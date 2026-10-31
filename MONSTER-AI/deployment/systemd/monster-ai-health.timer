@@ -1,0 +1,23 @@
+# ======================================================================================================
+# MONSTER AI - health check schedule                              (/etc/systemd/system/monster-ai-health.timer)
+#
+# WHAT IT DOES
+#   Starts monster-ai-health.service 3 minutes after boot and then every 5 minutes after the previous run
+#   started (OnUnitActiveSec is relative to the last activation of the service, so runs never overlap
+#   or pile up even if one check is slow). AccuracySec=30s lets systemd coalesce wake-ups; there is no
+#   random delay because the check itself is cheap and timing matters more than spreading load.
+# ======================================================================================================
+
+[Unit]
+Description=Run the MONSTER AI health check every 5 minutes
+Documentation=file:/opt/monster-ai/deployment/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=0
+Unit=monster-ai-health.service
+
+[Install]
+WantedBy=timers.target

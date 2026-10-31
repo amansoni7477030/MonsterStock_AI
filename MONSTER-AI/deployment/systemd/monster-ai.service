@@ -1,0 +1,108 @@
+# ======================================================================================================
+# MONSTER AI - scheduler daemon                                     (/etc/systemd/system/monster-ai.service)
+#
+# WHAT IT DOES
+#   Runs `python -m app.cli daemon`: the long-running scheduler that collects market data and news, builds
+#   the 09:12 IST large-move report, evaluates the results after the close, retrains weekly and takes the
+#   nightly backups. The default MONSTER_MODE=shadow only produces research output - nothing here ever
+#   places an order. The daemon announces READY=1 when it is initialised (Type=notify) and then sends
+#   WATCHDOG=1 heartbeats; a process that stops heartbeating for WatchdogSec is killed and restarted.
+#
+# SELF-HEALING
+#   Restart=always together with StartLimitIntervalSec=0: a crashed or hung daemon is restarted every
+#   10 seconds forever and never ends up in the "start request repeated too quickly" failed state.
+#   monster-ai-health.timer reports state changes to Telegram; OnFailure= covers the remaining cases.
+#
+# SECURITY
+#   Unprivileged user `monster`, no capabilities, no privilege escalation, the whole file system is
+#   read-only except /var/lib/monster-ai (state) and /var/log/monster-ai (logs), only IPv4/IPv6/UNIX
+#   sockets. Secrets arrive solely through EnvironmentFile= (root:monster, mode 0640): they are never in
+#   this unit, in process arguments or in logs. SystemCallFilter= and MemoryDenyWriteExecute= are
+#   deliberately NOT used because numpy / LightGBM (OpenMP) break under them. systemd-journal is a
+#   supplementary group so the failure alert and `journalctl` stay usable for the service.
+#
+# RESOURCES (1 GB RAM server)
+#   MemoryHigh=750M throttles the service before the hard limit MemoryMax=880M; OOMScoreAdjust=-300 makes
+#   the kernel prefer other victims; OOMPolicy=continue lets the daemon survive when one job process is
+#   OOM-killed. BLAS/OpenMP are pinned to one thread (extra threads only cost memory on 1 vCPU).
+# ======================================================================================================
+
+[Unit]
+Description=MONSTER AI scheduler daemon (NSE large-move intelligence, shadow mode)
+Documentation=file:/opt/monster-ai/deployment/README.md
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+OnFailure=monster-ai-alert@%n.service
+# Never give up: no start rate limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=monster
+Group=monster
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/opt/monster-ai
+SyslogIdentifier=monster-ai
+
+EnvironmentFile=/etc/monster-ai/monster.env
+Environment=MONSTER_ENV=production
+Environment=MONSTER_HOME=/opt/monster-ai
+Environment=MONSTER_DATA_DIR=/var/lib/monster-ai
+Environment=MONSTER_LOG_DIR=/var/log/monster-ai
+Environment=MONSTER_ENV_FILE=/etc/monster-ai/monster.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+
+ExecStart=/opt/monster-ai/.venv/bin/python -m app.cli daemon
+Restart=always
+RestartSec=10
+WatchdogSec=180
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=control-group
+OOMPolicy=continue
+OOMScoreAdjust=-300
+MemoryHigh=750M
+MemoryMax=880M
+TasksMax=256
+LimitNOFILE=4096
+Nice=0
+CPUSchedulingPolicy=other
+UMask=0027
+
+# systemd creates these (owner monster) if they were deleted, so a missing directory can never wedge the unit.
+StateDirectory=monster-ai
+StateDirectoryMode=0750
+LogsDirectory=monster-ai
+LogsDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/monster-ai /var/log/monster-ai
+ReadOnlyPaths=/opt/monster-ai /etc/monster-ai
+
+[Install]
+WantedBy=multi-user.target

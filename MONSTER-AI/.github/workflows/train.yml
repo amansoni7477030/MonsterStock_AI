@@ -1,0 +1,91 @@
+name: Train models (external worker)
+
+# Weekly external training worker. It trains on a GitHub runner (far more RAM/CPU than the 1 GB server),
+# signs the model bundles with MODEL_SIGNING_KEY (HMAC-SHA256) and uploads them to the S3-compatible object
+# store. The production server runs with TRAINING_MODE=external and only PULLS and verifies the signed
+# bundles (job `model_sync`, daily 05:30-07:00 IST) - it never trusts an unsigned or tampered artifact.
+# See deployment/README.md ("External training").
+#
+# Required repository secrets: MODEL_SIGNING_KEY, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY.
+# Optional: S3_ENDPOINT_URL (R2/B2/MinIO/Spaces), S3_REGION, S3_PREFIX, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+# BACKUP_PASSPHRASE (only if the server encrypts its backups: the worker restores the server's newest off-box
+# backup as its training data, and collects the history itself when there is none).
+
+on:
+  schedule:
+    # Friday 19:30 UTC = Saturday 01:00 IST: published well before the server's 05:30 IST model_sync.
+    - cron: "30 19 * * 5"
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Model stage to train and publish"
+        type: choice
+        default: both
+        options: [both, final, pre]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train-models
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: Train and publish signed model bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      PYTHONUNBUFFERED: "1"
+      MONSTER_ENV: production
+      MONSTER_MODE: shadow
+      MONSTER_DATA_DIR: ${{ github.workspace }}/.monster/data
+      MONSTER_LOG_DIR: ${{ github.workspace }}/.monster/logs
+      # The runner is not the 1 GB server: lift the RAM guards of the in-process trainer.
+      TRAIN_MAX_ROWS: "2000000"
+      JOB_MAX_RSS_MB: "6000"
+      JOB_TIMEOUT_MINUTES: "330"
+      OMP_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Initialise the working directories and database
+        run: python -m app.cli init
+
+      - name: Train and publish (signed bundles)
+        env:
+          STAGE: ${{ inputs.stage || 'both' }}
+          MODEL_SIGNING_KEY: ${{ secrets.MODEL_SIGNING_KEY }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_PREFIX: ${{ secrets.S3_PREFIX }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m app.cli train --stage "$STAGE" --publish
+
+      - name: Upload the training report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-report-${{ github.run_id }}
+          path: |
+            artifacts/**
+            .monster/logs/train.log
+            .monster/data/models/**/*.json
+          if-no-files-found: warn
+          retention-days: 90

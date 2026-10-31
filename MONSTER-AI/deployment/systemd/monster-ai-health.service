@@ -1,0 +1,80 @@
+# ======================================================================================================
+# MONSTER AI - health check                                     (/etc/systemd/system/monster-ai-health.service)
+#
+# WHAT IT DOES
+#   Triggered every 5 minutes by monster-ai-health.timer. Runs `python -m app.cli health --notify`, which
+#   evaluates the system (daemon heartbeat, data freshness, disk, RAM, models, deliveries) and sends a
+#   Telegram alert ONLY when the state changes (ok -> warn -> crit and back), so it never spams.
+#
+# EXIT CODES
+#   health exits 0 (ok), 1 (warning) or 2 (critical). Those are results, not failures of this unit, so
+#   SuccessExitStatus=1 2 keeps the unit "inactive (success)" instead of "failed": a WARN/CRIT state
+#   must be reported by the application (Telegram), not by systemd's failure machinery.
+#
+# RESOURCES / SECURITY
+#   Nice=10 and a small memory cap: the check must never compete with the 09:12 IST report path. The
+#   sandbox is the same as monster-ai.service (see there for the reasoning).
+# ======================================================================================================
+
+[Unit]
+Description=MONSTER AI health check (Telegram alert on state change)
+Documentation=file:/opt/monster-ai/deployment/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=monster
+Group=monster
+WorkingDirectory=/opt/monster-ai
+SyslogIdentifier=monster-ai-health
+
+EnvironmentFile=/etc/monster-ai/monster.env
+Environment=MONSTER_ENV=production
+Environment=MONSTER_HOME=/opt/monster-ai
+Environment=MONSTER_DATA_DIR=/var/lib/monster-ai
+Environment=MONSTER_LOG_DIR=/var/log/monster-ai
+Environment=MONSTER_ENV_FILE=/etc/monster-ai/monster.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+
+ExecStart=/opt/monster-ai/.venv/bin/python -m app.cli health --notify
+SuccessExitStatus=1 2
+TimeoutStartSec=120
+Nice=10
+MemoryHigh=300M
+MemoryMax=450M
+TasksMax=64
+LimitNOFILE=4096
+UMask=0027
+
+StateDirectory=monster-ai
+StateDirectoryMode=0750
+LogsDirectory=monster-ai
+LogsDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/monster-ai /var/log/monster-ai
+ReadOnlyPaths=/opt/monster-ai /etc/monster-ai

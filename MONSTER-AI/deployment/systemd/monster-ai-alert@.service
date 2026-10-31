@@ -1,0 +1,78 @@
+# ======================================================================================================
+# MONSTER AI - failure alert (template unit)                      (/etc/systemd/system/monster-ai-alert@.service)
+#
+# WHAT IT DOES
+#   Target of OnFailure=monster-ai-alert@%n.service in the other MONSTER AI units. When monster-ai.service
+#   (or the bootstrap service) enters the "failed" state systemd starts an instance of this template whose
+#   instance name is the failed unit; `python -m app.cli alert-unit <unit>` then sends a Telegram alert
+#   containing that unit's last journal lines. The application redacts secrets before sending.
+#
+# NO LOOPS
+#   This unit intentionally has NO OnFailure= of its own: an alert that cannot be delivered must never
+#   trigger another alert. systemd-journal is a supplementary group so the journal can be read as `monster`.
+#
+# SECURITY: same sandbox as monster-ai.service (see there for the reasoning).
+# ======================================================================================================
+
+[Unit]
+Description=MONSTER AI failure alert for %i
+Documentation=file:/opt/monster-ai/deployment/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=monster
+Group=monster
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/opt/monster-ai
+SyslogIdentifier=monster-ai-alert
+
+EnvironmentFile=/etc/monster-ai/monster.env
+Environment=MONSTER_ENV=production
+Environment=MONSTER_HOME=/opt/monster-ai
+Environment=MONSTER_DATA_DIR=/var/lib/monster-ai
+Environment=MONSTER_LOG_DIR=/var/log/monster-ai
+Environment=MONSTER_ENV_FILE=/etc/monster-ai/monster.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+
+ExecStart=/opt/monster-ai/.venv/bin/python -m app.cli alert-unit %i
+TimeoutStartSec=60
+Nice=10
+MemoryHigh=300M
+MemoryMax=450M
+TasksMax=64
+LimitNOFILE=4096
+UMask=0027
+
+StateDirectory=monster-ai
+StateDirectoryMode=0750
+LogsDirectory=monster-ai
+LogsDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/monster-ai /var/log/monster-ai
+ReadOnlyPaths=/opt/monster-ai /etc/monster-ai

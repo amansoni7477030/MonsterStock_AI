@@ -1,0 +1,32 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime state - never commit
+.env
+*.env
+!.env.example
+data/runtime/
+data/cache/
+logs/*
+!logs/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+
+# Packaging output
+dist/
+*.tar.gz
+*.zip

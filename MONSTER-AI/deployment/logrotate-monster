@@ -1,0 +1,29 @@
+# MONSTER AI - logrotate policy (installed as /etc/logrotate.d/monster-ai)
+#
+# The application rotates its own monster.log (5 files x 5 MB) - this policy is only the safety net for
+# any other *.log file that ends up in /var/log/monster-ai (for example output of a manual CLI run).
+#
+#   copytruncate - the running daemon keeps its file handle, so the file is copied and truncated in place
+#   su monster   - the directory is owned by the service user; without `su` logrotate refuses to rotate
+#                  in a directory that is not writable by root only
+/var/log/monster-ai/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su monster monster
+}
+
+# Transcript written by deployment/install.sh (masked: never contains secret values).
+/var/log/monster-ai-install.log {
+    monthly
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

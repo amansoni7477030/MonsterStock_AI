@@ -1,0 +1,117 @@
+"""Adapter to the news-intelligence and event-graph packages.
+
+News is an *enrichment*: if the packages are unavailable or raise, scans continue with empty catalysts and the report
+says so (blueprint: failure of the LLM/news provider must reduce coverage, never block or fabricate)."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from typing import Any
+
+from app.clock import Clock, get_clock, iso
+from app.config import Settings
+from database.store import Store
+from ranking.types import Catalyst
+
+log = logging.getLogger(__name__)
+
+
+class Intel:
+    def __init__(self, store: Store, settings: Settings, clock: Clock | None = None) -> None:
+        self.store, self.settings, self.clock = store, settings, clock
+        self.pipeline: Any = None
+        self.graph: Any = None
+        self.errors: list[str] = []
+        try:
+            from news_intelligence.pipeline import NewsPipeline
+
+            llm = None
+            if settings.llm_configured:
+                from news_intelligence.llm import LLMExtractor
+
+                llm = LLMExtractor(settings, clock=clock)
+            self.pipeline = NewsPipeline(store, settings, clock=clock, llm=llm)
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"news pipeline unavailable ({type(exc).__name__})")
+            log.warning("news pipeline unavailable: %s", exc)
+        try:
+            from event_graph.propagation import GraphImpactEngine
+
+            self.graph = GraphImpactEngine(store)
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"event graph unavailable ({type(exc).__name__})")
+            log.warning("event graph unavailable: %s", exc)
+
+    def _now(self) -> datetime:
+        return (self.clock or get_clock()).now()
+
+    # -------------------------------------------------------------------------------------- processing
+    def process(self) -> dict[str, Any]:
+        if self.pipeline is None:
+            return {"error": "pipeline unavailable"}
+        try:
+            stats = self.pipeline.process_pending()
+            return dict(stats.__dict__) if hasattr(stats, "__dict__") else {"processed": str(stats)}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("news processing failed")
+            self.errors.append(f"news processing failed ({type(exc).__name__})")
+            return {"error": type(exc).__name__}
+
+    # ------------------------------------------------------------------------------------------ queries
+    def catalysts(self, symbols: Sequence[str], as_of: datetime, limit: int = 3) -> dict[str, list[Catalyst]]:
+        out: dict[str, list[Catalyst]] = {}
+        if self.pipeline is None:
+            return out
+        for symbol in symbols:
+            try:
+                items = self.pipeline.catalysts_for(symbol, as_of, limit=limit)
+            except Exception:  # noqa: BLE001
+                log.debug("catalysts_for failed for %s", symbol, exc_info=True)
+                continue
+            if items:
+                out[symbol] = list(items)
+        return out
+
+    def chains(self, symbols: Sequence[str], as_of: datetime) -> dict[str, list[str]]:
+        if self.graph is None or self.pipeline is None:
+            return {}
+        try:
+            events = self.pipeline.recent_events(as_of, self.settings.news_lookback_hours, limit=80)
+            impacts = self.graph.impacts(events, as_of)
+        except Exception:  # noqa: BLE001
+            log.debug("graph propagation failed", exc_info=True)
+            return {}
+        wanted = set(symbols)
+        return {s: list(getattr(i, "chains", []))[:3] for s, i in impacts.items() if s in wanted and getattr(i, "chains", None)}
+
+    def reacted(self, symbols: Sequence[str], as_of: datetime) -> dict[str, tuple[int, int]]:
+        """Per symbol: (events already showing a market reaction, events) within the lookback, point-in-time."""
+        since = iso(as_of - timedelta(hours=self.settings.news_lookback_hours))
+        until = iso(as_of)
+        out: dict[str, tuple[int, int]] = {}
+        for symbol in symbols:
+            pattern = f'%"id":"{symbol}"%'
+            row = self.store.conn.execute(
+                "SELECT COUNT(*) AS n, SUM(CASE WHEN market_reacted = 1 THEN 1 ELSE 0 END) AS r FROM events "
+                "WHERE first_seen_at >= ? AND first_seen_at <= ? AND entities_json LIKE ?", (since, until, pattern),
+            ).fetchone()
+            if row and row["n"]:
+                out[symbol] = (int(row["r"] or 0), int(row["n"]))
+        return out
+
+    def event_features(self, symbols: Sequence[str], as_of: datetime) -> dict[str, dict[str, float]]:
+        if self.pipeline is None:
+            return {}
+        try:
+            return self.pipeline.event_features(list(symbols), as_of, self.settings.news_lookback_hours)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def coverage_note(self) -> str | None:
+        reduced = self.store.kv_get("news.reduced_coverage")
+        notes = list(self.errors)
+        if reduced == "1":
+            notes.append("LLM extraction degraded (rule-based extraction used)")
+        return "; ".join(notes) or None

@@ -1,0 +1,106 @@
+{
+  "source": "NSE holiday-master (CM) fetched at build time; refreshed automatically by the app",
+  "year_hint": 2026,
+  "holidays": [
+    {
+      "trade_date": "2026-01-15",
+      "description": "Municipal Corporation Election - Maharashtra",
+      "special": false
+    },
+    {
+      "trade_date": "2026-01-26",
+      "description": "Republic Day",
+      "special": false
+    },
+    {
+      "trade_date": "2026-02-15",
+      "description": "Mahashivratri",
+      "special": false
+    },
+    {
+      "trade_date": "2026-03-03",
+      "description": "Holi",
+      "special": false
+    },
+    {
+      "trade_date": "2026-03-21",
+      "description": "Id-Ul-Fitr (Ramadan Eid)",
+      "special": false
+    },
+    {
+      "trade_date": "2026-03-26",
+      "description": "Shri Ram Navami",
+      "special": false
+    },
+    {
+      "trade_date": "2026-03-31",
+      "description": "Shri Mahavir Jayanti",
+      "special": false
+    },
+    {
+      "trade_date": "2026-04-03",
+      "description": "Good Friday",
+      "special": false
+    },
+    {
+      "trade_date": "2026-04-14",
+      "description": "Dr. Baba Saheb Ambedkar Jayanti",
+      "special": false
+    },
+    {
+      "trade_date": "2026-05-01",
+      "description": "Maharashtra Day",
+      "special": false
+    },
+    {
+      "trade_date": "2026-05-28",
+      "description": "Bakri Id",
+      "special": false
+    },
+    {
+      "trade_date": "2026-06-26",
+      "description": "Muharram",
+      "special": false
+    },
+    {
+      "trade_date": "2026-08-15",
+      "description": "Independence Day",
+      "special": false
+    },
+    {
+      "trade_date": "2026-09-14",
+      "description": "Ganesh Chaturthi",
+      "special": false
+    },
+    {
+      "trade_date": "2026-10-02",
+      "description": "Mahatma Gandhi Jayanti",
+      "special": false
+    },
+    {
+      "trade_date": "2026-10-20",
+      "description": "Dussehra",
+      "special": false
+    },
+    {
+      "trade_date": "2026-11-08",
+      "description": "Diwali Laxmi Pujan*",
+      "special": true
+    },
+    {
+      "trade_date": "2026-11-10",
+      "description": "Diwali-Balipratipada",
+      "special": false
+    },
+    {
+      "trade_date": "2026-11-24",
+      "description": "Prakash Gurpurb Sri Guru Nanak Dev",
+      "special": false
+    },
+    {
+      "trade_date": "2026-12-25",
+      "description": "Christmas",
+      "special": false
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+# ======================================================================================================
+# MONSTER AI - read-only dashboard (optional)                  (/etc/systemd/system/monster-ai-dashboard.service)
+#
+# WHAT IT DOES
+#   Runs `python -m app.cli dashboard`: a read-only FastAPI/uvicorn UI bound to DASHBOARD_HOST:DASHBOARD_PORT
+#   (default 127.0.0.1:8080). deployment/install.sh installs and starts this unit ONLY when the dashboard
+#   is enabled (--enable-dashboard or DASHBOARD_ENABLED=true) and requirements-dashboard.txt is installed.
+#
+# SECURITY
+#   The unit does not set DASHBOARD_HOST: it stays on loopback, and the application refuses any other
+#   bind address unless DASHBOARD_TOKEN (>= 16 characters) is set. Reach it from your PC with an SSH tunnel:
+#       ssh -L 8080:127.0.0.1:8080 user@server    ->    http://127.0.0.1:8080
+#   Sandbox identical to monster-ai.service (see there); only 250 MB of RAM are budgeted.
+# ======================================================================================================
+
+[Unit]
+Description=MONSTER AI read-only dashboard
+Documentation=file:/opt/monster-ai/deployment/README.md
+After=monster-ai.service
+
+[Service]
+Type=simple
+User=monster
+Group=monster
+WorkingDirectory=/opt/monster-ai
+SyslogIdentifier=monster-ai-dashboard
+
+EnvironmentFile=/etc/monster-ai/monster.env
+Environment=MONSTER_ENV=production
+Environment=MONSTER_HOME=/opt/monster-ai
+Environment=MONSTER_DATA_DIR=/var/lib/monster-ai
+Environment=MONSTER_LOG_DIR=/var/log/monster-ai
+Environment=MONSTER_ENV_FILE=/etc/monster-ai/monster.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+
+ExecStart=/opt/monster-ai/.venv/bin/python -m app.cli dashboard
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+MemoryHigh=200M
+MemoryMax=250M
+TasksMax=128
+LimitNOFILE=4096
+Nice=5
+UMask=0027
+
+StateDirectory=monster-ai
+StateDirectoryMode=0750
+LogsDirectory=monster-ai
+LogsDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/monster-ai /var/log/monster-ai
+ReadOnlyPaths=/opt/monster-ai /etc/monster-ai
+
+[Install]
+WantedBy=multi-user.target

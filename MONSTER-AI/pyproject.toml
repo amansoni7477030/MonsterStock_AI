@@ -1,0 +1,52 @@
+[project]
+name = "monster-ai"
+version = "1.0.0"
+description = "MONSTER AI - NSE large-move intelligence engine (probabilistic research tool, shadow-first)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers -p no:cacheprovider"
+markers = [
+    "network: touches the live network (deselected unless MONSTER_RUN_NETWORK_TESTS=1)",
+    "slow: slow test (model training)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:feedparser.*",
+    "ignore:.*sgmllib.*:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = [
+    "app", "ingestion", "news_intelligence", "event_graph", "features", "models",
+    "ranking", "backtesting", "automation", "notifications", "database", "dashboard",
+]
+branch = true
+
+[tool.coverage.report]
+show_missing = false
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = [".venv", "data/runtime", "artifacts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+ignore = [
+    "E501",    # long lines are tolerated in SQL / report templates
+    "S101",    # assert is fine in tests
+    "S608",    # SQL is built only from internal constants / placeholders
+    "B008",
+    "S311",    # random is used for jitter / sampling, never for security
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B", "UP", "E741"]

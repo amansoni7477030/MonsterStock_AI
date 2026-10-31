@@ -1,0 +1,9 @@
+# Runtime dependencies (pinned). Verified to have binary wheels for CPython 3.10-3.13
+# on linux x86_64 / aarch64 (manylinux2014 / manylinux_2_28) so the 1 GB server never compiles from source.
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+lightgbm==4.6.0
+requests==2.32.5
+feedparser==6.0.12
+tzdata==2025.2
