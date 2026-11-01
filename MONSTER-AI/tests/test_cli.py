@@ -407,7 +407,8 @@ def _ai_checks(monkeypatch, *checks):
 def test_ai_test_without_any_key_says_what_to_add_and_fails(cli_env, capsys):
     assert run(["ai-test"]) == 1
     captured = capsys.readouterr()
-    assert captured.out.count("OFF") == 2 and "GROQ_API_KEY" in captured.err and "TYPESAFE_API_KEY" in captured.err
+    assert captured.out.count("OFF") == 3  # the LLM, its web check and Jev
+    assert "GROQ_API_KEY" in captured.err and "TYPESAFE_API_KEY" in captured.err
 
 
 def test_ai_test_prints_a_line_per_service_and_succeeds_when_every_configured_one_answers(cli_env, monkeypatch, capsys):
@@ -433,11 +434,14 @@ def test_ai_test_fails_when_a_configured_service_does_not_answer_and_a_warning_s
 def test_ai_test_options_json_service_and_list_only(cli_env, monkeypatch, capsys):
     from news_intelligence.ai_check import AiCheck
 
-    calls = _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "ok", "key accepted"), AiCheck("jev", "Jev (TypeSafe AI)", "ok", "key accepted"))
+    calls = _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "ok", "key accepted"),
+                       AiCheck("web", "Groq web check", "ok", "enabled"), AiCheck("jev", "Jev (TypeSafe AI)", "ok", "key accepted"))
     assert run(["ai-test", "--json", "--service", "jev", "--list-only"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [item["service"] for item in payload] == ["jev"] and payload[0]["status"] == "ok"
     assert calls[0]["only"] == ["jev"] and calls[0]["deep"] is False
+    assert run(["ai-test", "--json", "--service", "web"]) == 0
+    assert [item["service"] for item in json.loads(capsys.readouterr().out)] == ["web"] and calls[1]["only"] == ["web"]
 
 
 def test_ai_test_still_works_when_the_database_cannot_be_opened(cli_env, monkeypatch, capsys):

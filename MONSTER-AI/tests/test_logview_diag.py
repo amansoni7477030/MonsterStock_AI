@@ -231,11 +231,14 @@ def test_diag_bundle_is_complete_small_and_free_of_secrets(cli_env, capsys, fake
 def test_the_state_listing_shows_the_ai_counters_but_not_the_cached_answers(store):
     from app.diagnostics import database_state
 
-    for key in ("llm:abc", "jev:abc", "news.sig:1", "llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m"):
+    for key in ("llm:abc", "jev:abc", "llmweb:abc", "news.sig:1", "llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m",
+                "llmweb.calls", "llmweb.cooldown_until", "llmweb.caps:m"):
         store.kv_set(key, "x")
     listing = database_state(store)
-    assert all(key in listing for key in ("llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m"))
+    assert all(key in listing for key in ("llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m", "llmweb.calls",
+                                          "llmweb.cooldown_until", "llmweb.caps:m"))
     assert "llm:abc" not in listing and "jev:abc" not in listing and "news.sig:1" not in listing
+    assert "llmweb:abc" not in listing  # a cached web brief is article-derived text: never in the bundle
 
 
 def test_the_bundle_carries_the_ai_counter_values_and_nothing_else_from_the_cache(store):

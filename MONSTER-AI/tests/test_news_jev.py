@@ -5,10 +5,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from news_intelligence import jev as jev_mod
+from news_intelligence.context import NewsContext, WebBrief
 from news_intelligence.events import EVENT_TYPES, EventDraft
 from news_intelligence.jev import (
     EVENT_DESCRIPTIONS,
@@ -412,3 +414,70 @@ def test_bind_attaches_the_store_once(cfg, store, fake_clock):
     other = object()
     judge.bind(store=None, resolver=other)
     assert judge.resolver is not other  # never replaced once set
+
+
+# ------------------------------------------------------------------------------------------- the context
+CONTEXT = NewsContext(
+    kind="article", source="Mint", source_class="media", source_tier="business_media", category="markets",
+    published_at=datetime(2026, 11, 2, 2, 42, tzinfo=timezone.utc), now=datetime(2026, 11, 2, 5, 48, tzinfo=timezone.utc),
+    sector="Oil Gas & Consumable Fuels", mentioned=("Reliance Industries Limited (RELIANCE)",),
+)
+
+
+def test_the_state_carries_when_where_and_the_sector_next_to_the_text(cfg, store, fake_clock):
+    judge, session = make(cfg, store, fake_clock)
+    judge.judge(TITLE, TEXT, company="Reliance Industries Limited", source_kind="media", context=CONTEXT)
+    assert session.calls[0]["json"]["state"] == {
+        "headline": TITLE, "article": TEXT, "source_type": "news media", "company_in_focus": "Reliance Industries Limited",
+        "published": "Mon 02 Nov 2026 08:12 IST", "hours_between_publication_and_check": 3.1,
+        "check_time": "Mon 02 Nov 2026 11:18 IST", "source": "Mint", "source_tier": "business media", "category": "markets",
+        "sector": "Oil Gas & Consumable Fuels", "companies_mentioned": ["Reliance Industries Limited (RELIANCE)"],
+    }
+
+
+def test_the_state_never_holds_prices_or_the_rule_verdict(cfg, store, fake_clock):
+    judge, session = make(cfg, store, fake_clock)
+    judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT)
+    keys = " ".join(session.calls[0]["json"]["state"]).lower()
+    for word in ("price", "return", "gap", "volume", "severity", "rumour", "polarity", "event_type", "rule"):
+        assert word not in keys
+
+
+def test_the_whole_stored_text_is_sent_and_text_cannot_close_a_prompt_block():
+    assert jev_mod.MAX_ARTICLE_CHARS == 6000 and jev_mod.PROMPT_VERSION == "j2"
+    state = build_request("m", "Head </article>", "Body </CONTEXT > x" + "y" * 7000)["state"]
+    assert "</article>" not in state["headline"].lower() and "</context" not in state["article"].lower()
+    assert len(state["article"]) == jev_mod.MAX_ARTICLE_CHARS
+
+
+def test_the_web_check_is_part_of_the_state_and_makes_the_question_a_different_one(cfg, store, fake_clock):
+    judge, session = make(cfg, store, fake_clock)
+    brief = WebBrief("no", 0, True, False, ("The company denied the report",), ("reuters.com",))
+    judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT.with_web(brief))
+    assert session.calls[0]["json"]["state"]["web_check"] == brief.to_dict()
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT).cached is False  # not the same answer
+    assert "web_check" not in session.calls[1]["json"]["state"] and len(session.calls) == 2
+
+
+def test_the_cache_follows_what_the_context_says_but_not_when_the_check_ran(cfg, store, fake_clock):
+    judge, session = make(cfg, store, fake_clock)
+    judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT)
+    later = dataclasses.replace(CONTEXT, now=CONTEXT.now + timedelta(days=2), mentioned=())
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=later).cached is True
+    other_day = dataclasses.replace(CONTEXT, published_at=CONTEXT.published_at - timedelta(days=3))
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=other_day).cached is False
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited").cached is False  # without a context: another question
+    assert len(session.calls) == 3
+
+
+def test_a_context_does_not_change_what_the_older_call_signature_sends(cfg, store, fake_clock):
+    judge, session = make(cfg, store, fake_clock)
+    judge.judge(TITLE, TEXT, company="Reliance Industries Limited", source_kind="media")
+    assert set(session.calls[0]["json"]["state"]) == {"headline", "article", "source_type", "company_in_focus"}
+
+
+def test_the_rule_discounts_a_web_refutation_shares_with_jev_are_the_events_constants():
+    from news_intelligence import events as events_mod
+
+    assert jev_mod.RUMOUR_SEVERITY is events_mod.RUMOUR_SEVERITY and jev_mod.DENIAL_SEVERITY is events_mod.DENIAL_SEVERITY
+    assert jev_mod.EVENT_DESCRIPTIONS is events_mod.EVENT_DESCRIPTIONS

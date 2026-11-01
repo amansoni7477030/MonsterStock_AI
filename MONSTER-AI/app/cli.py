@@ -596,8 +596,8 @@ def cmd_ai_test(args: argparse.Namespace) -> int:
             print(f"{check.label:<22} {check.status.upper():<5}{took}  {check.detail}")
     active = [check for check in checks if check.status != "off"]
     if not active:
-        print("nothing to test: add GROQ_API_KEY and/or TYPESAFE_API_KEY to the env file (the AI services are optional)",
-              file=sys.stderr)
+        print("nothing to test: the selected service is not configured (see the line above); set GROQ_API_KEY and/or "
+              "TYPESAFE_API_KEY in the env file to switch the optional AI services on", file=sys.stderr)
         return EXIT_FAIL
     return EXIT_OK if all(check.usable for check in active) else EXIT_FAIL
 
@@ -699,9 +699,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", nargs="+", metavar="KIND", help="only these kinds (see --list)")
     p.add_argument("--list", action="store_true", help="list the kinds of sample message and exit")
     p.add_argument("--delay", type=float, default=1.2, help="seconds between messages (default 1.2)")
-    p = add("ai-test", cmd_ai_test, "check the optional Groq / Jev AI keys with one made-up news item")
-    p.add_argument("--service", choices=("all", "llm", "jev"), default="all")
-    p.add_argument("--list-only", action="store_true", help="only list the models the key can use (spends no tokens)")
+    p = add("ai-test", cmd_ai_test, "check the optional Groq / Jev AI keys with one made-up news item (and one real web search)")
+    p.add_argument("--service", choices=("all", "llm", "web", "jev"), default="all")
+    p.add_argument("--list-only", action="store_true", help="only list the models the key can use (spends no tokens, no web search)")
     p.add_argument("--json", action="store_true")
     add("dashboard", cmd_dashboard, "run the read-only dashboard")
     return parser

@@ -213,10 +213,10 @@ def collect_news(ctx: JobContext) -> JobResult:
 
 
 def ai_note(processed: dict[str, Any]) -> str:
-    """``; AI: llm 12 used, 3 cached; jev 40 used, 1 failed`` for the optional AI services that did something in this news job
-    (empty when none did), so ``monster-ai jobs`` and the log show each morning what they contributed."""
+    """``; AI: llm 12 used, 3 cached; web 2 used; jev 40 used, 1 failed`` for the optional AI services that did something in this
+    news job (empty when none did), so ``monster-ai jobs`` and the log show each morning what they contributed."""
     parts = []
-    for name in ("llm", "jev"):
+    for name in ("llm", "web", "jev"):
         used, cached, failed = (int(processed.get(f"{name}_{key}") or 0) for key in ("used", "cached", "failed"))
         if used or cached or failed:
             parts.append(f"{name} {used} used" + (f", {cached} cached" if cached else "") + (f", {failed} failed" if failed else ""))

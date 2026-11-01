@@ -79,6 +79,7 @@ MAX_ENTITIES = 24
 MAX_CONTRADICTIONS = 8
 ENGLISH_CODES = frozenset({"", "en", "eng", "english"})
 OFFICIAL_CLASSES = frozenset({"exchange_filing", "official"})  # first-hand reports: never a rumour, whatever an AI says
+FIRST_HAND_CLASSES = OFFICIAL_CLASSES | {"company"}  # the company speaking for itself: nothing for a web check to confirm
 # Company news whose facts a web check can settle and that moves prices when it is true (or false): deals, orders, money raised,
 # court and regulator action, who runs the company.
 WEB_CHECK_TYPES = frozenset({
@@ -174,10 +175,10 @@ def _consensus(direction: float, other: float) -> float:
 
 def _wants_web(draft: EventDraft, source_class: str) -> bool:
     """Which items deserve a web check: company news of a kind a search can settle (``WEB_CHECK_TYPES``) that could matter
-    (``WEB_MIN_SEVERITY``), and any company story the rules already read as an unconfirmed rumour. Exchange filings and official
-    statements are the primary source, an item that is itself a denial needs no confirmation, and macro or sector news is
-    reported everywhere: a check there would only spend the budget."""
-    if source_class in OFFICIAL_CLASSES or draft.is_denial or draft.scope != "company" or draft.event_type == "other":
+    (``WEB_MIN_SEVERITY``), and any company story the rules already read as an unconfirmed rumour. Exchange filings, official
+    statements and the company's own releases are first-hand, an item that is itself a denial needs no confirmation, and macro
+    or sector news is reported everywhere: a check there would only spend the budget."""
+    if source_class in FIRST_HAND_CLASSES or draft.is_denial or draft.scope != "company" or draft.event_type == "other":
         return False
     return draft.is_rumour or (draft.event_type in WEB_CHECK_TYPES and draft.severity >= WEB_MIN_SEVERITY)
 
@@ -526,8 +527,8 @@ class NewsPipeline:
         """Add what the entity step found to the context the caller built: the companies mentioned in the text and, for a filing,
         the issuer with its sector, and the moment of this check."""
         mentioned = tuple(
-            entity.name if entity.id.startswith("global:") else f"{entity.name} ({entity.id})"
-            for entity in entities if entity.type == "company"
+            entity.name if entity.id.startswith("global:") or entity.name == entity.id else f"{entity.name} ({entity.id})"
+            for entity in entities if entity.type == "company" and entity.id != symbol
         )[:MAX_MENTIONED]
         changes: dict[str, Any] = {"mentioned": mentioned, "now": context.now or self.clock.now()}
         if symbol:

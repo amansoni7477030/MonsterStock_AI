@@ -85,20 +85,22 @@ def test_the_news_job_says_what_the_ai_services_contributed(env, monkeypatch):
 
     class Intel:
         def process(self):
-            return {"llm_used": 12, "llm_cached": 3, "llm_failed": 0, "jev_used": 40, "jev_cached": 0, "jev_failed": 1}
+            return {"llm_used": 12, "llm_cached": 3, "llm_failed": 0, "web_used": 2, "web_failed": 0, "jev_used": 40,
+                    "jev_cached": 0, "jev_failed": 1}
 
     monkeypatch.setattr(news_sources, "load_feed_registry", lambda path: ([object()], [{"id": "q"}]))
     ctx = ctx_for(env)
     ctx._cache["intel"] = Intel()
     result = jobs.collect_news(ctx)
-    assert result.status == "success" and result.message.endswith("; AI: llm 12 used, 3 cached; jev 40 used, 1 failed")
+    assert result.status == "success" and result.message.endswith("; AI: llm 12 used, 3 cached; web 2 used; jev 40 used, 1 failed")
     assert result.metrics["processed"]["jev_used"] == 40
 
 
 @pytest.mark.parametrize(("processed", "expected"), [
-    ({}, ""), ({"error": "RuntimeError"}, ""), ({"llm_used": 0, "jev_used": 0}, ""),
+    ({}, ""), ({"error": "RuntimeError"}, ""), ({"llm_used": 0, "jev_used": 0, "web_used": 0}, ""),
     ({"jev_cached": 4}, "; AI: jev 0 used, 4 cached"), ({"llm_failed": 2}, "; AI: llm 0 used, 2 failed"),
     ({"llm_used": None, "jev_used": 1}, "; AI: jev 1 used"),
+    ({"web_used": 3, "web_cached": 1, "web_failed": 1}, "; AI: web 3 used, 1 cached, 1 failed"),
 ])
 def test_the_ai_note_only_mentions_services_that_did_something(processed, expected):
     assert jobs.ai_note(processed) == expected

@@ -904,12 +904,15 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
     assert any(ln.startswith("🎯 <b>Targets:</b> primary range threshold 3% · thresholds 1, 2, 3, 5% · top-N 5 · universe fno_nifty100") for ln in got)
     for line in ("🔹 08:45:00 preliminary scan", "🔹 09:08:45 final scan", "🔹 09:12:00 report cutoff · 09:14:30 delivery deadline"):
         assert line in got, line
-    assert any(ln.startswith("🔌 <b>Integrations:</b> LLM ✅ configured · Jev ✅ configured · off-box backup ✅ configured") for ln in got)
+    assert any(ln.startswith("🔌 <b>Integrations:</b> LLM ✅ configured · web check ⚪ off · Jev ✅ configured · off-box backup ✅ configured") for ln in got)
     for secret in (*secrets.values(), "1001", "2002"):
         assert secret not in text
     bare = "\n".join(lines([render_test_message(settings)]))
     assert "Report chat: ❌ NOT configured" in bare and "Alerts go to: the same chat" in bare
-    assert "LLM ⚪ off · Jev ⚪ off · off-box backup ⚪ off" in bare
+    assert "LLM ⚪ off · web check ⚪ off · Jev ⚪ off · off-box backup ⚪ off" in bare
+    groq = "\n".join(lines([render_test_message(dataclasses.replace(settings, groq_api_key="gsk_fake_groq_key_1234567890"))]))
+    assert "LLM ✅ configured · web check ✅ configured · Jev ⚪ off" in groq  # Groq's gpt-oss models can search the web
+    assert "gsk_fake" not in groq
 
 
 def test_test_message_shows_each_ai_service_by_its_own_key(settings):

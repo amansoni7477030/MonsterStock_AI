@@ -9,7 +9,7 @@ import pytest
 import requests
 
 from news_intelligence import ai_check
-from news_intelligence.ai_check import SAMPLE_TEXT, SAMPLE_TITLE, check_jev, check_llm, run_checks
+from news_intelligence.ai_check import SAMPLE_TEXT, SAMPLE_TITLE, check_jev, check_llm, check_web, run_checks
 from news_intelligence.entities import EntityResolver
 from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, add_instruments, jev_response, ok
 
@@ -53,14 +53,15 @@ def resolver(store):
 
 # --------------------------------------------------------------------------------------- not configured
 def test_unconfigured_services_are_off_and_say_which_keys_switch_them_on(settings):
-    llm, jev_check = run_checks(settings)
-    assert (llm.status, jev_check.status) == ("off", "off") and not llm.usable and not jev_check.usable
-    assert "GROQ_API_KEY" in llm.detail and "TYPESAFE_API_KEY" in jev_check.detail
+    llm, web, jev_check = run_checks(settings)
+    assert (llm.status, web.status, jev_check.status) == ("off", "off", "off") and not llm.usable and not jev_check.usable
+    assert "GROQ_API_KEY" in llm.detail and "TYPESAFE_API_KEY" in jev_check.detail and "GROQ_API_KEY" in web.detail
 
 
 def test_only_the_wanted_service_is_checked_and_the_order_is_fixed(settings):
     assert [c.service for c in run_checks(settings, only=["jev"])] == ["jev"]
-    assert [c.service for c in run_checks(settings)] == ["llm", "jev"]
+    assert [c.service for c in run_checks(settings, only=["web"])] == ["web"]
+    assert [c.service for c in run_checks(settings)] == ["llm", "web", "jev"]
 
 
 # ----------------------------------------------------------------------------------------------- Groq
@@ -186,7 +187,88 @@ def test_the_sample_is_an_unambiguous_order_win_that_names_a_company():
     assert "Reliance" in SAMPLE_TITLE and QUOTE in SAMPLE_TEXT and ai_check.SAMPLE_EVENT == "order_win"
 
 
+def test_the_checks_send_the_context_production_sends(groq, jev, fake_clock):
+    session = FakeSession(ok(reply()), gets=[groq_models()])
+    check_llm(groq, session=session, clock=fake_clock)
+    message = session.calls[1]["json"]["messages"][1]["content"]
+    assert message.startswith("<context>\nItem: news article\nSource: Sample Wire, news media, wire service\n")
+    assert "Published: Mon 02 Nov 2026 06:30 IST (2.0 hours before this check)" in message  # two hours before the fake clock's 08:30
+    assert "Check time: Mon 02 Nov 2026 08:30 IST" in message
+    session = FakeSession(jev_response(), gets=[jev_models()])
+    check_jev(jev, session=session, clock=fake_clock)
+    state = session.calls[1]["json"]["state"]
+    assert state["source"] == "Sample Wire" and state["published"] == "Mon 02 Nov 2026 06:30 IST" and state["source_tier"] == "wire service"
+
+
 def test_to_dict_rounds_the_seconds_and_keeps_every_field():
     check = ai_check.AiCheck("llm", "Groq LLM", "ok", "fine", 1.23456)
     assert check.to_dict() == {"service": "llm", "label": "Groq LLM", "status": "ok", "detail": "fine", "seconds": 1.23}
     assert ai_check.AiCheck("jev", "Jev", "off", "x").to_dict()["seconds"] is None
+
+
+# -------------------------------------------------------------------------------------------- web check
+def brief(**over) -> str:
+    data = {"confirmed": "unclear", "independent_outlets": 0, "denial_found": False, "earlier_coverage": False,
+            "facts": ["The company declined to comment"], "sources": ["reuters.com"]}
+    data.update(over)
+    return json.dumps(data)
+
+
+@pytest.mark.parametrize(("changes", "needle"), [
+    ({"groq_api_key": None}, "needs the LLM: set GROQ_API_KEY"),
+    ({"llm_web_search": False}, "disabled (LLM_WEB_SEARCH=false)"),
+    ({"llm_web_max_per_run": 0}, "disabled (LLM_WEB_MAX_PER_RUN=0)"),
+    ({"llm_model": "qwen/qwen3.8-27b", "llm_fallback_model": "meta-models/muse-spark-open"}, "gpt-oss"),
+    ({"groq_api_key": None, "llm_api_base": "https://llm.example/v1", "llm_model": "m", "llm_api_key": "sk-x"}, "gpt-oss"),
+])
+def test_the_web_check_is_off_and_says_why(groq, changes, needle):
+    check = check_web(dataclasses.replace(groq, **changes))
+    assert check.status == "off" and not check.usable and needle in check.detail and check.label == "Groq web check"
+
+
+def test_a_healthy_web_check_makes_one_real_search_with_the_sample(groq, fake_clock):
+    session = FakeSession(ok(brief(confirmed="no", independent_outlets=1)))
+    check = check_web(groq, session=session, clock=fake_clock)
+    assert check.status == "ok" and check.usable and f"model {PRIMARY}: " in check.detail
+    assert "independent outlets report the same facts: no (1 found)" in check.detail and "Sources: reuters.com" in check.detail
+    (request,) = session.calls  # there is no free listing for the tool: one request, and nothing else
+    body = request["json"]
+    assert request["url"] == "https://api.groq.com/openai/v1/chat/completions" and body["tools"] == [{"type": "browser_search"}]
+    assert ai_check.WEB_SAMPLE_TITLE in body["messages"][1]["content"] and "Source: Sample Wire" in body["messages"][1]["content"]
+    assert GROQ_KEY not in json.dumps(check.to_dict())
+
+
+def test_the_web_check_without_a_search_only_reports_how_it_is_configured(groq, fake_clock):
+    session = FakeSession(ok(brief()))
+    check = check_web(groq, deep=False, session=session, clock=fake_clock)
+    assert check.status == "ok" and session.calls == []
+    assert f"enabled on {PRIMARY}, {FALLBACK}, up to 8 per news job" in check.detail and "ai-test makes one real search" in check.detail
+
+
+@pytest.mark.parametrize(("response", "needle"), [
+    (FakeResponse(413, {"error": {"message": "Request too large for model on tokens per minute (TPM): Limit 8000"}}), "tokens-per-minute"),
+    (FakeResponse(400, {"error": {"message": "tools are not supported with this model"}}), "browser_search tool"),
+    (FakeResponse(500), "http 500"),
+    (ok("no json at all"), "not a JSON object"),
+])
+def test_a_web_check_that_cannot_run_is_a_warning_because_items_are_then_judged_without_it(groq, fake_clock, response, needle):
+    check = check_web(groq, session=FakeSession(response, response, response), clock=fake_clock)
+    assert check.status == "warn" and check.usable and needle in check.detail and "judged without a web check" in check.detail
+
+
+def test_the_web_check_is_skipped_when_the_llm_check_has_just_failed_on_the_same_key(groq, fake_clock):
+    sessions = {"llm": FakeSession(ok(reply()), gets=[FakeResponse(401)]), "web": FakeSession(ok(brief()))}
+    llm, web, jev_check = run_checks(groq, sessions=sessions, clock=fake_clock)
+    assert llm.status == "fail" and web.status == "off" and "skipped" in web.detail and jev_check.status == "off"
+    assert sessions["web"].calls == []
+
+
+def test_all_three_services_are_checked_in_a_fixed_order(groq, fake_clock):
+    both = dataclasses.replace(groq, typesafe_api_key=JEV_KEY)
+    sessions = {"llm": FakeSession(ok(reply()), gets=[groq_models()]), "web": FakeSession(ok(brief())),
+                "jev": FakeSession(jev_response(), gets=[jev_models()])}
+    checks = run_checks(both, sessions=sessions, clock=fake_clock)
+    assert [(c.service, c.status) for c in checks] == [("llm", "ok"), ("web", "ok"), ("jev", "ok")]
+    listing_only = run_checks(both, deep=False, sessions={"llm": FakeSession(gets=[groq_models()]), "jev": FakeSession(gets=[jev_models()])},
+                              clock=fake_clock)
+    assert [(c.service, c.status) for c in listing_only] == [("llm", "ok"), ("web", "ok"), ("jev", "ok")]

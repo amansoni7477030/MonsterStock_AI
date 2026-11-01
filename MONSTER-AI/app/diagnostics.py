@@ -35,6 +35,7 @@ RECENT_ROWS = 40
 # What the optional AI services keep in ``kv`` (counters, cooldowns, the coverage flags and the latest news run). None of it is secret.
 AI_STATE_KEYS = (
     "llm.calls", "llm.failures", "llm.tokens_in", "llm.tokens_out", "llm.cooldown_until",
+    "llmweb.calls", "llmweb.failures", "llmweb.tokens_in", "llmweb.tokens_out", "llmweb.cooldown_until",
     "jev.calls", "jev.failures", "jev.tokens_in", "jev.tokens_out", "jev.cooldown_until",
     "news.reduced_coverage", "news.coverage", "news.last_run",
 )
@@ -85,8 +86,8 @@ def database_state(store: Any) -> str:
             store, "SELECT kind, trade_date, status, attempts, error, updated_at FROM deliveries ORDER BY delivery_id DESC "
                    "LIMIT ?", (RECENT_ROWS,)))),
         _section("state keys (names and update times only)", _table(_rows(
-            store, "SELECT key, updated_at FROM kv WHERE key NOT LIKE 'llm:%' AND key NOT LIKE 'jev:%' "
-                   "AND key NOT LIKE 'news.sig:%' ORDER BY key"))),
+            store, "SELECT key, updated_at FROM kv WHERE key NOT LIKE 'llm:%' AND key NOT LIKE 'llmweb:%' "
+                   "AND key NOT LIKE 'jev:%' AND key NOT LIKE 'news.sig:%' ORDER BY key"))),
     ]
     return "\n".join(parts)
 

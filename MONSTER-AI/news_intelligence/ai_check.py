@@ -1,8 +1,10 @@
 """Live self-check of the optional AI services: ``monster-ai ai-test`` and the network part of ``doctor``.
 
-``deep=True`` sends ONE made-up news item through the same code path production uses, so a wrong model name, a rejected key, a
-schema the provider refuses or an unreadable answer shows up now and not at 08:10 on a trading day. ``deep=False`` only lists the
-account's models, which is free (no tokens are spent): it proves the key and shows whether the configured models exist.
+``deep=True`` sends ONE made-up news item through the same code path production uses (context block included), so a wrong model
+name, a rejected key, a schema the provider refuses or an unreadable answer shows up now and not at 08:10 on a trading day.
+``deep=False`` only lists the account's models, which is free (no tokens are spent): it proves the key and shows whether the
+configured models exist. The web check has no free probe: ``deep=True`` makes one real search (it takes tens of seconds and bills
+a search), ``deep=False`` only reports how it is configured.
 
 Nothing is cached, counted or written: the services run without a store.
 """
@@ -11,29 +13,45 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import requests
 
 from app.clock import Clock
 from app.config import Settings
+from news_intelligence.context import NewsContext
 from news_intelligence.jev import JEV_BASE_URL, JevJudge
 from news_intelligence.llm import LLMExtractor
 from news_intelligence.remote import RemoteJudge
+from news_intelligence.web import WebResearcher
 
-SERVICES = ("llm", "jev")
+SERVICES = ("llm", "web", "jev")
 SAMPLE_TITLE = "Reliance Industries bags Rs 5,000 crore order from NTPC for solar modules"
 SAMPLE_TEXT = (
     "Reliance Industries has received a Rs 5,000 crore order from NTPC for supply of solar modules over three years, the "
     "company said in a stock exchange filing on Monday."
 )
 SAMPLE_EVENT = "order_win"  # what any sound model answers for the sample
+WEB_SAMPLE_TITLE = "Reliance in talks to acquire a stake in a media company, sources say"
+WEB_SAMPLE_TEXT = (
+    "Reliance Industries is in talks to buy a minority stake, two people familiar with the matter said. The company declined "
+    "to comment."
+)
 LIST_TIMEOUT_SEC = 15.0
+
+
+def sample_context(now: Any) -> NewsContext:
+    """A context like production's for the made-up item: a wire story published two hours ago."""
+    return NewsContext(
+        kind="article", source="Sample Wire", source_class="media", source_tier="wire", category="markets",
+        published_at=now - timedelta(hours=2), now=now, mentioned=("Reliance Industries Limited (RELIANCE)",),
+    )
 
 
 @dataclass
 class AiCheck:
-    service: str  # llm | jev
+    service: str  # llm | web | jev
     label: str
     status: str  # ok | warn | fail | off
     detail: str
@@ -102,7 +120,7 @@ def check_llm(
     if not deep:
         return _verdict("llm", label, remarks, "key accepted", None)
     started = judge.clock.monotonic()
-    result = judge.extract(SAMPLE_TITLE, SAMPLE_TEXT)
+    result = judge.extract(SAMPLE_TITLE, SAMPLE_TEXT, sample_context(judge.clock.now()))
     seconds = judge.clock.monotonic() - started
     if result is None:
         return AiCheck("llm", label, "fail", _explain(judge.last_error, key_name), seconds)
@@ -114,6 +132,32 @@ def check_llm(
     severity = "-" if result.severity is None else f"{result.severity:.2f}"
     summary = f"model {judge.last_model}: {result.event_type}, severity {severity}, entities {entities}"
     return _verdict("llm", label, remarks, summary, seconds)
+
+
+def check_web(
+    settings: Settings, *, deep: bool = True, session: Any = None, clock: Clock | None = None, resolver: Any = None
+) -> AiCheck:
+    """The optional web check. A failure is only ever a warning: every item is then judged without it."""
+    label = "Groq web check"
+    if not settings.llm_configured:
+        return AiCheck("web", label, "off", "needs the LLM: set GROQ_API_KEY")
+    if not settings.llm_web_models:
+        return AiCheck("web", label, "off", "needs Groq with a gpt-oss model: browser_search exists on no other provider or model")
+    if not settings.llm_web_search:
+        return AiCheck("web", label, "off", "disabled (LLM_WEB_SEARCH=false)")
+    if settings.llm_web_max_per_run <= 0:
+        return AiCheck("web", label, "off", "disabled (LLM_WEB_MAX_PER_RUN=0)")
+    enabled = f"enabled on {', '.join(settings.llm_web_models)}, up to {settings.llm_web_max_per_run} per news job"
+    if not deep:
+        return AiCheck("web", label, "ok", enabled + " (ai-test makes one real search to prove it)")
+    researcher = WebResearcher(settings, session=session, clock=clock, resolver=resolver)
+    started = researcher.clock.monotonic()
+    brief = researcher.research(WEB_SAMPLE_TITLE, WEB_SAMPLE_TEXT, sample_context(researcher.clock.now()))
+    seconds = researcher.clock.monotonic() - started
+    if brief is None:
+        reason = _explain(researcher.last_error, "GROQ_API_KEY")
+        return AiCheck("web", label, "warn", f"{reason}; items are judged without a web check", seconds)
+    return AiCheck("web", label, "ok", f"model {researcher.last_model}: {brief.summary()}", seconds)
 
 
 def check_jev(
@@ -130,7 +174,8 @@ def check_jev(
     if not deep:
         return _verdict("jev", label, remarks, "key accepted", None)
     started = judge.clock.monotonic()
-    judgment = judge.judge(SAMPLE_TITLE, SAMPLE_TEXT, company="Reliance Industries Limited", source_kind="media")
+    judgment = judge.judge(SAMPLE_TITLE, SAMPLE_TEXT, company="Reliance Industries Limited", source_kind="media",
+                           context=sample_context(judge.clock.now()))
     seconds = judge.clock.monotonic() - started
     if judgment is None:
         return AiCheck("jev", label, "fail", _explain(judge.last_error, "TYPESAFE_API_KEY"), seconds)
@@ -149,10 +194,17 @@ def run_checks(
     settings: Settings, *, only: Sequence[str] | None = None, deep: bool = True, sessions: Mapping[str, Any] | None = None,
     clock: Clock | None = None, resolver: Any = None,
 ) -> list[AiCheck]:
-    """Check the wanted services (default: both), in a fixed order. ``sessions`` injects an HTTP session per service."""
+    """Check the wanted services (default: all), in a fixed order. ``sessions`` injects an HTTP session per service. The web
+    check shares the LLM's key, so it is skipped when the LLM check has just failed."""
     sessions = sessions or {}
-    checks = {"llm": check_llm, "jev": check_jev}
-    return [
-        checks[name](settings, deep=deep, session=sessions.get(name), clock=clock, resolver=resolver)
-        for name in SERVICES if only is None or name in only
-    ]
+    checks = {"llm": check_llm, "web": check_web, "jev": check_jev}
+    results: list[AiCheck] = []
+    for name in SERVICES:
+        if only is not None and name not in only:
+            continue
+        llm_failed = any(check.service == "llm" and check.status == "fail" for check in results)
+        if name == "web" and llm_failed:
+            results.append(AiCheck("web", "Groq web check", "off", "skipped: the LLM check failed first (it uses the same key)"))
+            continue
+        results.append(checks[name](settings, deep=deep, session=sessions.get(name), clock=clock, resolver=resolver))
+    return results

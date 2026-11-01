@@ -281,3 +281,37 @@ def test_assign_polarity_with_hand_built_entities():
     macro = ev.EventDraft(event_type="central_bank", polarity_hint=0.7, scope="macro")
     assert ev.assign_polarity(macro, ents, "text") == {"AAA": 0.0, "BBB": 0.0}
     assert ev.extract_moves("x", ents) == {}
+
+
+# ------------------------------------------------------------------------------- shared definitions
+def test_every_event_type_has_a_definition_and_the_discount_constants_match_the_rules():
+    assert list(ev.EVENT_DESCRIPTIONS) == list(ev.EVENT_TYPES)  # the taxonomy and what the AI readers are told never drift apart
+    assert all(text.strip().endswith(".") for text in ev.EVENT_DESCRIPTIONS.values())
+    plain = ev.classify_rules("Company X wins Rs 900 crore order", "", category=None, source_kind="business_media")
+    rumour = ev.classify_rules("Company X in talks to win Rs 900 crore order, sources say", "", category=None, source_kind="business_media")
+    assert rumour.is_rumour and rumour.severity == pytest.approx(plain.severity * ev.RUMOUR_SEVERITY, abs=0.002)
+
+
+# ----------------------------------------------------------------------------------- web refutation
+def test_a_refuted_report_becomes_a_rumour_with_a_denials_discounts():
+    draft = ev.EventDraft(event_type="merger_acquisition", severity=0.7, confidence=0.8, polarity_hint=0.6, rules=("ma_deal",))
+    assert ev.apply_refutation(draft) is True
+    assert draft.is_rumour and not draft.is_denial
+    assert draft.severity == 0.35 and draft.polarity_hint == 0.3 and draft.confidence == pytest.approx(0.56)
+    assert draft.rules == ("ma_deal", ev.REFUTED_RULE)  # recorded, so the discount is traceable and never applied twice
+    assert ev.apply_refutation(draft) is False and draft.severity == 0.35
+
+
+def test_a_report_already_flagged_as_a_rumour_only_loses_the_difference_between_the_two_discounts():
+    draft = ev.EventDraft(event_type="order_win", severity=0.85 * 0.6, confidence=0.5, polarity_hint=0.3, is_rumour=True)
+    assert ev.apply_refutation(draft) is True
+    assert draft.severity == pytest.approx(0.3, abs=0.001)  # half of the confirmed severity in total
+    assert draft.polarity_hint == 0.3  # its direction was already halved when it was flagged
+    assert draft.is_rumour
+
+
+def test_a_denial_is_left_alone_and_the_discount_never_goes_below_the_floor():
+    denial = ev.EventDraft(severity=0.3, is_denial=True)
+    assert ev.apply_refutation(denial) is False and denial.severity == 0.3 and not denial.is_rumour
+    tiny = ev.EventDraft(severity=0.02, confidence=0.05)
+    assert ev.apply_refutation(tiny) is True and tiny.severity == 0.02 and tiny.confidence == 0.05

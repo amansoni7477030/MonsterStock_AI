@@ -3,14 +3,17 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from news_intelligence import pipeline as pl
 from news_intelligence.dedup import event_confidence
+from news_intelligence.events import EventDraft, apply_refutation, classify_rules
 from news_intelligence.jev import JevJudge
 from news_intelligence.llm import LLMExtractor
 from news_intelligence.pipeline import NewsPipeline, ProcessStats
+from news_intelligence.web import WebResearcher
 from tests.test_news_support import (
     FakeResponse,
     FakeSession,
@@ -667,3 +670,213 @@ def test_running_out_of_time_is_not_reported_as_degraded_coverage(store, jev_set
     add_deal(store, 0)
     stats = pipe.process_pending()
     assert judge.run_failures == 0 and stats.jev_skipped_budget == 1 and store.kv_get("news.reduced_coverage") == "0"
+
+
+# ------------------------------------------------------------------------- the context and the web check
+GROQ_KEY = "gsk_test_groq_key_1234567890"
+RUMOUR = ("Reliance in talks to acquire stake in Wipro, sources said", "The talks are at an early stage and may not conclude.")
+
+
+def web_reply(**over):
+    data = {"confirmed": "no", "independent_outlets": 1, "denial_found": True, "earlier_coverage": False,
+            "facts": ["Reliance said the report was speculative"], "sources": ["reuters.com"]}
+    data.update(over)
+    return ok(json.dumps(data))
+
+
+@pytest.fixture()
+def groq_settings(settings):
+    return dataclasses.replace(settings, groq_api_key=GROQ_KEY, llm_web_max_per_run=4)
+
+
+def ai_pipe(store, cfg, clock, *, web=(), llm=(FakeResponse(500),), jev=(), **kwargs):
+    """A pipeline whose web check, LLM and Jev answers are scripted: nothing leaves the process."""
+    add_instruments(store)
+    sessions = SimpleNamespace(web=FakeSession(*(web or [FakeResponse(500)])), llm=FakeSession(*llm),
+                               jev=FakeSession(*(jev or [FakeResponse(500)])))
+    judge = JevJudge(cfg, session=sessions.jev, clock=clock) if cfg.jev_configured else None
+    pipeline = NewsPipeline(store, cfg, clock=clock, llm=LLMExtractor(cfg, session=sessions.llm, clock=clock), jev=judge,
+                            web=WebResearcher(cfg, session=sessions.web, clock=clock), **kwargs)
+    return pipeline, sessions
+
+
+def add_rumour(store, i=0, name="Reliance", body=RUMOUR[1]):
+    add_article(store, i, f"{name} in talks to acquire stake in Wipro, sources said", body, source="Mint", feed="mint",
+                url=f"https://www.livemint.com/r{i}", seen=f"2026-11-01T10:{i:02d}:00Z")
+
+
+def test_a_rumour_is_checked_on_the_web_and_a_denial_found_elsewhere_discounts_it(store, groq_settings, fake_clock):
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[web_reply()])
+    add_rumour(store)
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    expected = classify_rules(*RUMOUR[:1], RUMOUR[1], category=None, source_kind="business_media")
+    assert expected.is_rumour and apply_refutation(expected)  # what the rules alone would say, plus the refutation's discount
+    assert event["rumour"] == 1 and event["severity"] == expected.severity
+    assert event["extraction_method"] == "rules+web"  # the failing LLM added nothing: the event says what was used
+    web = json.loads(event["evidence_json"])[0]["web"]
+    assert web == {"confirmed": "no", "independent_outlets": 1, "denial_found": True, "earlier_coverage": False,
+                   "facts": ["Reliance said the report was speculative"], "sources": ["reuters.com"]}
+    assert (stats.web_used, stats.web_refuted, stats.web_failed, stats.web_cached) == (1, 1, 0, 0)
+    body = sessions.web.calls[0]["json"]
+    assert body["tools"] == [{"type": "browser_search"}] and "response_format" not in body
+    assert RUMOUR[0] in body["messages"][1]["content"] and "Source: Mint (livemint.com)" in body["messages"][1]["content"]
+
+
+def test_a_confirmation_informs_the_readers_but_changes_nothing_by_itself(store, groq_settings, fake_clock):
+    reply = web_reply(confirmed="yes", denial_found=False, independent_outlets=3, sources=["reuters.com", "ft.com"])
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[reply])
+    add_rumour(store)
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert event["severity"] == classify_rules(*RUMOUR, category=None, source_kind="business_media").severity
+    assert event["rumour"] == 1  # a confirmation never clears a flag the rules set
+    assert stats.web_used == 1 and stats.web_refuted == 0
+    message = sessions.llm.calls[0]["json"]["messages"][1]["content"]  # ...but the extraction reads the item with it
+    assert "Web check (an automated search made just now; it may be wrong)" in message
+    assert "independent outlets report the same facts: yes (3 found)" in message and "Sources: reuters.com, ft.com" in message
+
+
+def test_a_contradictory_web_answer_is_not_acted_upon(store, groq_settings, fake_clock):
+    pipe, _ = ai_pipe(store, groq_settings, fake_clock, web=[web_reply(confirmed="yes", denial_found=True)])
+    add_rumour(store)
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert stats.web_refuted == 0 and event["severity"] == classify_rules(*RUMOUR, category=None, source_kind="business_media").severity
+
+
+def test_the_web_check_reaches_jev_as_well(store, groq_settings, fake_clock):
+    both = dataclasses.replace(groq_settings, typesafe_api_key=JEV_KEY)
+    pipe, sessions = ai_pipe(store, both, fake_clock, web=[web_reply()], jev=[jev_response()])
+    add_rumour(store)
+    pipe.process_pending()
+    state = sessions.jev.calls[0]["json"]["state"]
+    assert state["web_check"]["denial_found"] is True and state["web_check"]["sources"] == ["reuters.com"]
+    assert state["company_in_focus"] and state["source_type"] == "news media"
+
+
+def test_exchange_filings_are_never_searched_for(store, groq_settings, fake_clock):
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[web_reply()])
+    add_filing(store, "NSE-7", symbol="WIPRO", category="Acquisition", subject="Wipro - acquisition of stake",
+               text="Wipro has agreed to acquire a 51% stake in a company for Rs 3,000 crore.")
+    stats = pipe.process_pending()
+    assert events(store) and sessions.web.calls == [] and stats.web_used == 0 and stats.web_skipped_budget == 0
+
+
+@pytest.mark.parametrize(("title", "body"), [
+    ("RBI cuts repo rate by 25 bps", "The monetary policy committee cut the policy rate to support growth."),  # macro
+    ("Coal India board approves interim dividend of Rs 15 per share", "The dividend will be paid next month."),  # not settled by a search
+    ("TCS Q2 profit rises 12%, beats estimates", "Net profit rose to Rs 12,000 crore, ahead of analyst estimates."),  # reported by all
+])
+def test_news_a_search_cannot_settle_costs_no_search(store, groq_settings, fake_clock, title, body):
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[web_reply()])
+    add_article(store, 0, title, body, source="Mint", feed="mint", url="https://www.livemint.com/n")
+    pipe.process_pending()
+    assert events(store) and sessions.web.calls == []
+
+
+def test_a_failing_search_never_loses_the_item(store, groq_settings, fake_clock):
+    pipe, _ = ai_pipe(store, groq_settings, fake_clock, web=[FakeResponse(500)])
+    add_rumour(store)
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert stats.errors == 0 and stats.web_used == 0 and stats.web_failed == 1 and event["rumour"] == 1
+    assert event["extraction_method"] == "rules" and "web" not in json.loads(event["evidence_json"])[0]
+    assert event["severity"] == classify_rules(*RUMOUR, category=None, source_kind="business_media").severity
+
+
+def test_the_web_budget_is_per_job_and_the_items_beyond_it_are_still_processed(store, groq_settings, fake_clock):
+    cfg = dataclasses.replace(groq_settings, llm_web_max_per_run=2)
+    pipe, sessions = ai_pipe(store, cfg, fake_clock, web=[web_reply()])
+    for i, name in enumerate(["TCS", "Infosys", "HDFC Bank", "SBI", "ITC", "Tata Steel"]):
+        add_rumour(store, i, name, f"{name} is at an early stage of talks about the Wipro stake and nothing is certain, people said.")
+    stats = pipe.process_pending()
+    assert stats.web_used == 2 and stats.web_skipped_budget == 4 and len(sessions.web.calls) == 2
+    assert stats.articles_in == 6 and stats.events_created + stats.events_updated == 6 and stats.errors == 0
+
+
+def test_a_search_the_plan_cannot_take_backs_off_so_later_items_do_not_retry_it(store, groq_settings, fake_clock):
+    refusal = FakeResponse(413, {"error": {"message": "Request too large for model on tokens per minute (TPM): Limit 8000"}})
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[refusal])
+    for i, name in enumerate(["TCS", "Infosys", "SBI"]):
+        add_rumour(store, i, name)
+    stats = pipe.process_pending()
+    assert len(sessions.web.calls) == 1 and stats.web_failed == 1 and stats.errors == 0  # later items never retried it
+    assert stats.events_created + stats.events_updated == 3 and stats.web_skipped_budget == 0  # and were all still processed
+    assert store.kv_get("llmweb.cooldown_until")
+
+
+def test_a_replay_never_makes_web_checks_and_a_live_pipeline_builds_its_researcher(store, groq_settings, settings, fake_clock):
+    live = NewsPipeline(store, groq_settings, clock=fake_clock)
+    assert isinstance(live.web, WebResearcher) and live.web.store is store and live.web.resolver is live.resolver
+    assert live.web is not live.llm and live.llm is not None
+    assert NewsPipeline(store, groq_settings, clock=fake_clock, point_in_time_edges=True).web is None  # the web of today is not the web then
+    assert NewsPipeline(store, dataclasses.replace(groq_settings, llm_web_search=False), clock=fake_clock).web is None
+    assert NewsPipeline(store, settings, clock=fake_clock).web is None
+
+
+def test_the_models_are_given_the_facts_that_help_to_read_an_article(store, groq_settings, fake_clock):
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, llm=[ok(llm_reply())])
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/s",
+                seen="2026-11-01T10:00:00Z", published="2026-11-01T09:30:00Z")
+    pipe.process_pending()
+    message = sessions.llm.calls[0]["json"]["messages"][1]["content"]
+    assert message.startswith("<context>\nItem: news article\nSource: Mint (livemint.com), news media")
+    assert "Published: Sun 01 Nov 2026 15:00 IST (17.5 hours before this check)" in message
+    assert "Check time: Mon 02 Nov 2026 08:30 IST." in message and "Category: markets" in message
+    assert "Companies our entity matcher found in the text: NTPC; Reliance Industries Limited (RELIANCE)" in message
+    assert "Company in focus" not in message  # an article has no issuer; the readers decide what it is about
+    assert "<article>\nTitle: " + TITLE in message
+
+
+def test_a_filing_tells_the_models_who_filed_it_and_in_which_sector(store, groq_settings, fake_clock):
+    quote = "approved a buyback of shares worth Rs 17,000 crore"
+    reply = llm_reply(event_type="buyback_dividend", entities=[{"id": "TCS", "polarity": 0.5}], evidence_quote=quote)
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, llm=[ok(reply)])
+    add_filing(store, "NSE-9", symbol="TCS", category="Outcome of Board Meeting", subject="TCS - Outcome of Board Meeting",
+               text="The board " + quote + ".", disseminated="2026-11-01T10:00:00Z", seen="2026-11-01T10:05:00Z")
+    pipe.process_pending()
+    message = sessions.llm.calls[0]["json"]["messages"][1]["content"]
+    assert message.startswith("<context>\nItem: exchange filing\nSource: NSE, exchange filing\n")
+    assert "Published: Sun 01 Nov 2026 15:30 IST (17.0 hours before this check)" in message
+    assert "Category: Outcome of Board Meeting" in message
+    assert "Company in focus: Tata Consultancy Services Limited (TCS); sector: Information technology" in message
+    assert "Companies our entity matcher" not in message  # the issuer is the company in focus, not an extra mention
+
+
+def test_jev_is_given_the_publication_time_and_the_sector_of_the_company_in_focus(store, groq_settings, fake_clock):
+    both = dataclasses.replace(groq_settings, typesafe_api_key=JEV_KEY)
+    pipe, sessions = ai_pipe(store, both, fake_clock, jev=[jev_response()])
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/j",
+                seen="2026-11-01T10:00:00Z", published="2026-11-01T09:30:00Z")
+    pipe.process_pending()
+    state = sessions.jev.calls[0]["json"]["state"]
+    assert state["published"] == "Sun 01 Nov 2026 15:00 IST" and state["check_time"] == "Mon 02 Nov 2026 08:30 IST"
+    assert state["hours_between_publication_and_check"] == 17.5 and state["source"] == "Mint"
+    assert state["sector"] == "Oil, gas & fuels" and state["companies_mentioned"] == ["NTPC", "Reliance Industries Limited (RELIANCE)"]
+    assert state["source_type"] == "news media" and "web_check" not in state  # an item the rules do not doubt is not searched for
+
+
+@pytest.mark.parametrize(("draft", "source_class", "wanted"), [
+    (EventDraft(event_type="merger_acquisition", severity=0.7), "media", True),
+    (EventDraft(event_type="merger_acquisition", severity=0.7), "social", True),
+    (EventDraft(event_type="order_win", severity=0.5), "media", True),
+    (EventDraft(event_type="order_win", severity=0.3), "media", False),  # too small to matter
+    (EventDraft(event_type="earnings_result", severity=0.6, is_rumour=True), "media", True),  # any rumour about a company
+    (EventDraft(event_type="earnings_result", severity=0.9), "media", False),  # reported by everyone
+    (EventDraft(event_type="buyback_dividend", severity=0.9), "media", False),
+    (EventDraft(event_type="merger_acquisition", severity=0.9, scope="macro"), "media", False),
+    (EventDraft(event_type="other", severity=0.9, is_rumour=True), "media", False),  # nothing to look for yet
+    (EventDraft(event_type="merger_acquisition", severity=0.7, is_denial=True), "media", False),
+    (EventDraft(event_type="merger_acquisition", severity=0.7, is_rumour=True), "exchange_filing", False),
+    (EventDraft(event_type="merger_acquisition", severity=0.7), "official", False),
+    (EventDraft(event_type="merger_acquisition", severity=0.7), "company", False),  # the company speaking for itself
+    (EventDraft(event_type="merger_acquisition", severity=0.7), "unknown", True),
+])
+def test_only_company_news_that_is_not_first_hand_and_could_matter_is_searched_for(draft, source_class, wanted):
+    assert pl._wants_web(draft, source_class) is wanted
+
+
+def test_the_web_counters_are_part_of_the_stats_and_the_pruning_report(store, pipe):
+    assert {"web_used", "web_cached", "web_failed", "web_skipped_budget", "web_refuted"} <= set(ProcessStats().as_dict())
+    assert pipe.prune()["web_cache"] == 0
