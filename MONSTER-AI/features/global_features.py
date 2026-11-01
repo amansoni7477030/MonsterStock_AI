@@ -8,6 +8,7 @@ resulting "expected move from factor" features embody the global-to-India transm
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 
 import numpy as np
@@ -89,7 +90,8 @@ def global_features(
         stacks1 = [per_series[m]["ret1"] for m in members if m in per_series]
         stacks5 = [per_series[m]["ret5"] for m in members if m in per_series]
         if stacks1:
-            with np.errstate(all="ignore"):
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # "Mean of empty slice": a day with no data is NaN by design
                 out_name = {"us10y": "g_us10y_bp", "vix": "g_vix_chg"}.get(name, f"g_{name}_ret")
                 out[out_name] = np.nanmean(np.vstack(stacks1), axis=0) if len(stacks1) > 1 else stacks1[0]
                 if name in FIVE_DAY:

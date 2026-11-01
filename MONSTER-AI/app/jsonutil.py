@@ -28,7 +28,8 @@ def to_jsonable(obj: Any) -> Any:
         value = float(obj)
         return value if math.isfinite(value) else None
     if isinstance(obj, datetime):
-        return obj.isoformat()
+        text = obj.isoformat()
+        return None if text == "NaT" else text  # pandas NaT is a datetime subclass: a missing time is null, not "NaT"
     if isinstance(obj, date):
         return obj.isoformat()
     if isinstance(obj, Path):
@@ -50,9 +51,10 @@ def to_jsonable(obj: Any) -> Any:
     if module.startswith("pandas"):
         if hasattr(obj, "isoformat"):
             try:
-                return obj.isoformat()
+                text = obj.isoformat()
             except (ValueError, TypeError):
                 return None
+            return None if text == "NaT" else text  # a missing timestamp is null, not the string "NaT"
         if hasattr(obj, "to_dict"):
             return to_jsonable(obj.to_dict())
         if hasattr(obj, "tolist"):

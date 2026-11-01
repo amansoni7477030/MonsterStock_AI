@@ -252,8 +252,9 @@ class NewsCollector:
                 "disseminated_at, first_seen_at, source_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [(f["exchange"], f["symbol"], f["isin"], f["company"], f["category"], f["subject"], f["text"],
                   f["attachment_url"], f["disseminated_at"], now_iso, f["source_ref"]) for f in items])
+        new_rows = self.store.conn.total_changes - before  # counted before the source-health bookkeeping below adds changes
         self.store.record_source_result("nse_announcements", True)
-        return self.store.conn.total_changes - before
+        return new_rows
 
     def collect_board_meetings(self, nse: NseApi, start: date, end: date, symbols: set[str]) -> int:
         try:
