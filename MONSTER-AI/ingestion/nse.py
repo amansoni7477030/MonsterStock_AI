@@ -13,7 +13,7 @@ import logging
 import zipfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any
 
 from app.clock import IST, Clock, iso, parse_ts
@@ -247,7 +247,6 @@ class NseApi:
         )
         self.http.on_auth_failure = self._rewarm
         self._deadline: float | None = None
-        self._expiry_cache: dict[str, list[str]] = {}
 
     def _now_mono(self) -> float:
         from app.clock import get_clock
@@ -293,22 +292,6 @@ class NseApi:
         the final scan past its cutoff."""
         data = self._get("market-data-pre-open", {"key": key}, timeout=(10.0, 60.0), deadline=deadline)
         return parse_preopen(data, set(symbols) if symbols is not None else None)
-
-    def option_expiries(self, symbol: str) -> list[str]:
-        if symbol not in self._expiry_cache:
-            info = self._get("option-chain-contract-info", {"symbol": symbol})
-            dates = info.get("expiryDates") if isinstance(info, dict) else None
-            self._expiry_cache[symbol] = [d for d in (dates or []) if isinstance(d, str)]
-        return self._expiry_cache[symbol]
-
-    def option_chain_summary(self, symbol: str) -> dict[str, Any] | None:
-        expiries = self.option_expiries(symbol)
-        if not expiries:
-            return None
-        chain = self._get("option-chain-v3", {"type": "Equity", "symbol": symbol, "expiry": expiries[0]}, timeout=(10.0, 60.0))
-        from ingestion.fno import summarize_option_chain
-
-        return summarize_option_chain(chain, expiries[0])
 
     def announcements(self, start: date, end: date, symbols: set[str] | None = None) -> list[dict[str, Any]]:
         params = {"index": "equities", "from_date": f"{start:%d-%m-%Y}", "to_date": f"{end:%d-%m-%Y}"}
@@ -437,9 +420,3 @@ def parse_holidays(data: Any) -> list[dict[str, Any]]:
         description = str(item.get("description") or "").strip()
         out.append({"trade_date": day.isoformat(), "description": description, "special": description.endswith("*")})
     return out
-
-
-def utc_now_iso(clock: Clock | None = None) -> str:
-    from app.clock import get_clock
-
-    return iso((clock or get_clock()).now()) or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -334,13 +334,3 @@ def logging_flush() -> None:  # pragma: no cover - best effort
     for handler in logging.getLogger().handlers:
         with contextlib.suppress(Exception):
             handler.flush()
-
-
-def set_oom_score_adjust(value: int) -> None:
-    """Make the kernel prefer killing this (job) process over the supervisor. Linux only; never fatal."""
-    path = Path("/proc/self/oom_score_adj")
-    if path.exists():
-        try:
-            path.write_text(str(value))
-        except OSError:
-            pass

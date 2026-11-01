@@ -8,6 +8,7 @@ import pytest
 
 from news_intelligence import pipeline as pl
 from news_intelligence.dedup import event_confidence
+from news_intelligence.jev import JevJudge
 from news_intelligence.llm import LLMExtractor
 from news_intelligence.pipeline import NewsPipeline, ProcessStats
 from tests.test_news_support import (
@@ -17,6 +18,7 @@ from tests.test_news_support import (
     add_filing,
     add_instruments,
     events,
+    jev_response,
     ok,
 )
 
@@ -447,3 +449,207 @@ def test_llm_budget_and_cache_show_up_in_the_run_stats(store, llm_settings, fake
     stats = pipe.process_pending()
     assert stats.llm_cached == 2 and stats.llm_used == 2 and stats.llm_skipped_budget == 0  # cache hits cost no budget
     assert len(session.calls) == 4 and len(events(store)) == 4
+
+
+# ------------------------------------------------------------------------------------------------- Jev
+JEV_KEY = "ts_test_typesafe_key_1234567890"
+DEAL = ("TCS bags Rs 900 crore deal from European bank", "Multi-year deal.")
+
+
+@pytest.fixture()
+def jev_settings(settings):
+    return dataclasses.replace(settings, typesafe_api_key=JEV_KEY)
+
+
+@pytest.fixture()
+def both_settings(jev_settings):
+    return dataclasses.replace(jev_settings, llm_api_base="https://llm.example/v1", llm_model="m", llm_api_key="sk-x")
+
+
+def jev_pipe(store, cfg, clock, *responses, llm=(), **kwargs):
+    """A pipeline whose Jev (and optionally LLM) answers are scripted: nothing leaves the process."""
+    add_instruments(store)
+    session = FakeSession(*responses)
+    judge = JevJudge(cfg, session=session, clock=clock, **kwargs)
+    extractor = LLMExtractor(cfg, session=FakeSession(*llm), clock=clock) if llm else None
+    return NewsPipeline(store, cfg, clock=clock, llm=extractor, jev=judge), session, judge
+
+
+def add_deal(store, i, *, name="TCS", seen="2026-11-01T10:{:02d}:00Z"):
+    add_article(store, i, f"{name} bags Rs {900 + i} crore deal from a European bank", "Multi-year deal.", source="Mint",
+                feed="mint", url=f"https://www.livemint.com/{name}{i}", seen=seen.format(i))
+
+
+def reliance_polarity(store):
+    (event,) = events(store)
+    return {e["id"]: e for e in json.loads(event["entities_json"])}["RELIANCE"]["polarity"]
+
+
+def test_pipeline_builds_its_own_jev_judge_only_when_configured(store, settings, jev_settings, fake_clock):
+    assert NewsPipeline(store, settings, clock=fake_clock).jev is None
+    built = NewsPipeline(store, jev_settings, clock=fake_clock)
+    assert isinstance(built.jev, JevJudge) and built.jev.store is store and built.jev.resolver is built.resolver
+    assert built.llm is None  # one key never switches the other service on
+
+
+def test_jev_classifies_what_the_rules_call_other_and_the_event_records_how(store, jev_settings, fake_clock):
+    pipe, session, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(event="earnings_guidance", p=0.9, conf=0.8))
+    add_article(store, 0, "Reliance Industries news", "Reliance Industries chairman spoke about future opportunities at an "
+                "industry conference on Friday.", source="Mint", feed="mint", url="https://www.livemint.com/m")
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert event["event_type"] == "earnings_guidance" and event["extraction_method"] == "rules+jev"
+    assert stats.jev_used == 1 and stats.jev_retyped == 1 and len(session.calls) == 1
+
+
+def test_jev_is_told_the_company_in_focus_and_the_source_class_not_the_quality_tier(store, jev_settings, fake_clock):
+    pipe, session, _ = jev_pipe(store, jev_settings, fake_clock, jev_response())
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/s")
+    pipe.process_pending()
+    state = session.calls[0]["json"]["state"]
+    assert state["headline"] == TITLE and "Reliance" in state["company_in_focus"] and state["source_type"] == "news media"
+
+
+def test_the_direction_is_asked_about_the_company_the_event_is_signed_for_not_the_first_mention(store, jev_settings, fake_clock):
+    pipe, session, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(polarity=(0.85, 0.05, 0.1)))
+    add_article(store, 0, "NTPC awards Reliance Rs 5,000 crore solar module contract",
+                "NTPC placed an order worth Rs 5,000 crore with Reliance for solar modules.", source="Mint", feed="mint",
+                url="https://www.livemint.com/w")
+    pipe.process_pending()
+    assert "Reliance" in session.calls[0]["json"]["state"]["company_in_focus"]  # the award winner, though NTPC is named first
+    (event,) = events(store)
+    polarity = {e["id"]: e["polarity"] for e in json.loads(event["entities_json"])}
+    assert polarity["RELIANCE"] > 0 and polarity["NTPC"] == 0.0  # the buyer stays unsigned
+
+
+def test_a_weak_jev_opinion_leaves_the_rules_result_alone(store, jev_settings, fake_clock):
+    pipe, _, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(event="management_change", p=0.9, conf=0.2))
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/w")
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert event["event_type"] == "order_win" and stats.jev_retyped == 0 and stats.jev_used == 1
+
+
+def test_jev_flags_a_rumour_the_rules_missed_but_never_on_an_exchange_filing(store, jev_settings, fake_clock):
+    pipe, _, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(rumour=0.97))
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/r")
+    add_filing(store, "NSE-1", symbol="TCS", category="Award of Order / Receipt of Order", subject="TCS - Award of order",
+               text="TCS has received an order worth Rs 900 crore.")
+    stats = pipe.process_pending()
+    assert {e["cluster_key"].split(":")[0]: e["rumour"] for e in events(store)} == {"news": 1, "filing": 0}
+    assert stats.jev_rumours == 1 and stats.jev_used == 2
+
+
+def test_jev_flags_a_denial(store, jev_settings, fake_clock):
+    pipe, _, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(denial=0.95))
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/d")
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    assert stats.jev_denials == 1 and event["rumour"] == 0
+    assert json.loads(event["evidence_json"])[0]["den"] is True
+
+
+@pytest.mark.parametrize(
+    ("jev_polarity", "expected"),
+    [
+        ((0.9, 0.0, 0.1), 0.7),  # both read it as good: the mean of 0.9 and the LLM's 0.5
+        ((0.0, 0.8, 0.2), 0.0),  # opposite directions: unknown, never a guess
+        ((0.4, 0.3, 0.3), 0.5),  # Jev has no clear direction: the LLM's reading stands
+    ],
+)
+def test_jev_and_the_llm_agree_or_the_direction_is_unknown(store, both_settings, fake_clock, jev_polarity, expected):
+    pipe, _, _ = jev_pipe(store, both_settings, fake_clock, jev_response(polarity=jev_polarity),
+                          llm=[ok(llm_reply(entities=[{"id": "RELIANCE", "polarity": 0.5}]))])
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/p")
+    pipe.process_pending()
+    (event,) = events(store)
+    assert event["extraction_method"] == "rules+llm+jev" and reliance_polarity(store) == expected
+
+
+@pytest.mark.parametrize(("jev_polarity", "agree"), [((0.85, 0.05, 0.1), True), ((0.05, 0.85, 0.1), False)])
+def test_jev_direction_against_the_rules_is_blended_or_cancelled(store, jev_settings, fake_clock, jev_polarity, agree):
+    pipe, _, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(polarity=jev_polarity))
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/q")
+    pipe.process_pending()
+    assert (reliance_polarity(store) > 0) is agree and (agree or reliance_polarity(store) == 0.0)  # the rules read this as good
+
+
+def test_a_rumour_flag_also_discounts_the_direction_jev_offers(store, jev_settings, fake_clock):
+    flagged, _, _ = jev_pipe(store, jev_settings, fake_clock, jev_response(polarity=(0.9, 0.0, 0.1), rumour=0.97))
+    add_article(store, 0, TITLE, BODY, source="Mint", feed="mint", url="https://www.livemint.com/rum")
+    flagged.process_pending()
+    discounted = reliance_polarity(store)
+    assert 0 < discounted < 0.5  # an unflagged item would blend 0.9 with the rules' 0.6 and reach 0.75
+
+
+def test_a_failing_jev_falls_back_to_rules_and_raises_the_reduced_coverage_flag(store, jev_settings, fake_clock):
+    pipe, session, judge = jev_pipe(store, jev_settings, fake_clock, FakeResponse(500))
+    story(store, 0, 1)
+    add_article(store, 10, *DEAL, source="Mint", feed="mint", url="https://www.livemint.com/tcs")
+    stats = pipe.process_pending()
+    assert stats.jev_failed == 2 and stats.jev_used == 0 and len(events(store)) == 2
+    assert {e["extraction_method"] for e in events(store)} == {"rules"}
+    assert store.kv_get("news.reduced_coverage") == "1" and store.kv_get_json("news.coverage") == {"jev": True}
+    assert store.kv_get("jev.failures") == "2" and fake_clock.sleeps  # backoff used the injected clock, never real time
+    judge.max_attempts = 1
+    session.responses = [jev_response()]
+    add_article(store, 20, "Reliance Industries news", "Reliance Industries has " + QUOTE + " for solar modules.", source="Mint",
+                feed="mint", url="https://www.livemint.com/ok")
+    stats = pipe.process_pending()
+    assert stats.jev_failed == 0 and stats.jev_used == 1 and store.kv_get("news.reduced_coverage") == "0"
+
+
+def test_a_healthy_service_never_hides_a_failing_one(store, both_settings, fake_clock):
+    pipe, _, _ = jev_pipe(store, both_settings, fake_clock, FakeResponse(500), llm=[ok(llm_reply())])
+    add_article(store, 0, "Reliance Industries news", "Reliance Industries has " + QUOTE + " for supply of solar modules.",
+                source="Mint", feed="mint", url="https://www.livemint.com/h")
+    stats = pipe.process_pending()
+    assert stats.llm_used == 1 and stats.jev_failed == 1
+    assert store.kv_get_json("news.coverage") == {"llm": False, "jev": True} and store.kv_get("news.reduced_coverage") == "1"
+
+
+def test_jev_budget_and_cache_show_up_in_the_run_stats(store, jev_settings, fake_clock):
+    limited = dataclasses.replace(jev_settings, jev_max_items_per_run=2)
+    pipe, session, _ = jev_pipe(store, limited, fake_clock, jev_response())
+    for i, name in enumerate(("TCS", "Infosys", "Wipro", "Sun Pharma")):
+        add_deal(store, i, name=name)
+    stats = pipe.process_pending()
+    assert stats.jev_used == 2 and stats.jev_skipped_budget == 2 and len(session.calls) == 2
+    for table in ("event_articles", "events"):
+        store.conn.execute(f"DELETE FROM {table}")
+    store.conn.execute("DELETE FROM kv WHERE key LIKE 'news.sig:%'")
+    store.conn.execute("UPDATE news_raw SET processed = 0")
+    stats = pipe.process_pending()
+    assert stats.jev_cached == 2 and stats.jev_used == 2 and stats.jev_skipped_budget == 0  # cache hits cost no budget
+    assert len(session.calls) == 4 and len(events(store)) == 4
+
+
+def test_items_the_rules_find_irrelevant_cost_no_ai_calls(store, both_settings, fake_clock):
+    pipe, session, _ = jev_pipe(store, both_settings, fake_clock, jev_response(), llm=[ok(llm_reply())])
+    add_article(store, 0, "Weekend weather outlook for the coast", "Light showers are expected over the coast.", source="Mint",
+                feed="mint", url="https://www.livemint.com/weather")
+    stats = pipe.process_pending()
+    assert session.calls == [] and stats.skipped_irrelevant == 1 and stats.jev_used == 0 and stats.llm_used == 0
+    assert store.kv_get("news.reduced_coverage") is None  # nothing was asked, so nothing can have been degraded
+
+
+def test_a_cooldown_keeps_the_flag_raised_until_the_service_answers_again(store, jev_settings, fake_clock):
+    pipe, session, _ = jev_pipe(store, jev_settings, fake_clock, FakeResponse(429, headers={"retry-after": "5400"}))
+    add_deal(store, 0)
+    pipe.process_pending()
+    assert store.kv_get("news.reduced_coverage") == "1" and len(session.calls) == 1
+    add_deal(store, 1, name="Infosys")
+    stats = pipe.process_pending()  # inside the cooldown: no request at all, and the report still says so
+    assert len(session.calls) == 1 and stats.jev_failed == 0 and store.kv_get("news.reduced_coverage") == "1"
+    fake_clock.advance(5400 + 5)
+    session.responses = [jev_response()]
+    add_deal(store, 2, name="Wipro")
+    stats = pipe.process_pending()
+    assert stats.jev_used == 1 and store.kv_get("news.reduced_coverage") == "0"
+
+
+def test_running_out_of_time_is_not_reported_as_degraded_coverage(store, jev_settings, fake_clock):
+    pipe, _, judge = jev_pipe(store, jev_settings, fake_clock, FakeResponse(503), jev_response(), backoff_base=500.0, backoff_cap=500.0)
+    add_deal(store, 0)
+    stats = pipe.process_pending()
+    assert judge.run_failures == 0 and stats.jev_skipped_budget == 1 and store.kv_get("news.reduced_coverage") == "0"

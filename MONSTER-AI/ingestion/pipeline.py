@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -535,7 +534,3 @@ def collect_live_context(store: Store, yahoo: YahooClient, keys: Sequence[str] =
 
 def monotonic_deadline(seconds: float, clock: Clock | None = None) -> float:
     return (clock or get_clock()).monotonic() + seconds
-
-
-def sleep_budget(seconds: float) -> None:  # pragma: no cover - trivial wrapper used by CLI progress loops
-    time.sleep(seconds)

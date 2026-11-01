@@ -103,15 +103,6 @@ def _clean(text: Any, limit: int) -> str:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(str(text or "")))).strip()[:limit]
 
 
-def _release_day(raw: Any, when: datetime) -> str:
-    """Calendar date of an economic release as the feed states it (in the feed's own UTC offset, so a release moved by an hour
-    keeps its date even when the UTC date flips); the UTC date when the text is not an ISO date."""
-    try:
-        return date.fromisoformat(str(raw or "").strip()[:10]).isoformat()
-    except ValueError:
-        return when.date().isoformat()
-
-
 class NewsCollector:
     def __init__(self, store: Store, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
         self.store, self.settings, self.clock = store, settings, clock
@@ -310,56 +301,6 @@ class NewsCollector:
             if current is None or earliest < current:
                 self.store.kv_set("board_meetings.coverage_start", earliest)
         return written
-
-    # -------------------------------------------------------------------------------- economic calendar
-    def collect_econ_calendar(self) -> int:
-        """Upsert this week's releases. A release is keyed on (country, title, release DATE), so a release the publisher moved
-        to another time updates its row (time, impact, forecast) instead of adding a duplicate."""
-        client = HttpClient.from_settings(
-            "econ_calendar", self.settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=1.0, timeout=(8.0, 20.0),
-            max_attempts=2, clock=self.clock, max_bytes=2 * 1024 * 1024)
-        try:
-            data = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json").json()
-        except (DataUnavailable, CircuitOpen) as exc:
-            self.store.record_source_result("econ_calendar", False, error=redact(str(exc)))
-            log.warning("economic calendar collection failed: %s", redact(str(exc)))
-            return 0
-        if not isinstance(data, list):  # e.g. an error object answered with HTTP 200: not "a quiet week"
-            self.store.record_source_result("econ_calendar", False, error="unexpected payload")
-            log.warning("economic calendar collection failed: unexpected payload (%s)", type(data).__name__)
-            return 0
-        now_iso = iso(self._now())
-        releases: dict[str, tuple] = {}
-        legacy_keys: dict[str, str] = {}
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            when = parse_ts(item.get("date"))
-            title = _clean(item.get("title"), 160)
-            if when is None or not title:
-                continue
-            country = str(item.get("country") or "")[:8]
-            key = _hash(f"{country}|{title}|{_release_day(item.get('date'), when)}")
-            row = (key, country, title, str(item.get("impact") or "")[:10], iso(when), str(item.get("forecast") or "")[:40],
-                   str(item.get("previous") or "")[:40], now_iso, now_iso)
-            if key not in releases or row[4] < releases[key][4]:  # same title twice in one day: the earlier time, whatever the order
-                releases[key] = row
-            legacy_keys[_hash(f"{iso(when)}|{country}|{title}")] = key
-        if data and not releases:  # a feed that changed shape must not look like a quiet week
-            self.store.record_source_result("econ_calendar", False, error="no readable items")
-            log.warning("economic calendar collection failed: none of the %d items could be read", len(data))
-            return 0
-        with self.store.tx():
-            for legacy, key in legacy_keys.items():  # rows written before the key ignored the time keep their history
-                self.store.conn.execute("UPDATE OR IGNORE econ_calendar SET event_key = ? WHERE event_key = ?", (key, legacy))
-                self.store.conn.execute("DELETE FROM econ_calendar WHERE event_key = ?", (legacy,))
-            self.store.conn.executemany(
-                "INSERT INTO econ_calendar (event_key, country, title, impact, scheduled_at, forecast, previous, source, first_seen_at, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'faireconomy', ?, ?) ON CONFLICT(event_key) DO UPDATE SET "
-                "impact = excluded.impact, scheduled_at = excluded.scheduled_at, forecast = excluded.forecast, "
-                "previous = excluded.previous, updated_at = excluded.updated_at", list(releases.values()))
-        self.store.record_source_result("econ_calendar", True)
-        return len(releases)
 
     # ---------------------------------------------------------------------------------------- retention
     def prune_raw(self, retention_days: int | None = None) -> int:

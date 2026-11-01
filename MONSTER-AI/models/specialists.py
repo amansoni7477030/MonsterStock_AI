@@ -2,7 +2,7 @@
 primary targets from it; a meta-model then combines them. Similarity is a pass-through (no fitted model).
 
 The news/event specialist is limited to scheduled company events (board-meeting/results calendar) until enough live
-point-in-time snapshots exist to learn from article-level event features (see Settings.min_news_model_days).
+point-in-time snapshots exist to learn from article-level event features.
 """
 
 from __future__ import annotations

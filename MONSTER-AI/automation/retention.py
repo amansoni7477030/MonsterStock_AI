@@ -8,10 +8,8 @@ what                        rule                                                
 raw news / filing text      deleted after N days, structured events kept                  NEWS_RETENTION_DAYS (45)
 structured events           deleted N days after their last update                        EVENT_RETENTION_DAYS (1100)
 pre-open polls              thinned to the last poll per symbol and day after 14 days     (constant)
-pre-open / live quotes,     deleted after N days                                          QUOTE_RETENTION_DAYS (400)
-economic calendar
-daily bars, F&O rows,       kept HISTORY_YEARS + 1 years (the oldest data ever read)      HISTORY_YEARS (10)
-macro vintages
+pre-open / live quotes      deleted after N days                                          QUOTE_RETENTION_DAYS (400)
+daily bars, F&O rows        kept HISTORY_YEARS + 1 years (the oldest data ever read)      HISTORY_YEARS (10)
 snapshots, predictions,     deleted after N days (immutable: pruning is explicit)         RECORD_RETENTION_DAYS (1825)
 outcomes, metrics
 graph edge history          superseded versions older than N days (every edge keeps       RECORD_RETENTION_DAYS (1825)
@@ -120,7 +118,6 @@ def _history_days(settings: Settings) -> int:
 POLICIES: tuple[TablePolicy, ...] = (
     TablePolicy("live_quotes", "live_quotes", "received_at", "ts", lambda s: s.quote_retention_days),
     TablePolicy("preopen_quotes", "preopen_quotes", "trade_date", "date", lambda s: s.quote_retention_days),
-    TablePolicy("econ_calendar", "econ_calendar", "scheduled_at", "ts", lambda s: s.quote_retention_days),
     TablePolicy("events", "events", "last_updated_at", "ts", lambda s: s.event_retention_days),
     TablePolicy("alerts_delivered", "alerts", "created_at", "ts", lambda s: _half(s.ops_retention_days),
                 where="delivered = 1"),
@@ -138,8 +135,6 @@ POLICIES: tuple[TablePolicy, ...] = (
     TablePolicy("fno_daily", "fno_daily", "trade_date", "date", _history_days, key=("symbol", "trade_date"), shrink=False),
     TablePolicy("bars_daily", "bars_daily", "trade_date", "date", _history_days, key=("instrument_id", "trade_date"),
                 shrink=False),
-    TablePolicy("macro_observations", "macro_observations", "observation_date", "date", _history_days,
-                key=("series_id", "observation_date", "realtime_start"), shrink=False),
 )
 
 KV_POLICIES: tuple[KvPolicy, ...] = (
@@ -497,8 +492,7 @@ GROWING_TABLES: tuple[tuple[str, str | None], ...] = (
     ("live_quotes", "received_at"), ("news_raw", "first_seen_at"), ("filings", "first_seen_at"),
     ("events", "last_updated_at"), ("snapshots", "trade_date"), ("predictions", "trade_date"),
     ("outcomes", "trade_date"), ("eval_metrics", "as_of_date"), ("job_runs", "started_at"),
-    ("alerts", "created_at"), ("deliveries", "created_at"), ("macro_observations", "observation_date"),
-    ("econ_calendar", "scheduled_at"), ("graph_edge_history", "valid_from"), ("kv", None),
+    ("alerts", "created_at"), ("deliveries", "created_at"), ("graph_edge_history", "valid_from"), ("kv", None),
 )
 
 

@@ -146,7 +146,7 @@ Exit codes: `0` ok, `1` failure, `2` bad usage, `3` failed and rolled back, `4` 
 /opt/monster-ai/deployment/install.sh --yes` on the server). Code and dependencies are updated, data and secrets
 are kept, services are restarted. If the new release does not become active the previous one is restored
 automatically (exit code 3); the failed tree stays in `/opt/monster-ai.failed` for inspection. Database
-migrations are forward-only and additive; a rollback restores the code, not the schema - take a `sudo
+migrations are forward-only (`0005` drops two tables nothing read, see the [CHANGELOG](../CHANGELOG.md)); a rollback restores the code, not the schema - take a `sudo
 monster-ai backup` before a major upgrade if you want a restore point.
 
 **Rollback by hand** (the previous release is always kept):

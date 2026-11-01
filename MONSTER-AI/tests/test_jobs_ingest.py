@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
 from app.errors import DataUnavailable
 from automation import jobs
+from automation.context import JobResult
 from ingestion.pipeline import IngestReport
 from tests.seed_data import FakeNews, FakeNseApi, make_job_context, panel_ending, populate_store, preopen_rows
 
@@ -51,7 +52,7 @@ def test_collect_global_success_and_failure_modes(env, monkeypatch):
     monkeypatch.setattr(jobs, "collect_gift", lambda *a, **k: {"price": 1})
     monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=33, failed=1))
     ok = jobs.collect_global(ctx_for(env))
-    assert ok.status == "success" and ok.metrics["series_ok"] == 33 and ok.metrics["econ_events"] == 4
+    assert ok.status == "success" and ok.metrics["series_ok"] == 33
     monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=5, failed=20))
     assert jobs.collect_global(ctx_for(env)).status == "failed"
     monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=33, partial=True, notes=["deadline"]))
@@ -165,22 +166,65 @@ def test_trading_jobs_are_skipped_on_holidays(env):
     assert result.status == "skipped" and "closed" in result.message
 
 
-# ----------------------------------------------------------------------------------------------- preflight
-def test_preflight_runs_a_dry_run_scan_without_freezing(env, monkeypatch):
-    monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=3))
-    ctx = ctx_for(env)
-    result = jobs.preflight(ctx)
-    assert result.status == "success", result.message
-    assert "dry-run scan" in result.message and env.store.latest_snapshot("2026-11-02", "pre") is None
-    assert ctx.dry_run is False
+# -------------------------------------------------------------------------------------------- prelim_scan
+def stub_scan(monkeypatch, order):
+    """The scan itself is covered by test_scan.py: record only that (and when) it is asked to run."""
+
+    def fake(ctx, stage):
+        order.append(f"scan:{stage}")
+        return JobResult("success", "scanned")
+
+    monkeypatch.setattr(jobs.scan, "run_scan", fake)
 
 
-def test_preflight_alerts_when_data_cannot_be_repaired(settings, store, fake_clock, panel, monkeypatch):
+def test_prelim_scan_repairs_an_incomplete_previous_session_before_scanning(settings, store, fake_clock, panel, monkeypatch):
+    populate_store(store, panel, skip_last_for=10)  # 14 of 24 names (58 %) have Friday's bar
+    order = []
+    official, repair = fill_bars("2026-10-30"), jobs.ensure_session_bars
+
+    def fetch_official(store_, archive, day):
+        order.append("official file")
+        return official(store_, archive, day)
+
+    def recording_repair(ctx, session, **kw):
+        order.append(("repair", session.isoformat(), kw))
+        return repair(ctx, session, **kw)
+
+    monkeypatch.setattr(jobs, "ingest_bhavcopy", fetch_official)
+    monkeypatch.setattr(jobs, "ensure_session_bars", recording_repair)
+    monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=0))
+    stub_scan(monkeypatch, order)
+    ctx = make_job_context(settings, store, fake_clock)
+    assert jobs.prelim_scan(ctx).status == "success"
+    assert order == [("repair", "2026-10-30", {"budget_sec": 120}), "official file", "scan:pre"]
+    assert jobs.session_coverage(ctx, date(2026, 10, 30))[0] == 1.0
+
+
+@pytest.mark.parametrize(("missing", "repaired"), [(2, False), (3, True)])
+def test_prelim_scan_repairs_only_below_the_coverage_threshold(settings, store, fake_clock, panel, monkeypatch, missing, repaired):
+    populate_store(store, panel, skip_last_for=missing)  # 22 of 24 = 92 % is complete enough; 21 of 24 = 88 % is not
+    calls = []
+    monkeypatch.setattr(jobs, "ensure_session_bars", lambda ctx, session, **kw: calls.append(session) or {})
+    stub_scan(monkeypatch, [])
+    jobs.prelim_scan(make_job_context(settings, store, fake_clock))
+    assert bool(calls) is repaired
+
+
+def test_a_failed_repair_never_stops_the_preliminary_scan(settings, store, fake_clock, panel, monkeypatch):
     populate_store(store, panel, skip_last_for=10)
-    monkeypatch.setattr(jobs, "ingest_bhavcopy", lambda *a, **k: (_ for _ in ()).throw(DataUnavailable("nse", "blocked")))
-    monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=0, failed=10))
-    result = jobs.preflight(make_job_context(settings, store, fake_clock))
-    assert result.status == "failed" and "coverage" in result.message
+    monkeypatch.setattr(jobs, "ensure_session_bars", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("provider exploded")))
+    order = []
+    stub_scan(monkeypatch, order)
+    assert jobs.prelim_scan(make_job_context(settings, store, fake_clock)).status == "success"
+    assert order == ["scan:pre"]
+
+
+def test_prelim_scan_is_skipped_on_holidays_without_touching_the_providers(env, monkeypatch):
+    monkeypatch.setattr(jobs, "ensure_session_bars", lambda *a, **k: pytest.fail("the exchange is closed"))
+    order = []
+    stub_scan(monkeypatch, order)
+    result = jobs.prelim_scan(ctx_for(env, run_key="2026-11-08"))  # Muhurat Sunday: closed for the regular session
+    assert result.status == "skipped" and order == []
 
 
 # ------------------------------------------------------------------------------------------------ ingest_eod

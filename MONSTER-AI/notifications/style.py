@@ -110,7 +110,6 @@ _SAFE_PART = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _HINTS: tuple[tuple[str, str], ...] = (
     ("scan_pre_failed", "sudo monster-ai logs --job prelim_scan"),
     ("scan_final_failed", "sudo monster-ai logs --job final_scan"),
-    ("preflight_failed", "sudo monster-ai scan --stage final --dry-run"),
     ("snapshot_repair", "sudo monster-ai logs --job final_scan"),
     ("report_", "sudo monster-ai jobs"),
     ("job_failed_", "sudo monster-ai logs --job {rest}"),

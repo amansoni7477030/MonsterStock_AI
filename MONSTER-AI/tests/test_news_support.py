@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from database.store import Store
+from news_intelligence.jev import EVENT_DESCRIPTIONS
 
 INSTRUMENTS: list[tuple[str, str, str, int]] = [
     ("RELIANCE", "Reliance Industries Limited", "Oil Gas & Consumable Fuels", 1),
@@ -115,6 +116,28 @@ class FakeResponse:
 
 def ok(content: Any) -> FakeResponse:
     return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+
+
+def jev_answers(event="order_win", p=0.82, conf=0.78, rumour=0.05, denial=0.02, level=3.2, sev_conf=0.7,
+                polarity=(0.7, 0.1, 0.2), pol_conf=0.6, company=True):
+    """The ``answers`` of a valid Jev response to the questions the judge asks (``polarity`` = P(good), P(bad), P(flat))."""
+    rest = {name: round((1 - p) / (len(EVENT_DESCRIPTIONS) - 1), 4) for name in EVENT_DESCRIPTIONS if name != event}
+    out = {
+        "event_type": {"type": "choice", "choice": event, "confidence": conf, "probabilities": {**rest, event: p}},
+        "rumour": {"type": "noul", "noul": rumour},
+        "denial": {"type": "noul", "noul": denial},
+        "severity": {"type": "score", "score": level, "confidence": sev_conf, "legend": {}, "probabilities": {}},
+    }
+    if company:
+        good, bad, flat = polarity
+        out["polarity"] = {"type": "choice", "choice": "positive", "confidence": pol_conf,
+                           "probabilities": {"positive": good, "negative": bad, "neutral": flat}}
+    return out
+
+
+def jev_response(status=200, *, usage=(210, 14), headers=None, **kw):
+    return FakeResponse(status, {"model": "jev-1.14.0", "answers": jev_answers(**kw),
+                                 "usage": {"input_tokens": usage[0], "output_tokens": usage[1]}}, headers=headers)
 
 
 class FakeSession:

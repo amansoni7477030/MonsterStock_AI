@@ -424,7 +424,9 @@ def test_prune_removes_old_raw_rows_but_keeps_events(store, pipe):
     assert [r[0] for r in store.conn.execute("SELECT source_ref FROM filings")] == ["PENDING"]  # unprocessed filings are kept
     assert len(events(store)) == 3 and count(store, "event_articles") == 3  # events and their links survive
     assert count(store, "event_articles", "article_id IS NULL AND filing_id IS NULL") == 2
-    assert pipe.prune() == {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0}
+    assert pipe.prune() == {
+        "news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0,
+    }
 
 
 def test_prune_honours_the_retention_argument_and_cleans_kv(store, pipe, fake_clock):
@@ -438,9 +440,10 @@ def test_prune_honours_the_retention_argument_and_cleans_kv(store, pipe, fake_cl
     assert store.kv_get("news.sig:1") is not None  # the event is within the 14-day clustering window
     fake_clock.advance(20 * 86400)
     store.kv_set("llm:stale", "{}")
+    store.kv_set("jev:stale", "{}")
     fake_clock.advance(20 * 86400)
     out = pipe.prune()
-    assert out["signatures"] == 1 and out["llm_cache"] >= 1 and store.kv_get("news.sig:1") is None
+    assert out["signatures"] == 1 and out["llm_cache"] >= 1 and out["jev_cache"] >= 1 and store.kv_get("news.sig:1") is None
     assert len(events(store)) == 1  # structured events are kept
     assert store.kv_get("news.last_run") is not None  # unrelated keys survive
 

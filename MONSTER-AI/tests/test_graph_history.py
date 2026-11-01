@@ -73,7 +73,8 @@ def test_the_migration_is_additive_keeps_existing_rows_and_baselines_the_current
 
     full = tmp_path / "full"
     shutil.copytree(MIGRATIONS_DIR, full)
-    assert apply_migrations(conn, full) == [4] and current_version(conn) == 4
+    pending = [m.version for m in discover() if m.version >= 4]  # this one and whatever was added after it
+    assert apply_migrations(conn, full) == pending and current_version(conn) == pending[-1]
 
     edge = dict(conn.execute("SELECT * FROM graph_edges").fetchone())
     assert edge["version"] == 3 and edge["source"] == "measured"  # the live table is untouched

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from automation.context import JobContext
-from automation.scan import PREOPEN_POLL_SEC, preopen_coverage, run_scan, scan_cutoff, wait_for_preopen
+from automation.scan import PREOPEN_POLL_SEC, await_preopen, preopen_coverage, run_scan, scan_cutoff
 from notifications.service import NotificationService
 from tests.seed_data import FakeIntel, FakeNseApi, FakeTelegram, panel_ending, populate_store, preopen_rows
 
@@ -213,7 +213,7 @@ def test_preopen_wait_stops_when_final_prices_arrive(env):
     api = FakeNseApi(books=[partial, full])
     ctx._cache["nse_api"] = api
     start = env.clock.now()
-    coverage = wait_for_preopen(ctx, symbols)
+    coverage = await_preopen(ctx, symbols).share
     assert coverage >= 0.9 and api.calls == 2
     assert (env.clock.now() - start).total_seconds() == PREOPEN_POLL_SEC
 
@@ -223,7 +223,7 @@ def test_preopen_wait_gives_up_after_repeated_failures(env):
     ctx = env.make()
     api = FakeNseApi(fail=True)
     ctx._cache["nse_api"] = api
-    assert wait_for_preopen(ctx, env.panel.symbols) == 0.0
+    assert await_preopen(ctx, env.panel.symbols).share == 0.0
     assert api.calls == 3
 
 

@@ -25,7 +25,7 @@ def test_success_returns_json_and_text(fake_clock):
 def test_retries_5xx_with_exponential_backoff_then_succeeds(fake_clock):
     session = FakeSession([FakeResponse(503), FakeResponse(502), FakeResponse(200, b"ok")])
     client = make(session, fake_clock, max_attempts=4)
-    assert client.get_bytes("https://example.com/x") == b"ok"
+    assert client.get("https://example.com/x").content == b"ok"
     assert len(session.calls) == 3 and len(fake_clock.sleeps) == 2
     assert fake_clock.sleeps[1] > fake_clock.sleeps[0] * 0.9  # backoff grows (jittered)
 

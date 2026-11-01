@@ -244,7 +244,7 @@ def test_a_book_with_todays_prices_confirms_the_session(rule_year):
     ctx = rule_year(FakeNseApi(books=[[TODAY_ROW]], book_ts="29-Mar-2027 09:08:30"))
     result = scan.await_preopen(ctx, ["AAA"])
     assert result.usable == 1.0 and result.share == 1.0 and result.reachable and scan.suspected_holiday(ctx, result) is None
-    assert scan.wait_for_preopen(ctx, ["AAA"]) == 1.0  # the plain float API is unchanged
+    assert scan.await_preopen(ctx, ["AAA"]).share == 1.0  # a second wait finds the book complete
 
 
 def test_an_official_year_is_trusted_without_asking(settings, store, fake_clock):

@@ -70,10 +70,10 @@ def test_cross_field_validation(tmp_path, env, needle):
 
 def test_valid_token_and_redaction(tmp_path):
     token = "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789"
-    s = _load(tmp_path, TELEGRAM_BOT_TOKEN=token, TELEGRAM_CHAT_ID="42", FRED_API_KEY="abcdef123456")
+    s = _load(tmp_path, TELEGRAM_BOT_TOKEN=token, TELEGRAM_CHAT_ID="42", BACKUP_PASSPHRASE="abcdef123456")
     assert s.telegram_configured and s.alert_chat_id == "42"
     shown = s.redacted()
-    assert shown["telegram_bot_token"] == "***set***" and shown["fred_api_key"] == "***set***"
+    assert shown["telegram_bot_token"] == "***set***" and shown["backup_passphrase"] == "***set***"
     assert token not in str(shown)
     assert token in s.secrets()
     assert token not in repr(s) and "abcdef123456" not in repr(s) and "***set***" in repr(s)  # logs and tracebacks stay clean

@@ -43,7 +43,6 @@ def test_critical_job_preempts_a_running_noncritical_job(env):
     # a long collection job is running when the preliminary scan becomes due
     env.store.job_record("collect_global", "2026-11-02", "success")
     env.store.job_record("collect_india", "2026-11-02", "success")
-    env.store.job_record("preflight", "2026-11-02", "success")
     for slot in ("early", "late"):
         env.store.job_record("collect_news", f"2026-11-02:{slot}", "success")
     env.store.job_record("health_check", "2026-11-02:morning", "success")

@@ -9,12 +9,10 @@ Generated from `ingestion/registry.py` (run `python scripts/generate_docs.py`). 
 | `nse_bhavcopy` | important | NSE archives (sec_bhavdata_full) | yahoo_daily |
 | `nse_fo_bhavcopy` | important | NSE archives (UDiFF F&O bhavcopy) | - |
 | `nse_lists` | important | NSE archives (index constituents, F&O lot sizes) | seed_universe |
-| `nse_api_market` | important | NSE public JSON API (marketStatus, pre-open, option chain, holidays) | yahoo_quote |
+| `nse_api_market` | important | NSE public JSON API (marketStatus, pre-open, holidays) | yahoo_quote |
 | `nse_announcements` | important | NSE corporate announcements API | rss_news |
 | `rss_news` | important | Publisher RSS/Atom feeds (data/seeds/feeds.json) | gdelt |
 | `gdelt` | optional | GDELT Project DOC 2.0 API | rss_news |
-| `fred` | optional | Federal Reserve Bank of St. Louis (FRED/ALFRED) | yahoo_daily |
-| `econ_calendar` | optional | Public economic-calendar mirror (faireconomy JSON) | - |
 | `llm_extraction` | optional | Configured OpenAI-compatible LLM API | rules |
 
 ## Transport and request strategy
@@ -44,10 +42,10 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 ## `yahoo_quote` - Yahoo Finance (unofficial chart API)
 
 - **Endpoint:** `https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m`
-- **Coverage:** Live/recent intraday bars and last price (Asia open moves, US futures)
+- **Coverage:** Last price and previous close (Asia open moves, US futures); the 5-minute bars the endpoint also returns are not used
 - **Timestamp meaning:** Last trade time reported by the exchange (UTC epoch)
 - **Update frequency:** Real-time to ~15 min delayed
-- **History depth:** ~60 days of 5m bars
+- **History depth:** Latest quote only (the endpoint serves ~60 days of 5m bars; none are stored)
 - **Rate limits:** Same as yahoo_daily
 - **Transport and request strategy:** client `yahoo` (shared spacing): one 5-minute chart request per context symbol (Asia indices, US futures, USD/INR, crude) per collection; a failure never blocks a report.
 - **Licensing:** Unofficial / public endpoint: suitable for research and shadow operation; confirm the provider's terms before any commercial or redistributed use and prefer a licensed feed for production.
@@ -93,10 +91,10 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Failure behaviour:** Keep the previously stored universe; seed file used on first install
 - **Backup source:** seed_universe
 
-## `nse_api_market` - NSE public JSON API (marketStatus, pre-open, option chain, holidays)
+## `nse_api_market` - NSE public JSON API (marketStatus, pre-open, holidays)
 
 - **Endpoint:** `https://www.nseindia.com/api/*`
-- **Coverage:** GIFT Nifty, indicative/final pre-open prices and order imbalance, live option chain, trading holidays
+- **Coverage:** GIFT Nifty, indicative/final pre-open prices and order imbalance, trading holidays
 - **Timestamp meaning:** Server timestamps in IST (parsed with an explicit IST assumption)
 - **Update frequency:** Live during pre-open / session
 - **History depth:** Live only (not point-in-time reconstructable)
@@ -144,32 +142,6 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Licensing:** Free research use; discovery only - verify facts against primary sources.
 - **Failure behaviour:** Backoff on 429; skipped queries recorded as coverage gap
 - **Backup source:** rss_news
-
-## `fred` - Federal Reserve Bank of St. Louis (FRED/ALFRED)
-
-- **Endpoint:** `https://api.stlouisfed.org/fred/series/observations`
-- **Coverage:** US rates and macro series with vintages when an API key is set
-- **Timestamp meaning:** observation_date + realtime_start (first-release timestamp)
-- **Update frequency:** Per release
-- **History depth:** Decades
-- **Rate limits:** 120 requests/minute with key
-- **Transport and request strategy:** client `fred`: curl_cffi without browser impersonation (an official API gets an honest User-Agent), 0.6 s spacing, 3 attempts; one request per series; a no-op without `FRED_API_KEY`.
-- **Licensing:** Free with an API key; see FRED terms.
-- **Failure behaviour:** Optional and informational: first-release values are stored (macro_observations) but no feature or report line reads them yet; market-based yields come from Yahoo; revised values are never used as point-in-time history
-- **Backup source:** yahoo_daily
-
-## `econ_calendar` - Public economic-calendar mirror (faireconomy JSON)
-
-- **Endpoint:** `https://nfs.faireconomy.media/ff_calendar_thisweek.json`
-- **Coverage:** Scheduled macro releases with impact tags
-- **Timestamp meaning:** Scheduled release time with UTC offset
-- **Update frequency:** Daily
-- **History depth:** Current week
-- **Rate limits:** Fetch at most a few times per day
-- **Transport and request strategy:** client `econ_calendar`: one request per collection, 1 s spacing.
-- **Licensing:** Unofficial / public endpoint: suitable for research and shadow operation; confirm the provider's terms before any commercial or redistributed use and prefer a licensed feed for production.
-- **Failure behaviour:** Optional and informational: the schedule is stored (econ_calendar) but no feature or report line reads it yet, so a failure changes nothing
-- **Backup source:** none
 
 ## `llm_extraction` - Configured OpenAI-compatible LLM API
 

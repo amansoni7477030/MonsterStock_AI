@@ -196,11 +196,14 @@ def test_backoff_is_exponential_bounded_and_honours_retry_after(cfg, store, reso
     extractor2, _ = make(cfg, store, resolver, fake_clock, FakeResponse(429, headers={"Retry-After": "5"}), ok(reply()))
     assert extractor2.extract(TITLE + "a", TEXT) is not None and fake_clock.sleeps == [5.0]
     fake_clock.sleeps.clear()
-    extractor3, _ = make(cfg, store, resolver, fake_clock, FakeResponse(429, headers={"retry-after": "9999"}), ok(reply()))
-    assert extractor3.extract(TITLE + "b", TEXT) is not None and fake_clock.sleeps == [30.0]
+    extractor3, _ = make(cfg, store, resolver, fake_clock, FakeResponse(429, headers={"retry-after": "30"}), ok(reply()))
+    assert extractor3.extract(TITLE + "b", TEXT) is not None and fake_clock.sleeps == [30.0]  # up to 30 s is slept through
     fake_clock.sleeps.clear()
     extractor4, _ = make(cfg, store, resolver, fake_clock, FakeResponse(429, headers={"Retry-After": "soon"}), ok(reply()))
     assert extractor4.extract(TITLE + "c", TEXT) is not None and fake_clock.sleeps == [1.0]
+    fake_clock.sleeps.clear()
+    extractor5, _ = make(cfg, store, resolver, fake_clock, FakeResponse(429, headers={"retry-after": "1m30s"}), ok(reply()))
+    assert extractor5.extract(TITLE + "d", TEXT) is None  # a duration header is understood: 90 s is a quota, not a pause
 
 
 def test_transport_errors_are_retried_and_giving_up_returns_none(cfg, store, resolver, fake_clock, caplog):

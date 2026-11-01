@@ -18,7 +18,7 @@ import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -338,13 +338,6 @@ def trading_days_before(calendar: ExchangeCalendar, end: date, count: int) -> li
         if (end - cursor).days > count * 3 + 30:
             break
     return sorted(out)
-
-
-def parse_hhmm(value: str) -> time:
-    parts = [int(p) for p in value.split(":")]
-    while len(parts) < 3:
-        parts.append(0)
-    return time(*parts[:3])
 
 
 def utc(dt: datetime) -> datetime:

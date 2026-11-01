@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.clock import iso, utcnow
-from app.errors import DatabaseCorrupt, MonsterError
+from app.errors import MonsterError
 from database.connection import transaction
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
@@ -105,8 +105,3 @@ def check_integrity(conn: sqlite3.Connection, *, quick: bool = True) -> bool:
     except sqlite3.DatabaseError:
         return False
     return rows == ["ok"]
-
-
-def require_integrity(conn: sqlite3.Connection) -> None:
-    if not check_integrity(conn):
-        raise DatabaseCorrupt("SQLite integrity check failed")

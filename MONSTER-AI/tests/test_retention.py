@@ -94,12 +94,6 @@ def seeded(store: Store) -> Store:
         c.execute("INSERT INTO bars_daily (instrument_id, trade_date, close, source, received_at) VALUES (?, ?, 1, 'x', ?)",
                   (instrument, d(age), ts(0)))
         c.execute("INSERT INTO fno_daily (symbol, trade_date, received_at) VALUES ('AAA', ?, ?)", (d(age), ts(0)))
-    for age in (5000, 100):
-        c.execute("INSERT INTO macro_observations (series_id, observation_date, realtime_start, realtime_end, first_seen_at) "
-                  "VALUES ('S', ?, ?, ?, ?)", (d(age), d(age), d(age), ts(0)))
-    for key, scheduled in (("old", ts(500)), ("future", ts(-3))):
-        c.execute("INSERT INTO econ_calendar (event_key, title, scheduled_at, source, first_seen_at, updated_at) "
-                  "VALUES (?, 't', ?, 's', ?, ?)", (key, scheduled, ts(0), ts(0)))
     for key, updated in (("evaluation:2019-01-01", ts(2000)), ("evaluation:2026-10-30", ts(3)),
                          ("yahoo:fetched:GONE", ts(60)), ("yahoo:fetched:AAA", ts(1)), ("bootstrap.state", ts(900))):
         c.execute("INSERT INTO kv (key, value, updated_at) VALUES (?, 'v', ?)", (key, updated))
@@ -123,8 +117,6 @@ def test_expired_rows_go_and_recent_rows_stay(seeded, settings, clock):
     assert [r["as_of_date"] for r in seeded.conn.execute("SELECT as_of_date FROM eval_metrics")] == [d(10)]
     assert [r["trade_date"] for r in seeded.conn.execute("SELECT trade_date FROM bars_daily ORDER BY 1")] == [d(3000), d(1)]
     assert [r["trade_date"] for r in seeded.conn.execute("SELECT trade_date FROM fno_daily ORDER BY 1")] == [d(3000), d(1)]
-    assert [r["observation_date"] for r in seeded.conn.execute("SELECT observation_date FROM macro_observations")] == [d(100)]
-    assert [r["event_key"] for r in seeded.conn.execute("SELECT event_key FROM econ_calendar")] == ["future"]
     keys = {r["key"] for r in seeded.conn.execute("SELECT key FROM kv")}
     assert "evaluation:2019-01-01" not in keys and "yahoo:fetched:GONE" not in keys
     assert {"evaluation:2026-10-30", "yahoo:fetched:AAA", "bootstrap.state"} <= keys  # state is never pruned by age
@@ -140,7 +132,7 @@ def test_zero_means_keep_forever(seeded, settings, clock):
     forever = dataclasses.replace(settings, record_retention_days=0, quote_retention_days=0, event_retention_days=0,
                                   ops_retention_days=0)
     before = {t: count(seeded, t) for t in ("live_quotes", "events", "alerts", "deliveries", "job_runs", "eval_metrics",
-                                            "econ_calendar", "preopen_quotes")}
+                                            "preopen_quotes")}
     run(seeded, forever, clock)
     after = {t: count(seeded, t) for t in before}
     assert after.pop("preopen_quotes") < before.pop("preopen_quotes")  # thinning is not a window

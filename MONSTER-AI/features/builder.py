@@ -260,8 +260,3 @@ def _full_market_vector(
     if name == "p_mkt_gap" and gap_pct is not None:
         return gap_pct.mean(axis=1, skipna=True).to_numpy(dtype=np.float64)
     return np.full(len(dates), np.nan)
-
-
-def finite_mask(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
-    """Rows where every named column is finite."""
-    return frame[columns].notna().all(axis=1)

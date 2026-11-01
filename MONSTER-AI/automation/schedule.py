@@ -67,7 +67,6 @@ SCHEDULE: tuple[ScheduleEntry, ...] = (
     E("collect_news", "08:10", "08:38", slot="late", retry_sec=600, max_attempts=2),
     E("health_check", "07:50", "08:20", days="any", slot="morning", retry_sec=600, max_attempts=2),
     E("collect_india", "08:00", "08:35", retry_sec=300, max_attempts=6),
-    E("preflight", "08:30", "08:43", retry_sec=240, max_attempts=3, after=("collect_india",)),
     E("prelim_scan", "08:45", "09:02", retry_sec=180, max_attempts=5),
     E("refresh_preopen", "09:00:30", "09:07:30", retry_sec=60, max_attempts=2),
     E("final_scan", "09:08:45", "09:13:30", retry_sec=45, max_attempts=3),

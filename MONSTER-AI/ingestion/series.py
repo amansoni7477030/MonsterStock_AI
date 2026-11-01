@@ -91,10 +91,6 @@ CRITICAL_KEYS: tuple[str, ...] = tuple(s.key for s in SERIES if s.critical)
 INDIA_MARKET = "^NSEI"
 
 
-def spec_for(key: str) -> SeriesSpec | None:
-    return SERIES_BY_KEY.get(key)
-
-
 def latest_available_date(spec: SeriesSpec, dates: list[date], cutoff: datetime) -> date | None:
     """Most recent bar date whose bar is final at ``cutoff`` (``dates`` ascending)."""
     for d in reversed(dates):

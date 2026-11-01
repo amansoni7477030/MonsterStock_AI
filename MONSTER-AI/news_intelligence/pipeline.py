@@ -1,14 +1,14 @@
 """Raw items -> structured, deduplicated, point-in-time-queryable events.
 
 ``process_pending`` turns unprocessed ``news_raw`` rows and ``filings`` into ``events`` / ``event_articles`` (rules first,
-optional validated LLM enrichment), marking each row processed in the same transaction as its event write, so it is
+optional validated LLM enrichment and optional Jev judgments), marking each row processed in the same transaction as its event write, so it is
 idempotent and crash-safe. An item that raises is never silently lost: it stays unprocessed and is retried on the next runs,
 and only after ``MAX_ATTEMPTS`` failed attempts is it flagged (``processed = 2``) and logged at ERROR. The read side
 (``event_features``, ``catalysts_for`` ...) only uses data known at ``as_of``.
 
 kv keys used: ``news.sig:<event_id>`` (clustering signatures, pruned with the lookup window), ``news.last_run`` (stats),
-``news.reduced_coverage`` ('1' while the configured LLM is failing), ``news.retries`` (failed attempts of the items still
-waiting for a retry), ``llm:<hash>`` / ``llm.calls`` / ``llm.failures``.
+``news.reduced_coverage`` ('1' while a configured AI service is failing), ``news.retries`` (failed attempts of the items still
+waiting for a retry), ``llm:<hash>`` / ``llm.calls`` / ``llm.failures`` and ``jev:<hash>`` / ``jev.calls`` / ``jev.failures``.
 
 Evidence entries (one per distinct origin, ``events.evidence_json``) carry what a point-in-time reader needs: ``sc`` source
 class, ``rum`` / ``den`` when the report is a rumour / a denial, and ``event_time_bound`` (the publication time, an upper bound)
@@ -47,8 +47,10 @@ from news_intelligence.dedup import (
     event_confidence,
 )
 from news_intelligence.entities import Entity, EntityResolver
-from news_intelligence.events import EVENT_TYPES, EventDraft, assign_polarity, classify_rules, extract_moves
+from news_intelligence.events import EVENT_TYPES, EventDraft, assign_polarity, classify_rules, extract_moves, primary_company
+from news_intelligence.jev import JevJudge, merge_jev, prune_jev_cache
 from news_intelligence.llm import LLMExtractor, LLMResult, prune_llm_cache
+from news_intelligence.remote import RemoteJudge
 from news_intelligence.priced_in import assess_reaction
 from news_intelligence.source_quality import get_registry, source_class_of, split_publisher_suffix
 from news_intelligence.text import clean_text, domain_of, is_probably_english, lead, url_hash
@@ -66,6 +68,7 @@ GAVE_UP = 2  # the ``processed`` value of such an item (0 = pending, 1 = process
 MAX_ENTITIES = 24
 MAX_CONTRADICTIONS = 8
 ENGLISH_CODES = frozenset({"", "en", "eng", "english"})
+OFFICIAL_CLASSES = frozenset({"exchange_filing", "official"})  # first-hand reports: never a rumour, whatever an AI says
 BarsProvider = Callable[[str, str | None, str | None], pd.DataFrame]
 
 
@@ -80,6 +83,13 @@ class ProcessStats:
     llm_cached: int = 0
     llm_failed: int = 0
     llm_skipped_budget: int = 0
+    jev_used: int = 0
+    jev_cached: int = 0
+    jev_failed: int = 0
+    jev_skipped_budget: int = 0
+    jev_retyped: int = 0  # items whose event type Jev changed
+    jev_rumours: int = 0  # items Jev flagged as an unconfirmed rumour that the rules had missed
+    jev_denials: int = 0
     skipped_non_english: int = 0
     skipped_empty: int = 0
     skipped_routine: int = 0
@@ -132,6 +142,21 @@ def _entity_json(entity: Entity) -> dict[str, Any]:
     return data
 
 
+def _consensus(direction: float, other: float) -> float:
+    """Two independent readings of the same direction: their mean when they agree, unknown (0) when they point opposite ways,
+    and the one reading when the other has none."""
+    if other == 0.0:
+        return round(direction, 3)
+    return round((direction + other) / 2.0, 3) if direction * other > 0 else 0.0
+
+
+def _failing(service: RemoteJudge) -> bool:
+    """True when an AI service is refusing us (cooldown) or failed often enough in this run that rules covered the items.
+    Running out of the run's time budget is not a failure."""
+    failed = service.run_failures > 0 and (service.tripped or service.run_failures / max(service.run_calls, 1) >= 0.2)
+    return failed or service.cooldown_active()
+
+
 class NewsPipeline:
     def __init__(
         self,
@@ -140,6 +165,7 @@ class NewsPipeline:
         *,
         clock: Clock | None = None,
         llm: LLMExtractor | None = None,
+        jev: JevJudge | None = None,
         resolver: EntityResolver | None = None,
         point_in_time_edges: bool = False,
     ) -> None:
@@ -150,8 +176,10 @@ class NewsPipeline:
         self.clock = clock or get_clock()
         self.resolver = resolver or EntityResolver(store)
         self.llm = llm if llm is not None else (LLMExtractor(settings, clock=self.clock) if settings.llm_configured else None)
-        if self.llm is not None:
-            self.llm.bind(store=store, resolver=self.resolver)
+        self.jev = jev if jev is not None else (JevJudge(settings, clock=self.clock) if settings.jev_configured else None)
+        for service in (self.llm, self.jev):
+            if service is not None:
+                service.bind(store=store, resolver=self.resolver)
         self.point_in_time_edges = point_in_time_edges
         self._engine: GraphImpactEngine | None = None
         self._graph_repo = GraphRepository(store)
@@ -164,8 +192,9 @@ class NewsPipeline:
         that raises stays unprocessed for the next run (an item is attempted once per run) until ``MAX_ATTEMPTS`` is reached."""
         started = self.clock.monotonic()
         stats = ProcessStats()
-        if self.llm is not None:
-            self.llm.start_run()
+        for service in (self.llm, self.jev):
+            if service is not None:
+                service.start_run()
         now = self.clock.now()
         clusterer = self._load_clusterer(now)
         self._retries = self._load_retries()
@@ -257,14 +286,27 @@ class NewsPipeline:
             stats.llm_failed = self.llm.run_failures
             stats.llm_cached = self.llm.run_cache_hits
             stats.llm_skipped_budget = self.llm.run_budget_skipped
-            if self.llm.configured and (self.llm.run_calls or self.llm.tripped):
-                failing = self.llm.run_failures > 0 and (
-                    self.llm.tripped or self.llm.run_failures / max(self.llm.run_calls, 1) >= 0.2
-                )
-                self.store.kv_set("news.reduced_coverage", "1" if failing else "0")
+        if self.jev is not None:
+            stats.jev_used = max(0, self.jev.run_calls - self.jev.run_failures)
+            stats.jev_failed = self.jev.run_failures
+            stats.jev_cached = self.jev.run_cache_hits
+            stats.jev_skipped_budget = self.jev.run_budget_skipped
+        self._flag_coverage()
         stats.elapsed_sec = round(self.clock.monotonic() - started, 3)
         self.store.kv_set_json("news.last_run", {"at": iso(now), **stats.as_dict()})
         return stats
+
+    def _flag_coverage(self) -> None:
+        """``news.reduced_coverage`` is '1' while a configured AI service that was used in this run is failing (``news.coverage``
+        names which). A run that called none of them (nothing new to ask, or none configured) leaves both untouched."""
+        state = {
+            name: _failing(service)
+            for name, service in (("llm", self.llm), ("jev", self.jev))
+            if service is not None and service.configured and (service.run_calls or service.tripped)
+        }
+        if state:
+            self.store.kv_set_json("news.coverage", state)
+            self.store.kv_set("news.reduced_coverage", "1" if any(state.values()) else "0")
 
     # ------------------------------------------------------------------------------------ fetching
     def _fetch_batch(self, kind: str, limit: int, after: tuple[str, int] | None = None) -> list[sqlite3.Row]:
@@ -417,14 +459,19 @@ class NewsPipeline:
             stats.skipped_irrelevant += 1  # an unclassifiable filing has no structure worth an event or an LLM call
             return None
         method, quote, event_time = "rules", None, None
-        llm_polarity: dict[str, float] = {}
-        result = self.llm.extract(title, body) if self.llm is not None and (draft.event_type != "other" or entities) else None
+        ai_polarity: dict[str, float] = {}  # directions an AI service gave a company: they override the rules' reading
+        worth_asking = draft.event_type != "other" or bool(entities)  # the rules already said the item is irrelevant: spend nothing
+        result = self.llm.extract(title, body) if self.llm is not None and worth_asking else None
         if result is not None:
             method = "rules+llm"
-            quote, event_time = self._merge_llm(draft, entities, result, scan, llm_polarity)
+            quote, event_time = self._merge_llm(draft, entities, result, scan, ai_polarity)
         pol = assign_polarity(draft, entities, scan)
+        if self.jev is not None and worth_asking:
+            judged = self._judge_with_jev(title, body, draft, entities, scan, source_kind, ai_polarity, pol, stats)
+            if judged is not None:
+                method, pol = f"{method}+jev", judged
         for entity in entities:
-            entity.polarity = llm_polarity.get(entity.id, pol.get(entity.id, 0.0))
+            entity.polarity = ai_polarity.get(entity.id, pol.get(entity.id, 0.0))
         for entity_id, move in extract_moves(scan, entities).items():
             next(e for e in entities if e.id == entity_id).move_pct = move
         if draft.event_type == "other" and not entities:
@@ -432,9 +479,33 @@ class NewsPipeline:
             return None
         return draft, entities[:MAX_ENTITIES], scan, method, quote, event_time
 
+    def _judge_with_jev(
+        self, title: str, body: str, draft: EventDraft, entities: list[Entity], scan: str, source_kind: str,
+        ai_polarity: dict[str, float], pol: dict[str, float], stats: ProcessStats,
+    ) -> dict[str, float] | None:
+        """Ask Jev about the item and fold its judgment into the draft (see :func:`merge_jev`). The direction question is about
+        the company the rules or the LLM already signed the event for, else the most prominent one, and the answer is blended
+        into that company's direction. Returns the rules' directions for the merged draft, or ``None`` when Jev did not answer."""
+        assert self.jev is not None
+        known = {e.id: ai_polarity.get(e.id, pol.get(e.id, 0.0)) for e in entities if e.type == "company"}
+        signed = [e for e in entities if known.get(e.id)]
+        focus = max(signed, key=lambda e: abs(known[e.id])) if signed else primary_company(entities)
+        kind = source_class_of(source_kind)
+        judgment = self.jev.judge(title, body, company=focus.name if focus is not None else None, source_kind=kind)
+        if judgment is None:
+            return None
+        effect = merge_jev(draft, judgment, min_confidence=self.jev.min_confidence, official=kind in OFFICIAL_CLASSES)
+        stats.jev_retyped += int(effect.retyped)
+        stats.jev_rumours += int(effect.rumour_flagged)
+        stats.jev_denials += int(effect.denial_flagged)
+        pol = assign_polarity(draft, entities, scan)  # the merge may have changed the type or the rumour state
+        if effect.polarity is not None and focus is not None:
+            ai_polarity[focus.id] = _consensus(effect.polarity, ai_polarity.get(focus.id, pol.get(focus.id, 0.0)))
+        return pol
+
     @staticmethod
     def _merge_llm(
-        draft: EventDraft, entities: list[Entity], result: LLMResult, scan: str, llm_polarity: dict[str, float]
+        draft: EventDraft, entities: list[Entity], result: LLMResult, scan: str, ai_polarity: dict[str, float]
     ) -> tuple[str | None, str | None]:
         """Fold a validated LLM result into the rule draft; returns ``(verified quote, event time)``. Everything the LLM
         derived that its supporting quote does not back is dropped, the event time included (it must not fabricate evidence)."""
@@ -462,7 +533,7 @@ class NewsPipeline:
                 entities.append(entity)
                 present.add(entity.id)
             if verified and entity.polarity:
-                llm_polarity[entity.id] = entity.polarity
+                ai_polarity[entity.id] = entity.polarity
         return (result.evidence_quote, result.event_time) if verified else (None, None)
 
     @staticmethod
@@ -785,7 +856,7 @@ class NewsPipeline:
         days = int(retention_days if retention_days is not None else self.settings.news_retention_days)
         now = self.clock.now()
         cutoff = iso(now - timedelta(days=days))
-        out = {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0}
+        out = {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0}
         for table, column, extra in (("news_raw", "article_id", ""), ("filings", "filing_id", " AND processed <> 0")):
             with self._bulk_delete():
                 while True:
@@ -814,6 +885,7 @@ class NewsPipeline:
             )
             out["signatures"] = max(removed.rowcount, 0)
         out["llm_cache"] = self.llm.prune_cache() if self.llm is not None else prune_llm_cache(self.store, now)
+        out["jev_cache"] = self.jev.prune_cache() if self.jev is not None else prune_jev_cache(self.store, now)
         return out
 
     # ===================================================================================== queries

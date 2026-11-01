@@ -41,9 +41,9 @@ SOURCES: tuple[dict[str, Any], ...] = (
     dict(
         source_id="yahoo_quote", provider="Yahoo Finance (unofficial chart API)",
         endpoint="https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m",
-        coverage="Live/recent intraday bars and last price (Asia open moves, US futures)",
+        coverage="Last price and previous close (Asia open moves, US futures); the 5-minute bars the endpoint also returns are not used",
         timestamp_meaning="Last trade time reported by the exchange (UTC epoch)", update_frequency="Real-time to ~15 min delayed",
-        history_depth="~60 days of 5m bars", rate_limits="Same as yahoo_daily", license_notes=UNLICENSED,
+        history_depth="Latest quote only (the endpoint serves ~60 days of 5m bars; none are stored)", rate_limits="Same as yahoo_daily", license_notes=UNLICENSED,
         failure_behavior="Descriptive context only; absence never blocks a report", backup_source=None, criticality="optional",
     ),
     dict(
@@ -76,8 +76,8 @@ SOURCES: tuple[dict[str, Any], ...] = (
         backup_source="seed_universe", criticality="important",
     ),
     dict(
-        source_id="nse_api_market", provider="NSE public JSON API (marketStatus, pre-open, option chain, holidays)",
-        endpoint="https://www.nseindia.com/api/*", coverage="GIFT Nifty, indicative/final pre-open prices and order imbalance, live option chain, trading holidays",
+        source_id="nse_api_market", provider="NSE public JSON API (marketStatus, pre-open, holidays)",
+        endpoint="https://www.nseindia.com/api/*", coverage="GIFT Nifty, indicative/final pre-open prices and order imbalance, trading holidays",
         timestamp_meaning="Server timestamps in IST (parsed with an explicit IST assumption)", update_frequency="Live during pre-open / session",
         history_depth="Live only (not point-in-time reconstructable)", rate_limits="Cookie handshake required; ~1 request/second; frequent 401/403 from datacentre IPs",
         license_notes=EXCHANGE_PUBLIC + " Endpoints are undocumented and may change without notice.",
@@ -107,22 +107,6 @@ SOURCES: tuple[dict[str, Any], ...] = (
         update_frequency="15 minutes", history_depth="Rolling ~3 months via API", rate_limits="<= 1 request per 5 s; 429 on bursts",
         license_notes="Free research use; discovery only - verify facts against primary sources.",
         failure_behavior="Backoff on 429; skipped queries recorded as coverage gap", backup_source="rss_news", criticality="optional",
-    ),
-    dict(
-        source_id="fred", provider="Federal Reserve Bank of St. Louis (FRED/ALFRED)",
-        endpoint="https://api.stlouisfed.org/fred/series/observations", coverage="US rates and macro series with vintages when an API key is set",
-        timestamp_meaning="observation_date + realtime_start (first-release timestamp)", update_frequency="Per release",
-        history_depth="Decades", rate_limits="120 requests/minute with key", license_notes="Free with an API key; see FRED terms.",
-        failure_behavior="Optional and informational: first-release values are stored (macro_observations) but no feature or report line reads them yet; market-based yields come from Yahoo; revised values are never used as point-in-time history",
-        backup_source="yahoo_daily", criticality="optional",
-    ),
-    dict(
-        source_id="econ_calendar", provider="Public economic-calendar mirror (faireconomy JSON)",
-        endpoint="https://nfs.faireconomy.media/ff_calendar_thisweek.json", coverage="Scheduled macro releases with impact tags",
-        timestamp_meaning="Scheduled release time with UTC offset", update_frequency="Daily", history_depth="Current week",
-        rate_limits="Fetch at most a few times per day", license_notes=UNLICENSED,
-        failure_behavior="Optional and informational: the schedule is stored (econ_calendar) but no feature or report line reads it yet, so a failure changes nothing",
-        backup_source=None, criticality="optional",
     ),
     dict(
         source_id="llm_extraction", provider="Configured OpenAI-compatible LLM API", endpoint="LLM_API_BASE/chat/completions",
@@ -179,10 +163,6 @@ def _fetch_strategy() -> dict[str, str]:
             f"one 304; one unconditional fetch every {FEED_FULL_REFRESH_HOURS} h; a feed that fails {FEED_DISABLE_AFTER} times in a "
             f"row is parked for {FEED_DISABLE_HOURS} h; collection is deadline-bounded."),
         "gdelt": "client `gdelt`: one request per configured query, 6 s apart, back-off on 429.",
-        "fred": (
-            "client `fred`: curl_cffi without browser impersonation (an official API gets an honest User-Agent), 0.6 s spacing, "
-            "3 attempts; one request per series; a no-op without `FRED_API_KEY`."),
-        "econ_calendar": "client `econ_calendar`: one request per collection, 1 s spacing.",
         "llm_extraction": (
             "not scraped: the configured provider's own API through a `requests` session with its own timeout and retry rules "
             "and a per-run article budget."),

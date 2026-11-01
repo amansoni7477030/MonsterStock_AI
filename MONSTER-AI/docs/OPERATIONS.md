@@ -136,7 +136,6 @@ Optional capabilities, all off by default:
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
 | External training | `TRAINING_MODE=external`, `MODEL_SIGNING_KEY`, `MODEL_ARTIFACT_URL` or `S3_*` |
 | Dashboard | `DASHBOARD_ENABLED=true` (+ `DASHBOARD_TOKEN` if bound beyond loopback) |
-| Macro series | `FRED_API_KEY` (stored for research; no feature reads it yet) |
 
 ## Alerts and what to do
 
@@ -147,7 +146,6 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | Code | Meaning | What to do |
 |------|---------|------------|
 | `scan_final_failed` / `scan_pre_failed` | the scan stopped (usually the **data-quality gate**: previous session incomplete, global block stale, no universe) | read the message; `monster-ai scan --stage final --dry-run`; see [no report](#no-report-this-morning) |
-| `preflight_failed` | the 08:30 dry run failed, so the 09:00 scan would have too | same as above; it is a warning *before* the report time |
 | `holiday_inferred` | NSE published no pre-open book on a day the calendar called a trading day, in a year whose official holiday list is not out yet: the day was recorded as closed and no report was sent | none if the day really was a holiday; if it was a normal day, see [calendar](#the-calendar-every-month-every-year) |
 | `snapshot_repaired` / `snapshot_repair_failed` | a retried scan found a frozen snapshot without its predictions (an old interrupted freeze) and restored them from the snapshot / could not | informational / `monster-ai logs --job final_scan`; the report is re-sent either way |
 | `job_failed_<job>` / `job_crashed_<job>` | a job exhausted its retries / its process died | `monster-ai logs --job <job>`; `monster-ai logs`; the daemon tries the job again at its next window |
@@ -228,7 +226,7 @@ often it happened.
 ### NSE blocks the server (HTTP 403)
 
 NSE blocks some data-centre ranges. The system runs degraded and says so: the official archive and Yahoo still feed the
-price history; the pre-open book and option chains are missing, so the final report uses the preliminary model for
+price history; the pre-open book is missing, so the final report uses the preliminary model for
 names without a pre-open price. If it is permanent: use a server in an Indian region, or set `NSE_ENABLED=false` to stop
 the attempts and accept the reduced data.
 
@@ -481,7 +479,7 @@ with the same key and bucket. Rotating the key: change both sides, then run the 
 ## Upgrading
 
 Run the same deployment command again (see [deployment/README.md](../deployment/README.md#upgrade-rollback-uninstall)): it installs
-the new release next to the old one, migrates the database (migrations are forward-only and additive), restarts the services and
+the new release next to the old one, migrates the database (migrations are forward-only; `0005` drops two tables nothing read, see the [CHANGELOG](../CHANGELOG.md)), restarts the services and
 **rolls back by itself** if the new release does not come up. Afterwards:
 
 ```bash

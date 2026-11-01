@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -152,20 +152,6 @@ class YahooClient:
         return YahooSeries(symbol, meta, bars, sorted(splits, key=lambda s: s["ex_date"]),
                            sorted(dividends, key=lambda d: d["ex_date"]))
 
-    def fetch_intraday(self, symbol: str, *, interval: str = "5m", range_: str = "1d") -> list[dict[str, Any]]:
-        """Intraday bars (UTC timestamps) for post-session analysis of the day's path (time-to-extreme, MFE/MAE)."""
-        result = self._chart(symbol, {"range": range_, "interval": interval, "includePrePost": "false"})
-        stamps = result.get("timestamp") or []
-        q = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-        out = []
-        for idx, stamp in enumerate(stamps):
-            o, h, low, c = (_num(_at(q.get(k), idx)) for k in ("open", "high", "low", "close"))
-            if None in (o, h, low, c):
-                continue
-            out.append({"ts": iso(datetime.fromtimestamp(int(stamp), timezone.utc)), "open": o, "high": h, "low": low,
-                        "close": c, "volume": _num(_at(q.get("volume"), idx))})
-        return out
-
     def fetch_quote(self, symbol: str) -> dict[str, Any]:
         """Latest price snapshot from the chart meta (descriptive context only)."""
         result = self._chart(symbol, {"range": "1d", "interval": "5m"})
@@ -233,9 +219,3 @@ def _at(seq: Any, idx: int) -> Any:
         return seq[idx]
     except (TypeError, IndexError, KeyError):
         return None
-
-
-def bar_date_range(bars: list[dict[str, Any]]) -> tuple[date, date] | None:
-    if not bars:
-        return None
-    return date.fromisoformat(bars[0]["trade_date"]), date.fromisoformat(bars[-1]["trade_date"])

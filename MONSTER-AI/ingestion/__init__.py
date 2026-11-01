@@ -1,1 +1,1 @@
-"""Market and news data connectors: resilient HTTP, Yahoo, NSE, RSS/GDELT, FRED, validation and PIT timestamps."""
+"""Market and news data connectors: resilient HTTP, Yahoo, NSE, RSS/GDELT, validation and PIT timestamps."""

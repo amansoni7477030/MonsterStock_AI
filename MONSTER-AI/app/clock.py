@@ -108,10 +108,6 @@ def utcnow() -> datetime:
     return _default_clock.now()
 
 
-def now_ist() -> datetime:
-    return _default_clock.now().astimezone(IST)
-
-
 def to_utc(value: datetime) -> datetime:
     """Convert to aware UTC; naive values are rejected because their meaning is ambiguous."""
     if value.tzinfo is None:

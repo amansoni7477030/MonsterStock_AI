@@ -1,6 +1,6 @@
 """Resilient HTTP for data providers.
 
-Every call to a scraped / public data source (NSE, Yahoo, publisher RSS, GDELT, FRED ...) goes through ``HttpClient``:
+Every call to a scraped / public data source (NSE, Yahoo, publisher RSS, GDELT ...) goes through ``HttpClient``:
 
 * **transport** - ``curl_cffi`` (libcurl with a real browser TLS / HTTP-2 fingerprint, so CDNs and bot managers such as the
   ones in front of NSE and Yahoo treat the server as an ordinary browser) with an automatic fallback to ``requests`` when
@@ -625,6 +625,3 @@ class HttpClient:
 
     def get_json(self, url: str, **kwargs: Any) -> Any:
         return self.get(url, **kwargs).json()
-
-    def get_bytes(self, url: str, **kwargs: Any) -> bytes:
-        return self.get(url, **kwargs).content

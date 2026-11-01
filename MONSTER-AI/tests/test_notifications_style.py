@@ -73,7 +73,6 @@ def test_every_decoration_is_one_code_point_so_it_renders_the_same_everywhere():
 @pytest.mark.parametrize(("code", "command"), [
     ("scan_final_failed", "sudo monster-ai logs --job final_scan"),
     ("scan_pre_failed", "sudo monster-ai logs --job prelim_scan"),
-    ("preflight_failed", "sudo monster-ai scan --stage final --dry-run"),
     ("job_failed_collect_india", "sudo monster-ai logs --job collect_india"),
     ("job_crashed_train", "sudo monster-ai logs --job train"),
     ("job_missed_backup", "sudo monster-ai jobs"),

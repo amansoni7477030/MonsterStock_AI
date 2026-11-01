@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 PROCESS_BATCH = 600  # rows handled per pipeline call (the pipeline's own default)
 MAX_PROCESS_BATCHES = 4  # a first run or a long outage leaves a backlog: drain up to 2 400 rows in one job, not over several days
+AI_LABELS = {"llm": "LLM extraction", "jev": "Jev judgment"}  # the optional AI services, as named in the coverage note
 
 
 class Intel:
@@ -30,12 +31,7 @@ class Intel:
         try:
             from news_intelligence.pipeline import NewsPipeline
 
-            llm = None
-            if settings.llm_configured:
-                from news_intelligence.llm import LLMExtractor
-
-                llm = LLMExtractor(settings, clock=clock)
-            self.pipeline = NewsPipeline(store, settings, clock=clock, llm=llm)
+            self.pipeline = NewsPipeline(store, settings, clock=clock)  # builds the optional LLM / Jev services from settings
         except Exception as exc:  # noqa: BLE001
             self._degrade(f"news pipeline unavailable ({type(exc).__name__})")
             log.warning("news pipeline unavailable: %s", exc)
@@ -218,8 +214,8 @@ class Intel:
             return {}
 
     def coverage_note(self) -> str | None:
-        reduced = self.store.kv_get("news.reduced_coverage")
         notes = list(self.errors)
-        if reduced == "1":
-            notes.append("LLM extraction degraded (rule-based extraction used)")
+        if self.store.kv_get("news.reduced_coverage") == "1":
+            failing = [AI_LABELS[name] for name, bad in (self.store.kv_get_json("news.coverage") or {}).items() if bad and name in AI_LABELS]
+            notes.append(f"{' and '.join(failing or [AI_LABELS['llm']])} degraded (rule-based extraction used)")
         return "; ".join(notes) or None

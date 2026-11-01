@@ -10,7 +10,7 @@ import pytest
 from app.config import load_settings
 from app.errors import DataUnavailable
 from ingestion import nse
-from ingestion.fno import aggregate_stock_fno, bs_price, implied_vol, summarize_option_chain
+from ingestion.fno import aggregate_stock_fno, bs_price, implied_vol
 from ingestion.http import HttpClient
 from ingestion.series import SERIES, SERIES_BY_KEY, latest_available_date
 from ingestion.yahoo import SymbolNotFound, YahooClient
@@ -75,13 +75,10 @@ def test_yahoo_falls_back_to_second_host_and_handles_garbage(cfg, fake_clock):
         YahooClient(cfg, http=http_with(session, fake_clock)).fetch_daily("^NSEI")
 
 
-def test_yahoo_intraday_and_quote(cfg, fake_clock):
+def test_yahoo_quote_comes_from_the_chart_meta(cfg, fake_clock):
     result = fixture_json("yahoo_nsei_1mo.json")["chart"]["result"][0]
-    session = FakeSession([FakeResponse(200, {"chart": {"result": [result], "error": None}}),
-                           FakeResponse(200, {"chart": {"result": [result], "error": None}})])
+    session = FakeSession([FakeResponse(200, {"chart": {"result": [result], "error": None}})])
     client = YahooClient(cfg, http=http_with(session, fake_clock))
-    bars = client.fetch_intraday("^NSEI", interval="5m")
-    assert bars and bars[0]["ts"].endswith("Z")
     quote = client.fetch_quote("^NSEI")
     assert quote["price"] and quote["prev_close"] and quote["source_ts"]
 
@@ -207,15 +204,10 @@ def test_nse_api_warms_session_and_rewarms_on_403(cfg, fake_clock):
         nse.NseApi(cfg, http=HttpClient("nse", session=FakeSession(lambda u, k: FakeResponse(200, b"[]")), clock=fake_clock)).market_status()
 
 
-def test_nse_api_option_chain_and_lists(cfg, fake_clock):
+def test_nse_api_lists(cfg, fake_clock):
     def handler(url, kwargs):
         if url == nse.HOME:
             return FakeResponse(200, b"<html/>")
-        if "option-chain-contract-info" in url:
-            return FakeResponse(200, fixture_bytes("nse_option_contract_info.json"))
-        if "option-chain-v3" in url:
-            assert kwargs["params"]["expiry"] == "23-Nov-2026"
-            return FakeResponse(200, fixture_bytes("nse_option_chain_sample.json"))
         if "holiday-master" in url:
             return FakeResponse(200, fixture_bytes("nse_holiday_master.json"))
         if "corporate-announcements" in url:
@@ -227,9 +219,6 @@ def test_nse_api_option_chain_and_lists(cfg, fake_clock):
         raise AssertionError(url)
 
     api = nse.NseApi(cfg, http=HttpClient("nse", session=FakeSession(handler), clock=fake_clock))
-    summary = api.option_chain_summary("RELIANCE")
-    assert summary["atm_strike"] == 1160.0 and summary["pcr_oi"] == pytest.approx(0.78, abs=0.01)
-    assert api.option_expiries("RELIANCE")[0] == "23-Nov-2026"
     assert api.holidays() and api.announcements(DAY, DAY) and api.event_calendar(DAY, DAY) and api.preopen("FO").rows == []
 
 
@@ -274,12 +263,6 @@ def test_aggregation_on_expiry_day_uses_half_day_time_floor():
     row = aggregate_stock_fno(rows, DAY)[0]
     assert row["dte"] == 0 and row["pcr_oi"] == pytest.approx(1.4) and row["atm_straddle"] == 3.5
     assert row["iv_atm"] > 0 and "next_fut_oi" not in row
-
-
-def test_option_chain_summary_edge_cases():
-    assert summarize_option_chain(None, "x") is None
-    assert summarize_option_chain({"records": {"data": [], "underlyingValue": 100}}, "x") is None
-    assert summarize_option_chain({"records": {"data": [{"strikePrice": 100, "expiryDates": "x"}]}}, "x") is None  # no spot
 
 
 # ----------------------------------------------------------------------------- point-in-time availability

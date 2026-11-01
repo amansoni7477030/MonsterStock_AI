@@ -681,7 +681,7 @@ _MOVE_PCT = re.compile(r"(?<![\d.,])(\d{1,3}(?:\.\d+)?)\s?(?:%|per ?cent|percent
 _CLAUSE_SEPARATORS = ("; ", ". ", ": ", " | ")
 
 
-def _primary_company(entities: Sequence[Entity]) -> Entity | None:
+def primary_company(entities: Sequence[Entity]) -> Entity | None:
     """The subject of the text: title mentions first, then the earliest mention, then confidence and frequency."""
     companies = [e for e in entities if e.type == "company"]
     if not companies:
@@ -806,7 +806,7 @@ def assign_polarity(draft: EventDraft, entities: Sequence[Entity], text: str) ->
     variable itself. Everything else is 0 - unknown, not neutral wording.
     """
     out: dict[str, float] = {}
-    primary = _primary_company(entities)
+    primary = primary_company(entities)
     if draft.event_type in _AWARD_TYPES:
         winner, customer_subject = _award_winner(entities, text)
         if winner is not None:

@@ -125,11 +125,6 @@ def await_preopen(ctx: JobContext, symbols: list[str]) -> PreopenWait:
     return PreopenWait(final, usable, reachable or usable > 0)
 
 
-def wait_for_preopen(ctx: JobContext, symbols: list[str]) -> float:
-    """``await_preopen`` reduced to the share of the universe that has its final equilibrium price."""
-    return await_preopen(ctx, symbols).share
-
-
 def suspected_holiday(ctx: JobContext, wait: PreopenWait) -> JobResult | None:
     """The calendar of a year without an official NSE list holds only rule-based holidays, so before the final report goes
     out the exchange itself is asked: NSE answered but published no pre-open book for today = a closed day. The day is then

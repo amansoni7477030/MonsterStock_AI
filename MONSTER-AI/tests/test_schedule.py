@@ -97,21 +97,34 @@ def test_missed_critical_job_alerts_as_error(engine, store):
 
 
 def test_dependency_blocks_until_prerequisite_is_terminal(engine, store):
-    now = ist(*MON, 8, 31)
-    assert "preflight" not in labels(engine.due(now))  # collect_india has not run
-    store.job_record("collect_india", "2026-11-02", "success")
-    assert "preflight" in labels(engine.due(now))
+    now = ist(*MON, 18, 20)
+    assert "evaluate" not in labels(engine.due(now))  # ingest_eod has not run
+    store.job_record("ingest_eod", "2026-11-02", "success")
+    assert "evaluate" in labels(engine.due(now))
 
 
-def test_dependency_released_when_prerequisite_window_closes(engine, store):
-    store.job_record("collect_india", "2026-11-02", "failed", message="x")
-    assert "preflight" not in labels(engine.due(ist(*MON, 8, 31)))
+def test_dependency_released_when_prerequisite_window_closes(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    fake_clock.set(ist(*MON, 5, 0))
+    prerequisite = ScheduleEntry("ingest_eod", "17:45", "20:00", retry_sec=1200, max_attempts=12)  # not a catch-up job
+    dependent = ScheduleEntry("evaluate", "18:15", "23:45", after=("ingest_eod",), catch_up=True)
+    eng = ScheduleEngine(store, ExchangeCalendar(store), fake_clock, entries=(prerequisite, dependent))
+    eng.first_start()
+    store.job_record("ingest_eod", "2026-11-02", "failed", message="x")
+    assert "evaluate" not in labels(eng.due(ist(*MON, 19, 0)))  # the prerequisite may still retry inside its window
+    assert "evaluate" in labels(eng.due(ist(*MON, 20, 5)))  # the window closed: waiting any longer would block it for good
+
+
+def test_the_scans_wait_for_no_other_job_and_every_dependency_is_scheduled():
+    scheduled = {e.job for e in SCHEDULE}
+    assert all(set(e.after) <= scheduled for e in SCHEDULE)
+    assert [e.after for e in SCHEDULE if e.job in {"prelim_scan", "refresh_preopen", "final_scan"}] == [(), (), ()]
+    assert "preflight" not in scheduled | set(JOBS)  # the 08:30 dry run was removed: prelim_scan repairs the session itself
 
 
 def test_critical_jobs_sort_first(engine, store):
     store.job_record("collect_global", "2026-11-02", "success")
     store.job_record("collect_india", "2026-11-02", "success")
-    store.job_record("preflight", "2026-11-02", "success")
     for slot in ("early", "late"):
         store.job_record("collect_news", f"2026-11-02:{slot}", "success")
     store.job_record("health_check", "2026-11-02:morning", "success")
@@ -128,8 +141,7 @@ def test_slots_get_independent_run_keys(engine):
 
 def test_no_trading_jobs_on_weekend_but_backup_still_runs(engine, store):
     engine.clock.set(ist(*SAT, 6, 0))
-    pipeline = {"collect_global", "collect_news", "collect_india", "preflight", "prelim_scan", "final_scan", "ingest_eod",
-                "evaluate"}
+    pipeline = {"collect_global", "collect_news", "collect_india", "prelim_scan", "final_scan", "ingest_eod", "evaluate"}
     assert not pipeline & {d.entry.job for d in engine.due(ist(*SAT, 9, 10))}
     assert "backup" in labels(engine.due(ist(*SAT, 23, 31)))
 

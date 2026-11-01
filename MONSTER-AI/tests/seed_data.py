@@ -202,10 +202,6 @@ class FakeNews:
         self.calls.append("gdelt")
         return CollectReport(attempted=2, ok=2, new_items=7)
 
-    def collect_econ_calendar(self) -> int:
-        self.calls.append("econ")
-        return 4
-
     def collect_board_meetings(self, *a: Any, **k: Any) -> int:
         self.calls.append("meetings")
         return 2

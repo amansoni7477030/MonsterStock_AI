@@ -40,7 +40,7 @@ Companion documents: [README](../README.md) (overview and quick start), [OPERATI
 
 ```mermaid
 flowchart LR
-    SRC["Public data sources<br/>Yahoo, NSE, RSS, GDELT, FRED<br/>no paid keys required"] -->|"curl_cffi,<br/>rate limited"| MON
+    SRC["Public data sources<br/>Yahoo, NSE, RSS, GDELT<br/>no paid keys required"] -->|"curl_cffi,<br/>rate limited"| MON
     subgraph SERVER["Your server: 1 GB RAM, native systemd, no containers"]
         direction TB
         MON["MONSTER AI<br/>daemon + job processes"] <--> DB[("SQLite WAL<br/>+ logs, backups, models")]
@@ -91,7 +91,7 @@ flowchart TB
     subgraph L4["app/ - platform, used by every layer"]
         PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS, GDELT, FRED, Telegram, S3, LLM"]
+    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, LLM"]
     UNITS ~~~ SCHED
     SCHED ~~~ FEAT
     FEAT ~~~ ING
@@ -178,10 +178,9 @@ flowchart TB
         M2 --> M3["07:50 health_check"]
         M3 --> M4["08:00 collect_india"]
         M4 --> M5["08:10 collect_news (late)"]
-        M5 --> M6["08:30 preflight"]
-        M6 --> M7["08:45 prelim_scan"]
-        M7 --> M8["09:00:30 refresh_preopen"]
-        M8 --> M9["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
+        M5 --> M6["08:45 prelim_scan"]
+        M6 --> M7["09:00:30 refresh_preopen"]
+        M7 --> M8["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
     end
     subgraph EVE["After the close"]
         direction TB
@@ -191,7 +190,7 @@ flowchart TB
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
-    class M7,M8,M9 critical
+    class M6,M7,M8 critical
 ```
 
 | Time | Job | Purpose |
@@ -200,8 +199,7 @@ flowchart TB
 | 06:30 / 08:10 | `collect_news` | RSS (conditional GET), GDELT, filings, board meetings, event extraction |
 | 07:50 | `health_check` | operational alerts (also 20:00) |
 | 08:00 | `collect_india` | previous session completeness: official file first, Yahoo as repair |
-| 08:30 | `preflight` | readiness check, repair, dry-run of the scan |
-| 08:45 | `prelim_scan` | preliminary report (**critical**) |
+| 08:45 | `prelim_scan` | preliminary report (**critical**); first repairs the previous session when `collect_india` left it below 90 % coverage |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (**critical**) |
 | 09:08:45 | `final_scan` | final report with pre-open gaps, delivered by 09:12 (**critical**, hard deadline 09:14:30) |
 | 17:45 | `ingest_eod` | official end-of-day files |
@@ -485,7 +483,7 @@ Every call to a scraped or public data source goes through one client, `ingestio
 
 ```mermaid
 flowchart TB
-    CALL["caller: yahoo, nse, news, fred ...<br/>HttpClient.from_settings(source, settings)"] --> HTTPS{"https URL?"}
+    CALL["caller: yahoo, nse, news ...<br/>HttpClient.from_settings(source, settings)"] --> HTTPS{"https URL?"}
     HTTPS -- no --> REF["refuse: DataUnavailable"]
     HTTPS -- yes --> BRK{"circuit breaker open?"}
     BRK -- yes --> FAST["fail fast: CircuitOpen"]
@@ -517,7 +515,7 @@ flowchart TB
 | F&O | one UDiFF zip per day (all contracts), parsed once |
 | RSS feeds | **conditional GET** (`ETag` / `Last-Modified`): an unchanged feed costs one tiny 304; one unconditional fetch every 6 h; a feed that fails 6 times is parked for 24 h |
 | NSE API | one pre-open call returns the whole book; GIFT Nifty comes from the market-status call already needed for the session state |
-| GDELT, economic calendar | minimum spacing 6 s / 1 s, a few queries per run |
+| GDELT | minimum spacing 6 s, a few queries per run |
 
 ```mermaid
 flowchart TB
@@ -617,8 +615,8 @@ foreign-key-safe transactions that never starve the scheduler's heartbeat of the
 |------|----------------|---------|
 | raw news and filing text | deleted after 45 days, structured events kept | `NEWS_RETENTION_DAYS` |
 | structured events | 1100 days after their last update | `EVENT_RETENTION_DAYS` |
-| pre-open and live quotes, economic calendar | 400 days; every pre-open poll is kept 14 days, then only the last one per symbol and day | `QUOTE_RETENTION_DAYS` |
-| daily bars, F&O rows, macro vintages | `HISTORY_YEARS` + 1 years (the oldest data ever read) | `HISTORY_YEARS` |
+| pre-open and live quotes | 400 days; every pre-open poll is kept 14 days, then only the last one per symbol and day | `QUOTE_RETENTION_DAYS` |
+| daily bars, F&O rows | `HISTORY_YEARS` + 1 years (the oldest data ever read) | `HISTORY_YEARS` |
 | snapshots, predictions, outcomes, metrics, graph edge history | 1825 days (immutable: pruned explicitly, children before parents) | `RECORD_RETENTION_DAYS` |
 | job runs, deliveries, alerts | 180 days (delivered alerts: half) | `OPS_RETENTION_DAYS` |
 | backups | 7 daily + 4 weekly **and** a total size budget | `BACKUP_KEEP_*`, `BACKUP_MAX_MB` |
@@ -637,7 +635,7 @@ exceeds 256 MB, or when the retention has not run for three days.
 flowchart TB
     HK["housekeeping job, 23:50 IST daily"] --> RET["run_retention"]
     RET --> PR["disk pressure from free space<br/>ok x1, warn x0.5, critical x0.25<br/>(over the data budget: x0.5)"]
-    PR --> TB["table policies, children first<br/>outcomes, predictions, snapshots, quotes, news events,<br/>alerts, deliveries, job runs, metrics, F&O, bars,<br/>macro, graph edge history"]
+    PR --> TB["table policies, children first<br/>outcomes, predictions, snapshots, quotes, news events,<br/>alerts, deliveries, job runs, metrics, F&O, bars,<br/>graph edge history"]
     PR --> KV["kv rules: evaluation summaries,<br/>fetch markers, a stale prune flag"]
     PR --> FS["file sweeps: cache, tmp, backup leftovers,<br/>quarantine, diagnostic bundles, logs"]
     PR --> BK["backups: 7 daily + 4 weekly<br/>within the total size budget"]

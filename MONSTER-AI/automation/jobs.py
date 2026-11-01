@@ -22,7 +22,6 @@ from automation.calendar import infer_holidays_from_bars, refresh_calendar, trad
 from automation.context import JobContext, JobResult
 from automation.health import CALENDAR_REFRESH_KEY
 from ingestion.pipeline import (
-    backfill_fno,
     backfill_history,
     collect_gift,
     collect_live_context,
@@ -176,12 +175,6 @@ def collect_global(ctx: JobContext) -> JobResult:
     metrics["live_context"] = _guarded("live context", collect_live_context, store, ctx.yahoo(), deadline=deadline, clock=ctx.clock)
     if s.nse_enabled:
         _guarded("GIFT Nifty", collect_gift, store, ctx.nse_api())
-    from ingestion.macro import FredClient
-
-    fred = FredClient(s, store, clock=ctx.clock)
-    if fred.enabled:
-        metrics["fred_rows"] = _guarded("FRED", fred.collect)
-    metrics["econ_events"] = _guarded("economic calendar", ctx.news().collect_econ_calendar)
     ok = report.success_ratio >= 0.8 and not report.partial
     message = f"{report.ok} series ok, {report.failed} failed" + ("; deadline reached" if report.partial else "")
     if report.unchanged:
@@ -244,30 +237,19 @@ def collect_india(ctx: JobContext) -> JobResult:
     return JobResult("success" if ok else "failed", f"session {session}: {info.get('coverage', 0):.0%} of the universe has its bar", info)
 
 
-def preflight(ctx: JobContext) -> JobResult:
-    """08:30 readiness check: repair gaps, then dry-run the preliminary scan so problems surface before 08:45."""
+def prelim_scan(ctx: JobContext) -> JobResult:
     skipped = _non_trading(ctx)
     if skipped:
         return skipped
+    # collect_india retries until 08:35; when the previous session is still incomplete at scan time, repair it once more
+    # (bounded; a complete session costs one query). A failed repair never stops the scan: the data-quality gate decides.
     session = ctx.calendar.last_completed_session(ctx.clock.now())
-    repaired = ensure_session_bars(ctx, session, budget_sec=240)
-    if repaired.get("coverage", 0.0) < MIN_OFFICIAL_COVERAGE:
-        return JobResult("failed", f"universe coverage {repaired.get('coverage', 0):.0%} for {session}", repaired)
-    refresh_daily_bars(ctx.store, ctx.yahoo(), now=ctx.clock.now(), years=ctx.settings.history_years,
-                       include_equities=False, deadline=ctx.budget(180), clock=ctx.clock)
-    ctx.dry_run = True
-    result = scan.run_scan(ctx, "pre")
-    ctx.dry_run = False
-    metrics = {k: v for k, v in result.metrics.items() if k != "report"}
-    if result.status != "success":
-        ctx.store.add_alert("error", "preflight_failed", f"pre-scan dry run failed: {result.message}",
-                            dedupe_key=f"preflight:{ctx.run_date}", dedupe_minutes=60)
-    return JobResult(result.status, f"dry-run scan: {result.message}", metrics)
-
-
-def prelim_scan(ctx: JobContext) -> JobResult:
-    skipped = _non_trading(ctx)
-    return skipped or scan.run_scan(ctx, "pre")
+    coverage, missing = session_coverage(ctx, session)
+    if coverage < MIN_OFFICIAL_COVERAGE:
+        log.info("session %s is %.0f%% complete (%d names missing): repairing before the preliminary scan", session,
+                 coverage * 100, len(missing))
+        _guarded("previous-session repair", ensure_session_bars, ctx, session, budget_sec=120)
+    return scan.run_scan(ctx, "pre")
 
 
 def final_scan(ctx: JobContext) -> JobResult:
@@ -579,18 +561,6 @@ def health_check(ctx: JobContext) -> JobResult:
     return JobResult("success", f"health {report.level}: {len(report.problems)} problem(s)", {"level": report.level})
 
 
-def backfill_fno_history(ctx: JobContext, *, years: int | None = None) -> JobResult:
-    """One-time/resumable F&O end-of-day history load (UDiFF files exist from 2024-07-08)."""
-    s = ctx.settings
-    ctx.ensure_calendar()
-    end = ctx.calendar.last_completed_session(ctx.clock.now())
-    start = max(FNO_HISTORY_START, end - timedelta(days=int((years or s.history_years) * 365.25)))
-    days = ctx.calendar.trading_days(start, end)
-    report = backfill_fno(ctx.store, ctx.nse_archive(), days, deadline=ctx.budget(40 * 60), clock=ctx.clock)
-    message = f"{report.ok} days loaded, {report.skipped} already present/missing, {report.failed} failed"
-    return JobResult("failed" if report.partial else "success", message, {"rows": report.rows})
-
-
 def bootstrap_job(ctx: JobContext) -> JobResult:
     from automation.bootstrap import run_bootstrap
 
@@ -604,7 +574,6 @@ FUNCTIONS: dict[str, Callable[[JobContext], JobResult]] = {
     "collect_global": collect_global,
     "collect_news": collect_news,
     "collect_india": collect_india,
-    "preflight": preflight,
     "prelim_scan": prelim_scan,
     "refresh_preopen": refresh_preopen,
     "final_scan": final_scan,

@@ -891,7 +891,6 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
         "dashboard_token": "dashboard-token-1234567890",
         "model_signing_key": "signing-key-abcdef",
         "backup_passphrase": "backup-pass-phrase",
-        "fred_api_key": "fred-fake-key-0001",
     }
     configured = dataclasses.replace(settings, **secrets)
     text = render_test_message(configured)

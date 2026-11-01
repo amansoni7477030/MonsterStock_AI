@@ -19,6 +19,12 @@ from app.errors import ConfigError
 
 HOME_DEFAULT = Path(__file__).resolve().parent.parent
 
+# Groq (OpenAI-compatible). gpt-oss-120b is Groq's production model with strict JSON-schema outputs; Groq's rate limits are
+# per model, so gpt-oss-20b (also production, faster and cheaper) is both the fallback and extra headroom.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
+
 # --------------------------------------------------------------------------------------------- parsers
 
 
@@ -163,7 +169,7 @@ VARS: tuple[Var, ...] = (
     # -- providers -----------------------------------------------------------------------------------------
     Var("yahoo_min_interval_sec", "YAHOO_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between Yahoo requests.", "Providers"),
     Var("nse_min_interval_sec", "NSE_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between NSE requests.", "Providers"),
-    Var("nse_enabled", "NSE_ENABLED", "true", _bool, "Use NSE public endpoints (pre-open, option chain, filings).", "Providers"),
+    Var("nse_enabled", "NSE_ENABLED", "true", _bool, "Use NSE public endpoints (pre-open, filings).", "Providers"),
     Var("http_timeout_sec", "HTTP_TIMEOUT_SEC", "30", _float, "Default HTTP read timeout.", "Providers"),
     Var("http_max_attempts", "HTTP_MAX_ATTEMPTS", "4", _int, "Bounded attempts per request.", "Providers"),
     Var("http_max_response_mb", "HTTP_MAX_RESPONSE_MB", "40", _int, "Abort responses larger than this (RAM guard).", "Providers"),
@@ -173,32 +179,52 @@ VARS: tuple[Var, ...] = (
     Var("http_impersonate", "HTTP_IMPERSONATE", "chrome", _str,
         "Browser profile curl_cffi impersonates: chrome, safari, firefox, edge or a pinned version such as chrome131 "
         "(empty = no impersonation). Proxies: set HTTPS_PROXY in the environment file.", "Providers"),
-    Var("fred_api_key", "FRED_API_KEY", "", _opt_str, "Optional FRED key: stores vintage-aware macro data for research (no feature reads it yet).", "Providers", True),
     Var("gdelt_enabled", "GDELT_ENABLED", "true", _bool, "Use the GDELT DOC API for global news discovery.", "Providers"),
     Var("news_feeds_file", "NEWS_FEEDS_FILE", "{home}/data/seeds/feeds.json", _path, "RSS/Atom feed registry.", "Providers"),
     Var("news_lookback_hours", "NEWS_LOOKBACK_HOURS", "36", _int, "How far back a collection run looks.", "Providers"),
     Var("news_retention_days", "NEWS_RETENTION_DAYS", "45", _int, "Raw article text retention (structured events are kept).", "Providers"),
     # -- llm -----------------------------------------------------------------------------------------------
+    Var("groq_api_key", "GROQ_API_KEY", "", _opt_str,
+        "Groq API key (https://console.groq.com/keys). Enables LLM event extraction on Groq with the defaults below. Empty = "
+        "deterministic rules only.", "LLM", True),
     Var("llm_api_base", "LLM_API_BASE", "", _opt_str,
-        "OpenAI-compatible base URL (e.g. https://api.openai.com/v1). Empty = deterministic rules only.", "LLM"),
-    Var("llm_api_key", "LLM_API_KEY", "", _opt_str, "API key for the LLM endpoint.", "LLM", True),
-    Var("llm_model", "LLM_MODEL", "", _opt_str, "Model name for structured extraction.", "LLM"),
+        "Optional: another OpenAI-compatible base URL (e.g. https://api.openai.com/v1). Default with GROQ_API_KEY: "
+        "https://api.groq.com/openai/v1.", "LLM"),
+    Var("llm_api_key", "LLM_API_KEY", "", _opt_str, "Optional: API key for LLM_API_BASE (Groq uses GROQ_API_KEY).", "LLM", True),
+    Var("llm_model", "LLM_MODEL", "", _opt_str,
+        "Optional: model for structured extraction (default on Groq: openai/gpt-oss-120b).", "LLM"),
+    Var("llm_fallback_model", "LLM_FALLBACK_MODEL", "", _opt_str,
+        "Optional: model used when the primary one is rate-limited or unavailable (default on Groq: openai/gpt-oss-20b; "
+        "Groq's limits are per model, so it also adds headroom).", "LLM"),
+    Var("llm_reasoning_effort", "LLM_REASONING_EFFORT", "low", _choice("", "low", "medium", "high"),
+        "Reasoning effort for reasoning models such as gpt-oss (low = fast and cheap, enough for extraction). Empty = not sent.",
+        "LLM"),
     Var("llm_timeout_sec", "LLM_TIMEOUT_SEC", "40", _float, "LLM request timeout.", "LLM"),
     Var("llm_max_articles_per_run", "LLM_MAX_ARTICLES_PER_RUN", "60", _int, "Cost cap per extraction run.", "LLM"),
-    Var("llm_max_output_tokens", "LLM_MAX_OUTPUT_TOKENS", "700", _int, "Max tokens per extraction response.", "LLM"),
+    Var("llm_max_seconds_per_run", "LLM_MAX_SECONDS_PER_RUN", "240", _int,
+        "Wall-clock cap on the LLM calls of one news run (the rest of the run uses the rules), so rate limits can never delay "
+        "the morning schedule.", "LLM"),
+    Var("llm_max_output_tokens", "LLM_MAX_OUTPUT_TOKENS", "1200", _int,
+        "Max tokens per extraction response (reasoning models spend part of it on thinking).", "LLM"),
+    # -- jev -----------------------------------------------------------------------------------------------
+    Var("typesafe_api_key", "TYPESAFE_API_KEY", "", _opt_str,
+        "TypeSafe API key (https://console.typesafe.ai/keys). Enables Jev judgments on news (event type, rumour, denial, "
+        "severity, direction) with calibrated probabilities. Empty = rules (and the LLM) only.", "Jev", True),
+    Var("jev_model", "JEV_MODEL", "jev-1.14.0", _opt_str,
+        "Jev model id. A versioned id keeps the confidence thresholds valid; the alias jev-latest moves with releases.", "Jev"),
+    Var("jev_timeout_sec", "JEV_TIMEOUT_SEC", "20", _float, "Jev request timeout.", "Jev"),
+    Var("jev_max_items_per_run", "JEV_MAX_ITEMS_PER_RUN", "200", _int, "Cost cap: news items judged per run.", "Jev"),
+    Var("jev_min_confidence", "JEV_MIN_CONFIDENCE", "0.5", _float,
+        "A Jev answer is used only when its confidence reaches this value (0-1; below it the rules decide).", "Jev"),
     # -- training / governance ---------------------------------------------------------------------------
     Var("training_mode", "TRAINING_MODE", "local-light", _choice("local-light", "external", "disabled"),
         "local-light = small capped training on the server; external = only pull signed artifacts; disabled.", "Training"),
-    Var("training_dow", "TRAINING_DOW", "sat", _choice("mon", "tue", "wed", "thu", "fri", "sat", "sun"),
-        "Weekday of scheduled (re)training.", "Training"),
     Var("model_artifact_url", "MODEL_ARTIFACT_URL", "", _opt_str, "HTTPS URL of the external manifest.json (external mode).", "Training"),
     Var("model_signing_key", "MODEL_SIGNING_KEY", "", _opt_str, "HMAC-SHA256 key shared with the training worker.", "Training", True),
     Var("train_max_rows", "TRAIN_MAX_ROWS", "320000", _int, "Row cap for in-process training (RAM guard).", "Training"),
     Var("gate_min_days", "GATE_MIN_DAYS", "120", _int, "Min out-of-time days before a model may be called validated.", "Training"),
     Var("gate_max_ece", "GATE_MAX_ECE", "0.06", _float, "Calibration gate (expected calibration error).", "Training"),
     Var("gate_min_brier_skill", "GATE_MIN_BRIER_SKILL", "0.0", _float, "Brier skill vs climatology required.", "Training"),
-    Var("min_news_model_days", "MIN_NEWS_MODEL_DAYS", "120", _int,
-        "Accumulated live snapshot days required before the news/event specialist is trained.", "Training"),
     # -- storage / backups -------------------------------------------------------------------------------------
     Var("backup_keep_daily", "BACKUP_KEEP_DAILY", "7", _int, "Daily backups retained.", "Storage"),
     Var("backup_keep_weekly", "BACKUP_KEEP_WEEKLY", "4", _int, "Weekly backups retained.", "Storage"),
@@ -211,7 +237,7 @@ VARS: tuple[Var, ...] = (
     Var("event_retention_days", "EVENT_RETENTION_DAYS", "1100", _int,
         "Structured news events are kept this long (about 3 years). 0 = forever.", "Storage"),
     Var("quote_retention_days", "QUOTE_RETENTION_DAYS", "400", _int,
-        "Pre-open / live quote rows and the economic calendar are kept this long. Intermediate pre-open polls are thinned to "
+        "Pre-open / live quote rows are kept this long. Intermediate pre-open polls are thinned to "
         "the last one per symbol and day after 14 days. 0 = forever.", "Storage"),
     Var("record_retention_days", "RECORD_RETENTION_DAYS", "1825", _int,
         "Frozen snapshots, predictions, outcomes and evaluation metrics are kept this long (5 years). 0 = forever.", "Storage"),
@@ -292,26 +318,32 @@ class Settings:
     http_max_response_mb: int = 40
     http_transport: str = "auto"
     http_impersonate: str = "chrome"
-    fred_api_key: str | None = None
     gdelt_enabled: bool = True
     news_feeds_file: Path = HOME_DEFAULT / "data" / "seeds" / "feeds.json"
     news_lookback_hours: int = 36
     news_retention_days: int = 45
+    groq_api_key: str | None = None
     llm_api_base: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_fallback_model: str | None = None
+    llm_reasoning_effort: str = "low"
     llm_timeout_sec: float = 40.0
     llm_max_articles_per_run: int = 60
-    llm_max_output_tokens: int = 700
+    llm_max_seconds_per_run: int = 240
+    llm_max_output_tokens: int = 1200
+    typesafe_api_key: str | None = None
+    jev_model: str | None = "jev-1.14.0"
+    jev_timeout_sec: float = 20.0
+    jev_max_items_per_run: int = 200
+    jev_min_confidence: float = 0.5
     training_mode: str = "local-light"
-    training_dow: str = "sat"
     model_artifact_url: str | None = None
     model_signing_key: str | None = None
     train_max_rows: int = 320000
     gate_min_days: int = 120
     gate_max_ece: float = 0.06
     gate_min_brier_skill: float = 0.0
-    min_news_model_days: int = 120
     backup_keep_daily: int = 7
     backup_keep_weekly: int = 4
     backup_max_mb: int = 1500
@@ -358,8 +390,41 @@ class Settings:
         return self.telegram_alert_chat_id or self.telegram_chat_id
 
     @property
+    def llm_provider(self) -> str | None:
+        """``groq`` (Groq's endpoint, reached through GROQ_API_KEY or an LLM_API_BASE on api.groq.com), ``custom`` (any other
+        OpenAI-compatible endpoint) or ``None`` (rules only)."""
+        base = (self.llm_api_base or "").lower()
+        if base:
+            return "groq" if "://api.groq.com" in base else "custom"
+        return "groq" if self.groq_api_key else None
+
+    @property
+    def llm_base_url(self) -> str | None:
+        return self.llm_api_base or (GROQ_BASE_URL if self.groq_api_key else None)
+
+    @property
+    def llm_key(self) -> str | None:
+        """The key for the LLM endpoint. GROQ_API_KEY is only ever used for Groq's own endpoint, never sent elsewhere."""
+        if self.llm_api_key:
+            return self.llm_api_key
+        return self.groq_api_key if self.llm_provider == "groq" else None
+
+    @property
+    def llm_model_name(self) -> str | None:
+        return self.llm_model or (GROQ_MODEL if self.llm_provider == "groq" else None)
+
+    @property
+    def llm_fallback_name(self) -> str | None:
+        chosen = self.llm_fallback_model or (GROQ_FALLBACK_MODEL if self.llm_provider == "groq" else None)
+        return chosen if chosen and chosen != self.llm_model_name else None
+
+    @property
     def llm_configured(self) -> bool:
-        return bool(self.llm_api_base and self.llm_model)
+        return bool(self.llm_base_url and self.llm_model_name and (self.llm_provider != "groq" or self.llm_key))
+
+    @property
+    def jev_configured(self) -> bool:
+        return bool(self.typesafe_api_key)
 
     @property
     def s3_configured(self) -> bool:
@@ -504,12 +569,22 @@ def validate(s: Settings) -> list[str]:
         problems.append("DASHBOARD_TOKEN must be at least 16 characters")
     if not 1 <= s.dashboard_port <= 65535:
         problems.append("DASHBOARD_PORT must be a valid TCP port")
-    if (s.llm_api_base or s.llm_model) and not (s.llm_api_base and s.llm_model):
-        problems.append("LLM_API_BASE and LLM_MODEL must be set together")
-    if s.llm_api_base and not s.llm_api_base.lower().startswith("https://") and not s.llm_api_base.lower().startswith(
+    if s.llm_api_base and not s.llm_model_name:
+        problems.append("LLM_API_BASE and LLM_MODEL must be set together (only Groq's endpoint has a default model)")
+    if s.llm_model and not s.llm_base_url:
+        problems.append("LLM_API_BASE and LLM_MODEL must be set together (or set GROQ_API_KEY to use Groq's endpoint)")
+    if s.llm_base_url and not s.llm_base_url.lower().startswith("https://") and not s.llm_base_url.lower().startswith(
         ("http://localhost", "http://127.0.0.1")
     ):
         problems.append("LLM_API_BASE must use https (or a loopback http endpoint)")
+    if s.llm_provider == "groq" and not s.llm_key:
+        problems.append("LLM_API_BASE points at Groq but neither GROQ_API_KEY nor LLM_API_KEY is set")
+    if s.llm_max_seconds_per_run < 10:
+        problems.append("LLM_MAX_SECONDS_PER_RUN must be at least 10")
+    if not 0.0 <= s.jev_min_confidence <= 1.0:
+        problems.append("JEV_MIN_CONFIDENCE must be between 0 and 1")
+    if s.typesafe_api_key and not s.jev_model:
+        problems.append("JEV_MODEL must not be empty when TYPESAFE_API_KEY is set")
     if s.training_mode == "external" and not (s.model_artifact_url and s.model_signing_key):
         problems.append("TRAINING_MODE=external requires MODEL_ARTIFACT_URL and MODEL_SIGNING_KEY")
     if s.model_artifact_url and not s.model_artifact_url.lower().startswith("https://"):

@@ -47,7 +47,7 @@ Only this (everything else is automated, including first-time setup, history bac
 clean-up and the yearly holiday list):
 
 1. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and copy its token.
-2. Run the one-command deployment (see [Server deployment](#server-deployment)). Optional keys (S3 backup, LLM extraction, FRED)
+2. Run the one-command deployment (see [Server deployment](#server-deployment)). Optional keys (S3 backup, LLM extraction)
    can be added later to `/etc/monster-ai/monster.env`.
 
 After an **upgrade that changes the feature schema** (the release notes say so; `FEATURE_VERSION` is `fv2` today) the first `train`
@@ -58,7 +58,7 @@ on an existing server the weekly Saturday training does it, and `sudo monster-ai
 
 ```mermaid
 flowchart TB
-    SRC["Yahoo, NSE archives and API,<br/>RSS, GDELT, FRED"] -->|"curl_cffi, rate limited, validated"| DB[("SQLite<br/>single source of truth")]
+    SRC["Yahoo, NSE archives and API,<br/>RSS, GDELT"] -->|"curl_cffi, rate limited, validated"| DB[("SQLite<br/>single source of truth")]
     DB --> FEAT["features<br/>one path for training and live"]
     DB --> NEWS["news_intelligence + event_graph<br/>catalysts, chains, priced-in"]
     FEAT --> GATE{"data-quality gate"}
@@ -124,7 +124,7 @@ flowchart TB
     subgraph L4["app/ - platform, used by every layer"]
         PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS, GDELT, FRED, Telegram, S3, LLM"]
+    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, LLM"]
     UNITS ~~~ SCHED
     SCHED ~~~ FEAT
     FEAT ~~~ ING
@@ -183,10 +183,9 @@ flowchart TB
         M2 --> M3["07:50 health_check"]
         M3 --> M4["08:00 collect_india"]
         M4 --> M5["08:10 collect_news (late)"]
-        M5 --> M6["08:30 preflight"]
-        M6 --> M7["08:45 prelim_scan"]
-        M7 --> M8["09:00:30 refresh_preopen"]
-        M8 --> M9["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
+        M5 --> M6["08:45 prelim_scan"]
+        M6 --> M7["09:00:30 refresh_preopen"]
+        M7 --> M8["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
     end
     subgraph EVE["After the close"]
         direction TB
@@ -196,7 +195,7 @@ flowchart TB
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
-    class M7,M8,M9 critical
+    class M6,M7,M8 critical
 ```
 
 | Time | Job | Purpose |
@@ -204,8 +203,7 @@ flowchart TB
 | 06:00-08:30 | `collect_global` | US/Europe/Asia closes, FX, commodities, rates, VIX, GIFT Nifty (retries) |
 | 06:30, 08:10 | `collect_news` | RSS (conditional GET) + GDELT + NSE filings, entity/event extraction, market-reaction check |
 | 08:00 | `collect_india` | previous-session completeness (official bhavcopy first), results calendar |
-| 08:30 | `preflight` | repair gaps, dry-run the scan so problems surface before 08:45 |
-| 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`) |
+| 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (indicative/final equilibrium prices) |
 | 09:08:45 | `final_scan` | final scan with the opening gap, frozen snapshot, **Telegram report by 09:12-09:14:30** |
 | 17:45+ | `ingest_eod` | official end-of-day data (retries until 23:30) |
@@ -259,7 +257,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
 | Resources | `MIN_FREE_DISK_MB_WARN` / `_CRIT`, `JOB_MAX_RSS_MB` (720) |
 | Training | `TRAINING_MODE` (`local-light`, `external` signed models, or `disabled`), `MODEL_SIGNING_KEY`, S3 storage for off-box backups and model bundles |
-| Optional | LLM extraction (`LLM_*`), FRED (`FRED_API_KEY`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
+| Optional | LLM extraction (`LLM_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
 
 ## Reliability guarantees
 
