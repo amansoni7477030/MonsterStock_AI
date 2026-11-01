@@ -60,6 +60,11 @@ def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, default=str, ensure_ascii=False))
 
 
+def _why(exc: BaseException) -> str:
+    """One redacted line saying why a call failed (the Telegram client's own reasons never carry the token)."""
+    return " ".join(redact(str(exc)).split())[:200] or type(exc).__name__
+
+
 # --------------------------------------------------------------------------------------------- commands
 def cmd_version(_args: argparse.Namespace) -> int:
     print(f"monster-ai {__version__}")  # the installer reads only this first line
@@ -489,11 +494,15 @@ def cmd_telegram_setup(args: argparse.Namespace) -> int:
     try:
         me = client.get_me()
     except Exception as exc:  # noqa: BLE001
-        print(f"Telegram rejected the token: {type(exc).__name__}", file=sys.stderr)
+        print(f"Telegram call failed: {_why(exc)}", file=sys.stderr)
         return EXIT_FAIL
     print(f"bot: @{me.get('username', '?')}")
     print(f"Open Telegram, find @{me.get('username', 'your bot')} and send it any message (e.g. /start).", file=sys.stderr)
-    found = client.discover_chat_id(wait_seconds=float(args.wait))
+    try:
+        found = client.discover_chat_id(wait_seconds=float(args.wait))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Telegram call failed while waiting for your message: {_why(exc)}", file=sys.stderr)
+        return EXIT_FAIL
     if not found:
         print("no message received yet; send the bot a message and run this command again", file=sys.stderr)
         return EXIT_FAIL

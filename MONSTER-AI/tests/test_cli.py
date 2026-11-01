@@ -170,6 +170,50 @@ def test_telegram_setup_print_only_and_no_message_yet(cli_env, monkeypatch):
     assert run(["telegram-setup", "--token", token, "--wait", "1"]) == 1
 
 
+def _failing_client(monkeypatch, *, on):
+    """A Telegram client whose ``get_me`` or ``discover_chat_id`` fails with a reason that even embeds the token."""
+    import notifications.telegram as tg
+    from app.errors import DataUnavailable
+
+    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    reasons = {
+        "get_me": f"[telegram] HTTP 401: Unauthorized (check TELEGRAM_BOT_TOKEN) at /bot{token}/getMe",
+        "discover": "[telegram] HTTP 409: Conflict: can't use getUpdates method while webhook is active",
+    }
+
+    class Failing:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_me(self):
+            if on == "get_me":
+                raise DataUnavailable("telegram", reasons["get_me"], retryable=False)
+            return {"username": "monster_test_bot"}
+
+        def discover_chat_id(self, **kw):
+            raise DataUnavailable("telegram", reasons["discover"], retryable=False)
+
+    monkeypatch.setattr(tg, "TelegramClient", Failing)
+    return token
+
+
+def test_telegram_setup_says_why_the_token_check_failed_without_leaking_it(cli_env, monkeypatch, capsys):
+    token = _failing_client(monkeypatch, on="get_me")
+    assert run(["telegram-setup", "--token", token, "--wait", "1"]) == 1
+    captured = capsys.readouterr()
+    assert "HTTP 401: Unauthorized (check TELEGRAM_BOT_TOKEN)" in captured.err
+    assert token not in captured.err + captured.out
+    assert captured.out == ""  # the installer parses stdout: nothing may be printed there on failure
+
+
+def test_telegram_setup_reports_a_failure_while_waiting_for_the_message(cli_env, monkeypatch, capsys):
+    token = _failing_client(monkeypatch, on="discover")
+    assert run(["telegram-setup", "--token", token, "--wait", "1"]) == 1
+    captured = capsys.readouterr()
+    assert "while waiting for your message" in captured.err and "webhook is active" in captured.err
+    assert "TELEGRAM_CHAT_ID=" not in captured.out and "Traceback" not in captured.err
+
+
 def test_alert_unit_sanitises_the_unit_name_and_redacts_logs(cli_env, monkeypatch, capsys):
     import notifications.service as svc
 
