@@ -198,11 +198,17 @@ pulls and verifies**:
 
 1. **Worker** - weekly (Friday 19:30 UTC = Saturday 01:00 IST) and on demand (*Actions -> Train models (external
    worker) -> Run workflow*). It runs `python -m app.cli init` and `python -m app.cli train --stage both --publish`.
-   `--publish` trains, packs `models/<stage>/<version>.zip`, signs the manifest and the `latest.json` pointer with
-   HMAC-SHA256 (`MODEL_SIGNING_KEY`) and uploads them to the S3-compatible bucket (AWS, R2, B2, MinIO, Spaces). The
-   training log and report files are attached to the run as the artifact `training-report-<run id>`.
+   `--publish` makes sure the runner has market data (it restores the server's newest verified off-box backup;
+   on the very first run, when there is none, it collects the history itself), trains, then packs
+   `models/<stage>/<version>.zip`, signs the manifest and the `latest.json` pointer with HMAC-SHA256
+   (`MODEL_SIGNING_KEY`) and uploads them to the S3-compatible bucket (AWS, R2, B2, MinIO, Spaces). Only the models
+   trained in that run are published, and only if they passed their gates (`shadow` or `validated`); a model that
+   failed its gates is reported in the log and **not** published, which does not fail the run. The training log and
+   report files are attached to the run as the artifact `training-report-<run id>`.
    Repository secrets: `MODEL_SIGNING_KEY`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (optional:
-   `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
+   `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `BACKUP_PASSPHRASE` when the
+   server encrypts its backups). The server uploads its nightly backup to the same bucket (`backups/`, pruned to
+   `BACKUP_KEEP_DAILY`/`BACKUP_KEEP_WEEKLY`) as soon as the `S3_*` values are set.
 2. **Server** - in `/etc/monster-ai/monster.env` set `TRAINING_MODE=external`, the **same** `MODEL_SIGNING_KEY`
    and either the same `S3_*` values (private bucket) or `MODEL_ARTIFACT_URL=https://...` (public HTTPS URL of the
    published `manifest.json`/pointer); then `sudo systemctl restart monster-ai` (or run the installer again). The

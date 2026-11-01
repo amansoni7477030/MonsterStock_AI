@@ -33,9 +33,12 @@ def add(store, key, entities, hour=10, **fields):
     return insert_event(store, key, entities_json=json.dumps(entities), **fields)
 
 
-def evidence(owner, hour, *, q=0.75, conf=0.7, pol=0.7, ref=None):
-    return {"kind": "article", "ref": ref or f"a:{owner}{hour}", "t": H.format(hour), "owner": owner, "domains": [owner], "n": 1,
-            "q": q, "conf": conf, "pol": pol, "title": f"{owner} story", "url": f"https://{owner}.example/{hour}"}
+def evidence(owner, hour, *, q=0.75, conf=0.7, pol=0.7, ref=None, title=None, published=None):
+    entry = {"kind": "article", "ref": ref or f"a:{owner}{hour}", "t": H.format(hour), "owner": owner, "domains": [owner], "n": 1,
+             "q": q, "conf": conf, "pol": pol, "title": title or f"{owner} story", "url": f"https://{owner}.example/{hour}"}
+    if published:
+        entry["published_at"] = published
+    return entry
 
 
 @pytest.fixture()
@@ -161,6 +164,23 @@ def test_contradictions_and_late_entities_appear_only_once_known(store, pipe):
     assert late["TCS"]["ev_conf_weighted_severity"] < early["TCS"]["ev_conf_weighted_severity"]
 
 
+def test_headline_source_and_publication_time_come_only_from_visible_evidence(store, pipe):
+    add(store, "story", [ent("TCS", polarity=0.7)], severity=0.6, headline="stored later headline", published_at=H.format(7),
+        evidence_json=json.dumps([
+            evidence("blog", 10, q=0.4, title="first headline", published=H.format(8)),
+            evidence("reuters", 14, q=0.9, title="better headline", published=H.format(7)),
+        ]), last_updated_at=H.format(14))
+    early = pipe.recent_events(H.format(12), 36)[0]
+    assert early["headline"] == "first headline" and early["source"] == "blog" and early["published_at"] == H.format(8)
+    assert early["url"] == "https://blog.example/10"
+    late = pipe.recent_events(H.format(15), 36)[0]
+    assert late["headline"] == "better headline" and late["source"] == "reuters" and late["published_at"] == H.format(7)
+    assert pipe.catalysts_for("TCS", H.format(12))[0].headline == "first headline"
+    assert pipe.catalysts_for("TCS", H.format(15))[0].published_at == H.format(7)
+    tie = feat._lead_origin([evidence("a", 10, q=0.5), evidence("b", 11, q=0.5)])
+    assert tie["owner"] == "a" and feat._lead_origin([]) == {}
+
+
 def test_agreement_scale_edge_cases():
     contradiction = [{"kind": "polarity"}]
     assert feat._agreement_scale([], contradiction) is None
@@ -274,7 +294,7 @@ def test_as_of_is_validated_and_accepts_several_forms(store, pipe):
 def test_catalysts_cover_own_sector_and_macro_events_best_first(store, pipe):
     seed_graph(store)
     add(store, "own", [ent("HINDPETRO", polarity=-0.6)], severity=0.7, confidence=0.8, event_type="litigation_regulatory",
-        evidence_json=json.dumps([evidence("reuters", 10)]))
+        evidence_json=json.dumps([evidence("reuters", 10, title="own")]))
     add(store, "oilsector", [ent("sector:oil_gas_and_consumable_fuels", type="sector", polarity=-0.5, in_title=False)], scope="sector",
         event_type="sector_regulation", severity=0.6, confidence=0.7, hour=11)
     add(store, "brent", [ent("macro:brent", type="commodity", polarity=0.7, name="Brent crude", move_pct=3.1)], scope="macro",

@@ -102,7 +102,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     result = execute_job(settings, "bootstrap", run_key=ist_date(get_clock().now()).isoformat(), force=not args.resume,
                          install_signal=True, options={"skip_train": "1"} if args.skip_train else None)
     print(f"bootstrap: {result.status} - {result.message}")
-    return EXIT_OK if result.status == "success" else EXIT_FAIL
+    return EXIT_OK if result.status in {"success", "skipped"} else EXIT_FAIL  # skipped: another bootstrap holds the lock
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:

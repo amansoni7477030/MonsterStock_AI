@@ -331,6 +331,10 @@ class Settings:
                     out.append(str(value))
         return out
 
+    def __repr__(self) -> str:
+        # the generated dataclass repr would print every secret (bot token, API keys, signing key) into logs and tracebacks
+        return "Settings(" + ", ".join(f"{name}={value!r}" for name, value in self.redacted().items()) + ")"
+
     def redacted(self) -> dict[str, Any]:
         """Configuration safe to print or log."""
         out: dict[str, Any] = {}

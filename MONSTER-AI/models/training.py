@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -106,13 +107,17 @@ def _subsample(rows: np.ndarray, cap: int, rng: np.random.Generator) -> np.ndarr
 
 
 def _quantile_stats(Xv: np.ndarray, names: list[str], rows: np.ndarray) -> dict[str, Any]:
-    sample = Xv[rows]
+    """p01 / p50 / p99 per feature, computed a few columns at a time (a full copy of the sample would add ~100 MB)."""
     out: dict[str, Any] = {}
-    with np.errstate(all="ignore"):
-        q = np.nanpercentile(sample, [1, 50, 99], axis=0)
-    for i, name in enumerate(names):
-        if np.isfinite(q[:, i]).all():
-            out[name] = {"p01": float(q[0, i]), "p50": float(q[1, i]), "p99": float(q[2, i])}
+    step = 16
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN columns are expected and skipped below
+        for start in range(0, len(names), step):
+            cols = np.arange(start, min(start + step, len(names)))
+            q = np.nanpercentile(Xv[np.ix_(rows, cols)], [1, 50, 99], axis=0)
+            for j, i in enumerate(cols):
+                if np.isfinite(q[:, j]).all():
+                    out[names[i]] = {"p01": float(q[0, j]), "p50": float(q[1, j]), "p99": float(q[2, j])}
     return {"features": out}
 
 
@@ -144,7 +149,9 @@ def _fit_specialists(
             ok = np.isfinite(y)
             if target != "lr" and (y[ok].min() == y[ok].max()):
                 continue
-            boosters[f"sp:{name}:{target}"] = gbm.fit_booster(sub[ok], y[ok], params, cfg.gbm.n_estimators, feat)
+            fit_x = sub if ok.all() else sub[ok]  # a boolean mask always copies; skip it when every label is known
+            boosters[f"sp:{name}:{target}"] = gbm.fit_booster(fit_x, y[ok], params, cfg.gbm.n_estimators, feat)
+            del fit_x
     return boosters
 
 
@@ -258,7 +265,7 @@ def train_stage(
         test_rows = np.flatnonzero((day_ids >= t0) & (day_ids < t1))
         boosters = _fit_specialists(specs, Xv, labels, train_rows, cfg, rng, names, stop)
         for key, pred in _predict_specialists(boosters, specs, Xv, test_rows, names).items():
-            arr = oof.setdefault(key, np.full(len(Xv), np.nan))
+            arr = oof.setdefault(key, np.full(len(Xv), np.nan, dtype=np.float32))  # float32: ~30 of these live at once
             arr[test_rows] = pred
         test_rows_blocks.append(test_rows)
         del boosters, train_rows

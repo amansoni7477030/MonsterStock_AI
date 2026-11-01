@@ -76,6 +76,7 @@ def test_valid_token_and_redaction(tmp_path):
     assert shown["telegram_bot_token"] == "***set***" and shown["fred_api_key"] == "***set***"
     assert token not in str(shown)
     assert token in s.secrets()
+    assert token not in repr(s) and "abcdef123456" not in repr(s) and "***set***" in repr(s)  # logs and tracebacks stay clean
 
 
 def test_env_file_parsing(tmp_path):

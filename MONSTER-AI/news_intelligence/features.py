@@ -121,6 +121,15 @@ def is_subject(entity: dict[str, Any]) -> bool:
     return float(entity.get("polarity") or 0.0) != 0.0 or bool(entity.get("in_title"))
 
 
+def _lead_origin(evidence: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The origin shown for an event at ``as_of``: the best visible source, earliest on ties (later, better sources
+    never leak into an earlier view because only visible evidence is considered)."""
+    if not evidence:
+        return {}
+    best = max(range(len(evidence)), key=lambda i: (_num(evidence[i].get("q")), -i))
+    return evidence[best]
+
+
 def _agreement_scale(evidence: Sequence[dict[str, Any]], contradictions: Sequence[dict[str, Any]]) -> float | None:
     """Factor applied to signed entities when origins disagree: the quality-weighted mean origin polarity relative to the
     first origin's (which set the stored polarities). 0 when evenly split, negative when the weight favours the opposite
@@ -216,7 +225,9 @@ def build_views(
             reaction = None
         base_novelty = _num(row["novelty"], 1.0)
         novelty = novelty_at(base_novelty, first_ts.timestamp() if first_ts else as_of_ts.timestamp(), as_of_ts.timestamp(), n_independent)
-        origin = evidence[0] if evidence else {}
+        origin = _lead_origin(evidence)
+        headline = str(origin.get("title") or row["headline"]) if evidence else row["headline"]
+        published = min((str(e["published_at"]) for e in evidence if e.get("published_at")), default=None) if evidence else row["published_at"]
         entities = _entities(row["entities_json"], as_of_iso, first_seen)
         scale = _agreement_scale(evidence, contradictions)
         if scale is not None:
@@ -226,11 +237,11 @@ def build_views(
         views.append(
             EventView(
                 event_id=int(row["event_id"]), cluster_key=row["cluster_key"], event_type=row["event_type"],
-                scope=row["scope"] or "company", headline=row["headline"], summary=row["summary"], region=row["region"],
+                scope=row["scope"] or "company", headline=headline, summary=row["summary"], region=row["region"],
                 entities=entities, severity=_num(row["severity"]),
                 confidence=confidence, novelty=novelty, horizon=row["horizon"], source_quality=quality,
                 n_articles=n_articles, n_independent=n_independent, first_seen_at=first_seen,
-                published_at=row["published_at"], event_time=row["event_time"], market_reacted=reacted, reaction=reaction,
+                published_at=published, event_time=row["event_time"], market_reacted=reacted, reaction=reaction,
                 contradictions=contradictions, extraction_method=row["extraction_method"],
                 hours_since=max(0.0, (as_of_ts.timestamp() - (first_ts.timestamp() if first_ts else as_of_ts.timestamp())) / 3600.0),
                 source=str(origin.get("owner") or ""), url=origin.get("url"), evidence=evidence,
