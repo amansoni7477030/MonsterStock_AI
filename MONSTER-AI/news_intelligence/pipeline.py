@@ -87,10 +87,6 @@ WEB_CHECK_TYPES = frozenset({
     "management_change",
 })
 WEB_MIN_SEVERITY = 0.4  # the rules' severity below which even such a story is not worth a web check
-# A denial the web check reports changes a draft only when it names a host the source registry knows as reputable: an exchange,
-# an official body, a wire service, a business newspaper. The search model's report of where it saw the denial is otherwise
-# unverifiable (a page can be written to look like one), and acting on it would let anyone suppress a real catalyst.
-REPUTABLE_TIERS = frozenset({"exchange_filing", "official", "company", "wire", "business_media"})
 BarsProvider = Callable[[str, str | None, str | None], pd.DataFrame]
 
 
@@ -186,12 +182,6 @@ def _wants_web(draft: EventDraft, source_class: str) -> bool:
     if source_class in FIRST_HAND_CLASSES or draft.is_denial or draft.scope != "company" or draft.event_type == "other":
         return False
     return draft.is_rumour or (draft.event_type in WEB_CHECK_TYPES and draft.severity >= WEB_MIN_SEVERITY)
-
-
-def _reputable(brief: WebBrief) -> bool:
-    """True when at least one host the brief relied on is a publisher the source registry knows to be reputable."""
-    registry = get_registry()
-    return any((matched := registry.domain_match(host)) is not None and matched[1] in REPUTABLE_TIERS for host in brief.sources)
 
 
 def _failing(service: RemoteJudge) -> bool:
@@ -572,7 +562,7 @@ class NewsPipeline:
         if self.web is None or not worth_asking or not _wants_web(draft, source_class_of(source_kind)):
             return None
         brief = self.web.research(title, body, context)
-        if brief is not None and brief.refutes and _reputable(brief) and apply_refutation(draft):
+        if brief is not None and brief.refutes and apply_refutation(draft):
             stats.web_refuted += 1
         return brief
 

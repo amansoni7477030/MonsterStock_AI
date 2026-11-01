@@ -194,6 +194,19 @@ def publisher_key(source: str | None, feed: str | None = None, url: str | None =
     return get_registry().publisher_key(source, feed, url)
 
 
+# Tiers whose reports can settle a question of fact: an exchange, an official body, the company itself, a wire service and a
+# business newspaper. An aggregator, social media and an unknown site cannot (anyone can write a page that looks like news).
+REPUTABLE_TIERS = frozenset({"exchange_filing", "official", "company", "wire", "business_media"})
+
+
+def is_reputable_host(host: str | None) -> bool:
+    """True when the source registry knows ``host`` (or a parent domain of it) as a publisher in a reputable tier."""
+    if not host:
+        return False
+    matched = get_registry().domain_match(str(host).lower())
+    return matched is not None and matched[1] in REPUTABLE_TIERS
+
+
 def split_publisher_suffix(title: str) -> tuple[str, str | None]:
     """Aggregators append `` - Publisher`` to headlines: returns (headline, publisher) or (title, None)."""
     match = _SUFFIX_PUBLISHER.match(title.strip())

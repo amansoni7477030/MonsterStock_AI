@@ -39,6 +39,8 @@ from news_intelligence.remote import (
     Quota,
     RemoteJudge,
     clamp,
+    describe_status,
+    error_reason,
     prune_prefix,
     retry_after_seconds,
 )
@@ -338,9 +340,12 @@ class LLMExtractor(RemoteJudge):
         base = (self.settings.llm_base_url or "").rstrip("/")
         return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
-    def _rejection(self, status: int, snippet: str) -> Exception:
+    def _rejection(self, status: int, reason: str) -> Exception:
         """The exception for an answer that is neither a success nor worth a retry (a subclass may turn some into a back-off)."""
-        return RuntimeError(f"http {status}")
+        return RuntimeError(describe_status(status, reason))
+
+    def _observe(self, payload: Any) -> None:
+        """Called with every successful reply before its content is used (a subclass reads tool records from it)."""
 
     def _request(self, make_body: Callable[[str], dict[str, Any]]) -> str:
         """POST ``make_body(model)`` with bounded retries; returns the reply content or raises ``Fatal`` / ``Quota`` /
@@ -368,18 +373,20 @@ class LLMExtractor(RemoteJudge):
                 if isinstance(usage, dict):
                     self._count_tokens(usage.get("prompt_tokens"), usage.get("completion_tokens"))
                 self.last_model = model
+                self._observe(payload)
                 return content
+            reason = error_reason(payload, snippet) if status != -1 else ""
             complaint = (snippet.lower() + json.dumps(payload, default=str).lower()[:600]) if status == 400 else ""
             if status == 404 or (status == 400 and any(word in complaint for word in _MODEL_GONE)):
                 self._unavailable.add(model)
                 successor = self._next_model(limited)
                 if successor is None:
-                    raise Fatal(f"http {status}")
+                    raise Fatal(describe_status(status, reason))
                 self._use_model(successor)
                 continue
             if status == 400 and adaptations < 4:
                 if not self._adapt(model, complaint):
-                    raise RuntimeError("http 400")
+                    raise RuntimeError(describe_status(400, reason))
                 adaptations += 1
                 continue
             if status == 429:
@@ -392,11 +399,11 @@ class LLMExtractor(RemoteJudge):
                 if wait is not None and wait > RETRY_AFTER_CAP_SEC:
                     raise Quota(wait)
             if status in FATAL_STATUS:
-                raise Fatal(f"http {status}")
+                raise Fatal(describe_status(status, reason))
             if status != -1 and status not in RETRYABLE_STATUS:
-                raise self._rejection(status, snippet)
+                raise self._rejection(status, reason)
             if status != -1:
-                last = f"http {status}"
+                last = describe_status(status, reason)
             limited.clear()
             attempt += 1
             if attempt < self.max_attempts:

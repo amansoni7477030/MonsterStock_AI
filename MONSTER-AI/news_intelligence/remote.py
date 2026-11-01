@@ -64,6 +64,31 @@ def retry_after_seconds(headers: Mapping[str, str] | None) -> float | None:
     return min(7 * 86400.0, sum(float(number) * _UNIT_SECONDS[unit] for number, unit in parts))
 
 
+def error_reason(payload: Any, text: str = "", limit: int = 140) -> str:
+    """The provider's own short explanation of an error response, so a failure says *why* ("Unknown model: x", "Invalid API Key")
+    and not just "http 400". Reads ``{"error": {"message": ...}}`` (Groq, OpenAI), ``{"detail": {"message": ...}}`` and
+    ``{"detail": "..."}`` (Jev); a body that is not JSON contributes only when it is plain text (an HTML error page does not).
+    Single-line, redacted and capped; empty when the provider said nothing useful."""
+    message: Any = None
+    if isinstance(payload, dict):
+        for key in ("error", "detail"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                message = value.get("message") or value.get("error_type")
+            elif isinstance(value, str):
+                message = value
+            if message:
+                break
+    elif text and not text.lstrip().startswith("<"):
+        message = text
+    return redact(re.sub(r"\s+", " ", str(message or "")).strip())[:limit]
+
+
+def describe_status(status: int, reason: str = "") -> str:
+    """``http 400: Unknown model: x`` (just ``http 400`` when the provider gave no reason)."""
+    return f"http {status}: {reason}" if reason else f"http {status}"
+
+
 def prune_prefix(store: Any, now: Any, prefix: str, ttl_days: int) -> int:
     """Delete the cache entries ``prefix*`` last written more than ``ttl_days`` ago; returns how many were removed."""
     upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)  # the key range [prefix, prefix + 1): every key that starts with it

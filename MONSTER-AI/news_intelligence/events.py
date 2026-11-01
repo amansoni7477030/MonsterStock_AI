@@ -466,6 +466,12 @@ _DENIAL = re.compile(
     r"\b(?:denies|denied|dismisses|dismissed|refutes|refuted|rubbishes|clarifies|clarification|baseless|false (?:reports?|news|claims?)|no truth|categorically denies|not true)\b",
     re.IGNORECASE,
 )
+
+
+def mentions_denial(text: str | None) -> bool:
+    """True when the text uses the wording of a denial or correction (the rules' own test, offered to the web check so that it
+    judges a page with the same words the classifier uses)."""
+    return bool(text) and _DENIAL.search(str(text)) is not None
 _SCHEDULED_CUES = re.compile(
     r"\b(?:scheduled|due (?:on|today|tomorrow|this week)|to be (?:held|announced|released|published)|will (?:be held|announce|meet|consider|release)"
     r"|to (?:consider|announce|meet|release)|ahead of|awaits?|upcoming|preview|calendar|intimation)\b",

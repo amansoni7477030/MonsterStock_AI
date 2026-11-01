@@ -148,11 +148,14 @@ class WebBrief:
     denial_found: bool = False  # the company or an authority denied or corrected the report
     earlier_coverage: bool = False  # the same event was public well before this item (old news)
     facts: tuple[str, ...] = ()
-    sources: tuple[str, ...] = ()  # host names the search relied on
+    sources: tuple[str, ...] = ()  # host names the search relied on (the researcher keeps only hosts the search actually returned)
+    denial_verified: bool = False  # a reputable page the search returned contains denial wording; set by the researcher, never by the model
     cached: bool = field(default=False, compare=False)
 
     @classmethod
     def from_raw(cls, raw: Any, *, cached: bool = False) -> WebBrief | None:
+        """A brief from a reply of the search model (untrusted) or, with ``cached=True``, from our own cache. ``denial_verified``
+        is read from the cache only: a reply that claims it is ignored."""
         if not isinstance(raw, dict):
             return None
         confirmed = str(raw.get("confirmed") or "").strip().lower()
@@ -171,28 +174,32 @@ class WebBrief:
             outlets=_count(raw.get("independent_outlets"), MAX_OUTLETS),
             denial_found=raw.get("denial_found") is True,
             earlier_coverage=raw.get("earlier_coverage") is True,
-            facts=tuple(facts), sources=tuple(sources), cached=cached,
+            facts=tuple(facts), sources=tuple(sources),
+            denial_verified=cached and raw.get("denial_verified") is True, cached=cached,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "confirmed": self.confirmed, "independent_outlets": self.outlets, "denial_found": self.denial_found,
             "earlier_coverage": self.earlier_coverage, "facts": list(self.facts), "sources": list(self.sources),
+            "denial_verified": self.denial_verified,
         }
 
     @property
     def refutes(self) -> bool:
-        """A denial or correction was found, the facts were not confirmed and the search named where it saw the denial: the only
-        outcome that changes a draft by itself (see :func:`news_intelligence.events.apply_refutation`)."""
-        return self.denial_found and self.confirmed != "yes" and bool(self.sources)
+        """A denial or correction was found, the facts were not confirmed, and a reputable page that the search actually returned
+        and that the reply cites contains denial wording: the only outcome that changes a draft by itself (see
+        :func:`news_intelligence.events.apply_refutation`)."""
+        return self.denial_found and self.denial_verified and self.confirmed != "yes" and bool(self.sources)
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True).encode()).hexdigest()[:12]
 
     def summary(self) -> str:
+        denial = "no" if not self.denial_found else ("yes (seen on a reputable page)" if self.denial_verified else "yes (unverified)")
         text = (
             f"independent outlets report the same facts: {self.confirmed}" + (f" ({self.outlets} found)" if self.outlets else "")
-            + f"; denial or correction found: {'yes' if self.denial_found else 'no'}"
+            + f"; denial or correction found: {denial}"
             + f"; earlier coverage of the same event: {'yes' if self.earlier_coverage else 'no'}"
         )
         if self.facts:
