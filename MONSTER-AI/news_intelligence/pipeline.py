@@ -35,7 +35,7 @@ from event_graph.propagation import GraphImpactEngine, StockImpact
 from event_graph.repository import GraphRepository
 from ingestion.adjust import adjusted_bars
 from news_intelligence import features as feat
-from news_intelligence.context import MAX_MENTIONED, NewsContext, WebBrief
+from news_intelligence.context import MAX_MENTIONED, NewsContext, WebBrief, injection_reason
 from news_intelligence.dedup import (
     MAX_ORIGINS,
     Clusterer,
@@ -117,6 +117,7 @@ class ProcessStats:
     web_failed: int = 0
     web_skipped_budget: int = 0
     web_refuted: int = 0  # items whose report a web check found denied elsewhere (the rumour discount was applied)
+    ai_withheld: int = 0  # items kept from every AI service because their text tries to instruct a model
     skipped_non_english: int = 0
     skipped_empty: int = 0
     skipped_routine: int = 0
@@ -514,6 +515,12 @@ class NewsPipeline:
         method, quote, event_time = "rules", None, None
         ai_polarity: dict[str, float] = {}  # directions an AI service gave a company: they override the rules' reading
         worth_asking = draft.event_type != "other" or bool(entities)  # the rules already said the item is irrelevant: spend nothing
+        reason = injection_reason(title, body) if worth_asking else None
+        if reason is not None:  # a text that instructs the AI that reads it: the rules read it, no AI service and no search does
+            stats.ai_withheld += 1
+            worth_asking = False
+            log.warning("withholding an item from %s from the AI services: its text contains %s",
+                        (context.domain or context.source or "an unknown source") if context else "an unknown source", reason)
         context = self._complete_context(context or NewsContext(), entities, symbol, company)
         brief = self._web_check(title, body, draft, context, source_kind, worth_asking, stats)
         if brief is not None:

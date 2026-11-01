@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
@@ -48,6 +49,43 @@ _LINK = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 _CLOSING_TAG = re.compile(r"</(article|context)\s*>", re.IGNORECASE)
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOST = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.[a-z]{{2,24}}")
+_INVISIBLE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")  # zero-width and bidi characters hide words
+_DIRECTIVE = (
+    r"(?:ignore|disregard|forget|override|bypass|overrule|discard|do not follow|don't follow|stop following)"
+)
+_PROMPT_NOUN = r"(?:instructions?|prompts?|directives?|system messages?|guidelines)"
+_QUALIFIER = r"(?:all|any|the|these|those|your|my|our|previous|prior|above|earlier|preceding|former|original|initial|every)"
+# What an attacker writes to an AI that reads the article, and a news article never contains. Each pattern is deliberately narrow: a
+# false alarm only withholds one item from the AI services (the rules still read it), while a miss lets a text dictate an answer.
+INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("an order to ignore earlier instructions",
+     re.compile(rf"\b{_DIRECTIVE}\W+(?:{_QUALIFIER}\W+){{1,4}}{_PROMPT_NOUN}\b")),
+    ("a role marker (system / assistant)",
+     re.compile(r"(?:^|\n|[.!?]\s)\s*(?:system|assistant|developer|admin(?:istrator)?)\s*(?:prompt|message)?\s*:", re.MULTILINE)),
+    ("a chat-template token", re.compile(r"<\|[a-z_ ]{1,24}\|>|\[/?(?:inst|sys)\]|<<\s*/?sys\s*>>|###\s*(?:instruction|system)")),
+    ("a dictated answer",
+     re.compile(r"\b(?:report|set|output|return|respond|reply|answer|assign|mark|rate|classify|label|score|rank)\b[^.\n]{0,30}"
+                r"\b(?:severity|polarity|confidence|event[_ ]type|evidence[_ ]quote)\b\W{0,4}(?:to|as|of|=|:)?\W{0,4}"
+                r"(?:[-+]?\d|merger|acquisition|positive|negative|bullish|bearish|other)")),
+    ("a prompt-block tag", re.compile(r"</?\s*(?:article|context)\s*>")),
+    ("a request addressed to an AI",
+     re.compile(r"\b(?:as an? (?:ai|language model|assistant)|you are (?:now )?(?:an? )?(?:ai|assistant|language model|chatbot)|"
+                r"new instructions?\s*:|respond (?:only )?with (?:the )?json)\b")),
+)
+
+
+def injection_reason(*texts: Any) -> str | None:
+    """What makes the text look like an attempt to instruct the AI that reads it (see ``INJECTION_PATTERNS``), or ``None``. Used
+    to withhold such an item from the AI services and to drop such "facts" from a web brief."""
+    blob = "\n".join(str(text) for text in texts if text)
+    if not blob:
+        return None
+    blob = unicodedata.normalize("NFKC", _INVISIBLE.sub("", blob)).lower()
+    blob = re.sub(r"[ \t\r\f\v]+", " ", blob)
+    for label, pattern in INJECTION_PATTERNS:
+        if pattern.search(blob):
+            return label
+    return None
 
 
 def defang(text: str) -> str:
@@ -121,7 +159,7 @@ class WebBrief:
         facts: list[str] = []
         for item in raw.get("facts") if isinstance(raw.get("facts"), list) else ():
             text = one_line(_LINK.sub("", item), MAX_FACT_CHARS) if isinstance(item, str) else ""
-            if text and len(facts) < MAX_FACTS:
+            if text and injection_reason(text) is None and len(facts) < MAX_FACTS:  # a page that instructs the reader is not a fact
                 facts.append(text)
         sources: list[str] = []
         for item in raw.get("sources") if isinstance(raw.get("sources"), list) else ():
