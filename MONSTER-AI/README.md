@@ -238,7 +238,7 @@ every job restart-safe: missed windows are recorded and alerted, catch-up jobs r
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
 | `logs [--role R] [--date D] [-n N] [--level L] [--job J] [--grep T] [--since 90m] [--follow] [--list]` | read, filter and follow the daily logs (default: today's warnings and errors of every process) |
 | `diag` | write a redacted diagnostics bundle (`diag-<UTC>.tar.gz`) for a bug report |
-| `telegram-setup`, `telegram-test` | discover the chat id; send a test message |
+| `telegram-setup`, `telegram-test`, `telegram-preview` | discover the chat id; send a test message; send one sample of every message type (made-up data, marked *SAMPLE PREVIEW*) |
 | `dashboard` | optional read-only web view |
 | `env-example`, `version` | print the documented `.env` template; print the version and the running code fingerprint |
 | `alert-unit UNIT` | internal: the systemd `OnFailure=` hook |
@@ -308,7 +308,7 @@ features/       point-in-time feature engines + builder + loader
 models/         training, calibration, inference, registry, artifacts, signing
 ranking/        eligibility, costs, tiers, abstention, evidence
 automation/     calendar, scan, jobs, scheduler, schedule engine, health, bootstrap, retention
-notifications/  Telegram client, report renderers, idempotent delivery
+notifications/  Telegram client, report renderers and their emoji style, sample previews, idempotent delivery
 news_intelligence/, event_graph/   event extraction, entity resolution, causal-graph propagation
 backtesting/    metrics, walk-forward report, live evaluation and live record
 dashboard/      optional read-only web UI (loopback)

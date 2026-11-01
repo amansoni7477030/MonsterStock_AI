@@ -453,9 +453,11 @@ def cmd_alert_unit(args: argparse.Namespace) -> int:
             tail = redact(done.stdout.strip())[-1200:]
         except (OSError, subprocess.SubprocessError):
             pass
-    text = f"<b>Service failed:</b> {unit}\n<pre>{_escape(tail) or 'no log lines'}</pre>"
+    from notifications import report
     from notifications.service import NotificationService
     from notifications.telegram import TelegramClient
+
+    text = report.render_unit_failure(unit, tail, get_clock().now())
 
     try:
         store = _open_store(settings)
@@ -473,10 +475,6 @@ def cmd_alert_unit(args: argparse.Namespace) -> int:
             client.send_message(settings.alert_chat_id, text)
             return EXIT_OK
         return EXIT_FAIL
-
-
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def cmd_telegram_setup(args: argparse.Namespace) -> int:
@@ -529,6 +527,45 @@ def cmd_telegram_test(args: argparse.Namespace) -> int:
         store.close()
     print(f"telegram test: {outcome.status}" + (f" ({outcome.reason})" if outcome.reason else ""))
     return EXIT_OK if outcome.ok else EXIT_FAIL
+
+
+def cmd_telegram_preview(args: argparse.Namespace) -> int:
+    """Send one sample of every kind of Telegram message (made-up data, each one marked as a preview) to see how they look."""
+    from notifications import samples
+    from notifications.telegram import TelegramClient
+
+    if args.list:
+        for kind, what in samples.KINDS.items():
+            print(f"{kind:9} {what}")
+        return EXIT_OK
+    unknown = sorted(set(args.only or ()) - set(samples.KINDS))
+    if unknown:
+        print(f"unknown kind(s) {', '.join(unknown)}; choose from: {', '.join(samples.KINDS)}", file=sys.stderr)
+        return EXIT_USAGE
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    client = TelegramClient(settings)
+    if not client.configured or not settings.telegram_chat_id:
+        print("Telegram is not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (see telegram-setup).", file=sys.stderr)
+        return EXIT_FAIL
+    wanted = set(args.only or samples.KINDS)
+    sent = 0
+    try:
+        for kind, messages in samples.build_samples(settings, get_clock().now()):
+            if kind not in wanted:
+                continue
+            chat = settings.alert_chat_id if kind in samples.ALERT_KINDS else settings.telegram_chat_id
+            for text in samples.marked(messages):
+                if sent:
+                    get_clock().sleep(args.delay)  # Telegram allows about one message per second to a chat
+                client.send_message(chat, text)
+                sent += 1
+            print(f"preview {kind}: sent")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Telegram call failed after {sent} message(s): {_why(exc)}", file=sys.stderr)
+        return EXIT_FAIL
+    print(f"preview: {sent} sample message(s) sent; every one is made-up data, not a market signal")
+    return EXIT_OK
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -624,6 +661,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-only", action="store_true")
     p.add_argument("--write-env")
     add("telegram-test", cmd_telegram_test, "send a test message")
+    p = add("telegram-preview", cmd_telegram_preview, "send one sample of every Telegram message type (made-up data)")
+    p.add_argument("--only", nargs="+", metavar="KIND", help="only these kinds (see --list)")
+    p.add_argument("--list", action="store_true", help="list the kinds of sample message and exit")
+    p.add_argument("--delay", type=float, default=1.2, help="seconds between messages (default 1.2)")
     add("dashboard", cmd_dashboard, "run the read-only dashboard")
     return parser
 

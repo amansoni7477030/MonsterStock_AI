@@ -87,8 +87,14 @@ server with native systemd (no containers).
   propagation with a seeded expert-prior graph (seeded automatically, re-seeded when the universe changes, and re-measured
   weekly from returns with FDR control; edges without a price series stay labelled priors).
 - **Notifications** (`notifications/`): Telegram client, 4096-character-safe renderers (pre-open, final, evening, alerts,
-  failure notices), idempotent delivery ledger, deadline guard, queued alerts flushed when Telegram returns; catalysts show their
+  failure notices, failed-service alerts), idempotent delivery ledger, deadline guard, queued alerts flushed when Telegram returns; catalysts show their
   provenance (rumour flag, source class, independent sources, conflicts) and the regime line shows GIFT Nifty while its quote is fresh.
+- **Messages made for a phone** (`notifications/style.py`, `report.py`): a short head, an icon before every label, medals and tier badges,
+  a probability bar for calibrated probabilities only, traffic-light dots for data feeds, a severity colour on every alert with the
+  first command to run (read-only commands only), clock faces that follow the hour, English month names whatever the server's locale.
+  The icons only decorate: the words beside them carry every fact, and the honesty labels (SHADOW, PRELIMINARY, RUMOUR, "not
+  calibrated", LATE) are unchanged. `monster-ai telegram-preview` (`notifications/samples.py`) sends one sample of every message type with
+  made-up data, each marked *SAMPLE PREVIEW*.
 - **Evaluation and live record** (`backtesting/`): outcomes are attached to frozen predictions without ever editing them; only the effective
   snapshot of a (date, stage) is scored and a day is scored once; the evening report prints a **live record** (hit rate, range-forecast
   error, 80 % interval coverage, direction accuracy, realised range against the baselines, NDCG@5 and rank IC) over 20 days, 60 days and
@@ -112,7 +118,7 @@ server with native systemd (no containers).
   lost server.
 - **Dashboard (optional)** (`dashboard/`): read-only FastAPI view, loopback by default.
 - **CLI** (`app/cli.py`): `init`, `doctor`, `bootstrap`, `daemon`, `run-job`, `jobs`, `scan`, `evaluate`, `train`, `backtest`, `models`,
-  `backup`, `health`, `storage`, `logs`, `diag`, `telegram-setup`, `telegram-test`, `dashboard`, `env-example`, `version`.
+  `backup`, `health`, `storage`, `logs`, `diag`, `telegram-setup`, `telegram-test`, `telegram-preview`, `dashboard`, `env-example`, `version`.
 - **Documentation**: [README](README.md), [architecture](docs/ARCHITECTURE.md) with 18 Mermaid diagrams (context, whole-code architecture, data
   flow, timetable, scan sequence, training, scheduler / bootstrap state machines, HTTP stack, bulk fetching, calendar, time zones,
   retention, logging, deployment), [operations runbook](docs/OPERATIONS.md), [deployment guide](deployment/README.md), the generated

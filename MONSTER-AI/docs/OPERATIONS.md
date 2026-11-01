@@ -41,10 +41,28 @@ A morning with nothing worth reporting produces a short **"no setup"** message t
 could not be delivered before **09:14:30** is withheld rather than sent late; you get an alert instead. On an exchange
 holiday nothing is sent.
 
-Small marks worth knowing in a report: a catalyst line can carry `[RUMOUR - unconfirmed; ...]`, its source class
-(exchange filing, official source, company statement, media report, social media) and the number of independent sources or
-conflicting reports; a note names stocks with an **ex-date today** (split or bonus), which are scored without their opening gap;
-`gift_nifty=+0.40%` in the regime line is GIFT Nifty's change, shown only while its quote is fresh.
+### Reading a message
+
+Every message is laid out for a phone: a short head (what it is, the date and time, the model), the facts with an icon in front
+of each label, and a footer. **The icons only decorate: the words beside them carry every fact**, so nothing is lost if your
+client shows no emoji. `sudo monster-ai telegram-preview` sends one sample of every kind of message to your chat (made-up data;
+each message is marked *SAMPLE PREVIEW*) so you can see them before the first real one.
+
+| Mark | Meaning |
+|------|---------|
+| 🥇 🥈 🥉 🏅 | places 1, 2, 3 and the rest of the list (a list flagged *weak* has no medals) |
+| 🔥 STRONG, ⚡ MODERATE, 👀 WATCH, 🔸 WEAK | the conviction tier; a model that is not validated yet is capped at WATCH |
+| `██████░░░░` | the calibrated probability drawn as ten blocks; never drawn for a heuristic score or a missing value |
+| 🚩 or 🔎 under a catalyst | `RUMOUR - unconfirmed`, or how far the catalyst can be trusted: source class (exchange filing, official source, company statement, media report, social media), independent sources, conflicting reports |
+| 🟢 🟡 🟠 🔴 before a feed | the data feed is ok, in warning, stale, or missing |
+| 🔴 🟠 🟡 🔵 before an alert | critical, error, warning, info (🎉 and ✅ mark good news such as *bootstrap finished*) |
+| 🛠 **Next step** | the first command to run for that alert or notice (it only reads or reports; it never changes anything) |
+| 🧪 SHADOW, 📏 BASELINE, ⏳ PRELIMINARY | the model is not validated / no trained model, so a labelled heuristic is used / the list is from the 08:45 scan |
+| ⏰ **LATE** | a final report forced out after the 09:14:30 deadline, "for the record only" |
+| ✅ ❌ ➖ in the evening table | the pick's range was above the threshold / was not / is unknown |
+
+A note under the regime names stocks with an **ex-date today** (split or bonus), which are scored without their opening gap;
+`🌅 GIFT Nifty: +0.40%` in the market-regime line is GIFT Nifty's change, shown only while its quote is fresh.
 
 ## First day
 
@@ -80,6 +98,7 @@ calibrated"* and caps every name at WATCH.
 | `backup`, `backup --verify`, `backup --restore-latest [--remote]` | backups, see [below](#backups-and-recovery) |
 | `run-job NAME [--force] [--dry-run] [--opt K=V]` | run one scheduled job by hand (for example `refresh_calendar`) |
 | `telegram-test`, `telegram-setup` | test message; discover the chat id |
+| `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message (made-up data, each marked *SAMPLE PREVIEW*) |
 | `bootstrap --resume` | continue a first-run setup that stopped |
 | `version` | the version and the **code fingerprint** (`1.0.0+3fa9c1d2`) that is stamped on every frozen report and model |
 | `dashboard` | optional read-only web view (loopback; use an SSH tunnel) |

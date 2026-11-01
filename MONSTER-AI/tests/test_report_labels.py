@@ -27,7 +27,7 @@ def text_of(ctx: ReportContext) -> str:
 def test_baseline_probabilities_are_labelled_heuristic_not_calibrated():
     text = text_of(context("baseline"))
     assert HEURISTIC_LABEL in text and "(calibrated)" not in text
-    assert "P(up close) n/a / P(down close) n/a" in text
+    assert "P(up close) n/a · P(down close) n/a" in text
 
 
 @pytest.mark.parametrize("status", ["shadow", "validated"])

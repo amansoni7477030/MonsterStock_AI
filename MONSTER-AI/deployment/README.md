@@ -63,6 +63,7 @@ Afterwards:
 journalctl -u monster-ai -f                 # follow the daemon
 sudo monster-ai health                      # exit 0 ok / 1 warning / 2 critical
 sudo monster-ai doctor                      # full preflight incl. feed reachability
+sudo monster-ai telegram-preview            # one sample of every Telegram message type (made-up data)
 ```
 
 The default mode is **SHADOW**: research output only, the system never places orders.

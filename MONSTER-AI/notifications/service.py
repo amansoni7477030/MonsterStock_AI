@@ -26,7 +26,7 @@ from ranking.types import EveningSummary, ReportContext
 log = logging.getLogger(__name__)
 
 CHANNEL = "telegram"
-LATE_PREFIX = "LATE - sent after the deadline, for the record only"
+LATE_PREFIX = "⏰ <b>LATE</b> - sent after the deadline, for the record only"
 FLUSH_MIN_GAP_SEC = 1.0
 
 

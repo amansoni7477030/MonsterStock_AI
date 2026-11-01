@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from notifications import style
 from notifications.report import (
     DISCLAIMER,
     EVENING_NOTE,
@@ -21,6 +22,7 @@ from notifications.report import (
     render_final_report,
     render_prelim_report,
     render_test_message,
+    render_unit_failure,
 )
 from ranking.types import Candidate, Catalyst, EveningRow, EveningSummary, ReportContext
 
@@ -36,6 +38,7 @@ def assert_telegram_safe(messages):
     assert isinstance(messages, list) and messages and all(isinstance(m, str) for m in messages)
     for message in messages:
         assert 0 < len(message) <= 3900
+        message.encode("utf-8")  # raises on a lone surrogate
         stack = []
         for closing, name, attrs in _TAG.findall(message):
             assert name in ALLOWED_TAGS, name
@@ -112,48 +115,57 @@ def test_final_report_layout_golden_lines():
     assert len(messages) == 1
     got = lines(messages)
     expected = [
-        "<b>MONSTER AI | NSE LARGE-MOVE SCAN</b>",
-        "Date: 2026-11-02 (Mon) | Snapshot: 2026-11-02 09:12:00 IST | Stage: FINAL | Model: fake-model-0.1 [VALIDATED]",
-        "<b>#1 FAKECO - STRONG</b>  Fake Company Ltd | Fake Sector | F&amp;O",
-        "P(range &gt; 3%): 62% (calibrated)   [1%: 91% | 2%: 78% | 3%: 62% | 5%: 31%]",
-        "P(unusual for this stock): 40%",
-        "Expected intraday range: 3.4% (80% interval 2.1-5.6%)   Max excursion from open (q50/q90): 2.2% / 3.8%",
-        "Direction (secondary, not a trade signal): P(up close) 52% / P(down close) 48%",
-        'Main catalyst: Fake plant outage lifts prices - Fake Wire (<a href="https://example.test/news/1">link</a>)',
-        "Global-to-India chain: Fake crude spike -&gt; fake refiners -&gt; FAKECO",
-        "Confirmations: Pre-open volume 3x; Futures OI up",
-        "Contradictions: none",
-        "Priced-in assessment: Partly priced in (gap +1.2%)",
-        "Liquidity and data quality: pass - liquid | turnover Rs 412.5 cr | est. round-trip cost 0.12%",
-        "Model drivers (diagnostic, not causal): gap_pct; atr_ratio; news_novelty",
-        "Market regime: vix=calm, breadth=mixed",
-        "Data freshness: yahoo=ok (3 min old), nse_preopen=ok (1 min old)",
-        "Missing feeds: none",
-        "Model uncertainty: Intervals are wide for 2 names | max candidate uncertainty 0.42 (0-1, higher = less reliable)",
-        "Universe: 187 of 212 passed liquidity/data gates.",
-        f"<i>{DISCLAIMER}</i>",
+        "🚀 <b>MONSTER AI</b> · NSE large-move scan",
+        "🎯 <b>FINAL</b> · 📅 Mon 02 Nov 2026 · 🕘 09:12 IST",
+        "🧠 Model <code>fake-model-0.1</code> · ✅ <b>VALIDATED</b>",
+        "🎯 <b>Top 1</b> · chance that the day's range (high - low) exceeds 3% of the open",
+        "🥇 <b>#1 FAKECO</b> · 🔥 <b>STRONG</b>",
+        "<i>Fake Company Ltd · Fake Sector · F&amp;O</i>",
+        "📊 P(range &gt; 3%): <b>62%</b> (calibrated)",
+        "<code>██████░░░░</code>",
+        "🔢 1%: 91% · 2%: 78% · 3%: 62% · 5%: 31%",
+        "📏 Expected intraday range: <b>3.4%</b> · 80% interval 2.1-5.6%",
+        "📐 Max excursion from open (q50 / q90): 2.2% / 3.8%",
+        "✨ P(unusual for this stock): 40%",
+        "🧭 Direction (secondary, not a trade signal): P(up close) 52% · P(down close) 48%",
+        '📰 <b>Main catalyst:</b> Fake plant outage lifts prices - Fake Wire (<a href="https://example.test/news/1">link</a>)',
+        "🔗 <b>Global-to-India chain:</b> Fake crude spike → fake refiners → FAKECO",
+        "✅ <b>Confirmations:</b> Pre-open volume 3x; Futures OI up",
+        f"{style.WARN} <b>Contradictions:</b> none",
+        "💸 <b>Priced-in assessment:</b> Partly priced in (gap +1.2%)",
+        "💧 <b>Liquidity and data quality:</b> ✅ pass - liquid · turnover ₹412.5 cr · est. round-trip cost 0.12%",
+        "🧩 <b>Model drivers</b> (diagnostic, not causal): gap_pct; atr_ratio; news_novelty",
+        "🌍 <b>Market regime:</b> 🔹 vix: calm · 🔹 breadth: mixed",
+        "📡 <b>Data freshness</b>",
+        "🟢 yahoo: ok (3 min old)",
+        "🟢 nse_preopen: ok (1 min old)",
+        "✅ <b>Missing feeds:</b> none",
+        "❓ <b>Model uncertainty:</b> Intervals are wide for 2 names · max candidate uncertainty 0.42 (0-1, higher = less reliable)",
+        "🔬 <b>Universe:</b> 187 of 212 passed liquidity/data gates (88%)",
+        f"{style.WARN} <i>{DISCLAIMER}</i>",
     ]
     for line in expected:
         assert line in got, line
     assert [got.index(line) for line in expected] == sorted(got.index(line) for line in expected)
+    assert got.count(style.RULE) == 2  # one under the head, one above the footer
     assert "SHADOW MODE" not in messages[0]
     assert DISCLAIMER.startswith("Probabilistic research output; not investment advice and not a guarantee.")
 
 
 @pytest.mark.parametrize(
-    "status, label",
+    "status, badge, label",
     [
-        ("validated", "VALIDATED"),
-        ("shadow", "SHADOW - unvalidated"),
-        ("baseline", "BASELINE (no trained model)"),
-        ("something-else", "SHADOW - unvalidated"),
-        (None, "SHADOW - unvalidated"),
+        ("validated", "✅", "VALIDATED"),
+        ("shadow", "🧪", "SHADOW - unvalidated"),
+        ("baseline", "📏", "BASELINE (no trained model)"),
+        ("something-else", "🧪", "SHADOW - unvalidated"),
+        (None, "🧪", "SHADOW - unvalidated"),
     ],
 )
-def test_model_status_labels_and_shadow_banner(status, label):
+def test_model_status_labels_and_shadow_banner(status, badge, label):
     text = "\n".join(render_final_report(make_ctx(model_status=status)))
-    assert f"Model: fake-model-0.1 [{label}]" in text
-    assert (f"<b>{SHADOW_BANNER}</b>" in text) == (status != "validated")
+    assert f"🧠 Model <code>fake-model-0.1</code> · {badge} <b>{label}</b>" in text
+    assert (f"🧪 <b>{SHADOW_BANNER}</b>" in text) == (status != "validated")
     if status != "validated":
         assert SHADOW_BANNER == "SHADOW MODE: no demonstrated edge over simple baselines yet - tiers are capped at WATCH."
 
@@ -164,9 +176,10 @@ def test_unvalidated_models_never_show_tiers_above_watch():
         model_status="shadow",
     )
     text = "\n".join(render_final_report(ctx))
-    assert "STRONG" not in text and "MODERATE" not in text and text.count("- WATCH</b>") == 3
+    assert "STRONG" not in text and "MODERATE" not in text and text.count("👀 <b>WATCH</b>") == 3
     validated = "\n".join(render_final_report(dataclasses.replace(ctx, model_status="validated")))
-    assert "#1 AAA - STRONG" in validated and "#2 BBB - MODERATE" in validated
+    assert "<b>#1 AAA</b> · 🔥 <b>STRONG</b>" in validated and "<b>#2 BBB</b> · ⚡ <b>MODERATE</b>" in validated
+    assert "<b>#3 CCC</b> · 👀 <b>WATCH</b>" in validated
 
 
 @pytest.mark.parametrize("version", ["", "   ", None])
@@ -183,20 +196,27 @@ def test_prelim_report_is_titled_preliminary_and_never_claims_finality():
     messages = render_prelim_report(make_ctx(stage="pre", snapshot_ist="2026-11-02 08:45:00 IST"))
     assert_telegram_safe(messages)
     text = "\n".join(messages)
-    assert "<b>MONSTER AI | NSE LARGE-MOVE SCAN - PRELIMINARY (08:45 scan)</b>" in text
-    assert "Stage: PRELIMINARY" in text and "Stage: FINAL" not in text and "final" not in text.lower()
+    assert "🚀 <b>MONSTER AI</b> · NSE large-move scan" in text
+    assert "⏳ <b>PRELIMINARY</b> (08:45 scan) · 📅 Mon 02 Nov 2026 · 🕗 08:45 IST" in text
+    assert "🎯 <b>FINAL</b>" not in text and "final" not in text.lower()
     assert "must not be treated as confirmed" in text
-    assert "<b>#1 FAKECO - STRONG</b>" in text and "Universe: 187 of 212" in text
+    assert "<b>#1 FAKECO</b> · 🔥 <b>STRONG</b>" in text and "<b>Universe:</b> 187 of 212" in text
 
 
 def test_ranking_order_and_rank_fallbacks():
     cands = [make_candidate(3, "CCC"), make_candidate(1, "AAA"), make_candidate(2, "BBB"), make_candidate(None, "ZZZ")]
-    heads = [ln for ln in lines(render_final_report(make_ctx(cands))) if ln.startswith("<b>#")]
-    assert [re.match(r"<b>#(\d+) (\w+)", h).groups() for h in heads] == [
+    heads = [ln for ln in lines(render_final_report(make_ctx(cands))) if "<b>#" in ln]
+    assert [re.search(r"<b>#(\d+) (\w+)</b>", h).groups() for h in heads] == [
         ("1", "AAA"), ("2", "BBB"), ("3", "CCC"), ("4", "ZZZ"),
     ]
     odd = make_candidate(1, "ODD", tier="spicy<tier>")
-    assert "<b>#1 ODD - SPICY&lt;TIER&gt;</b>" in "\n".join(render_final_report(make_ctx([odd])))
+    assert "<b>#1 ODD</b> · 🔹 <b>SPICY&lt;TIER&gt;</b>" in "\n".join(render_final_report(make_ctx([odd])))
+
+
+def test_medals_go_to_the_first_three_places_only():
+    cands = [make_candidate(i, f"S{i}") for i in range(1, 6)]
+    heads = [ln for ln in lines(render_final_report(make_ctx(cands))) if "<b>#" in ln]
+    assert [h.split(" ", 1)[0] for h in heads] == ["🥇", "🥈", "🥉", "🏅", "🏅"]
 
 
 def test_plain_dict_candidates_render_like_objects():
@@ -211,21 +231,22 @@ def test_no_setup_block_labels_remaining_names_as_weak_watchlist():
     messages = render_final_report(ctx)
     assert_telegram_safe(messages)
     got = lines(messages)
-    assert "<b>NO HIGH-CONVICTION SETUP today</b>" in got
-    assert "Reason: Top probability only 33% &lt;low&gt;" in got
-    assert "<b>WEAK / WATCHLIST ONLY</b> - shown for transparency only; these are not signals." in got
-    assert "<b>#1 AAA - WEAK / WATCHLIST ONLY</b>  Fake Company Ltd | Fake Sector | F&amp;O" in got
-    assert "STRONG" not in "\n".join(messages)
+    assert "🛑 <b>NO HIGH-CONVICTION SETUP today</b>" in got
+    assert "📝 <b>Reason:</b> Top probability only 33% &lt;low&gt;" in got
+    assert "🔸 <b>WEAK / WATCHLIST ONLY</b> - shown for transparency only; these are not signals." in got
+    assert "🔹 <b>#1 AAA</b> · 🔸 <b>WEAK / WATCHLIST ONLY</b>" in got  # a weak list never gets medals
+    assert "STRONG" not in "\n".join(messages) and "🥇" not in "\n".join(messages)
+    assert not any("Top 1" in ln for ln in got)  # no "top picks" headline over a list that is flagged weak
 
 
 def test_no_candidates_means_no_setup_even_without_the_flag():
     text = "\n".join(render_final_report(make_ctx([], no_setup=False)))
-    assert "<b>NO HIGH-CONVICTION SETUP today</b>" in text
-    assert "Reason: no candidate cleared the ranking gates" in text
+    assert "🛑 <b>NO HIGH-CONVICTION SETUP today</b>" in text
+    assert "📝 <b>Reason:</b> no candidate cleared the ranking gates" in text
     assert "WEAK / WATCHLIST ONLY" not in text and "<b>#1" not in text
     flagged = "\n".join(render_final_report(make_ctx([], no_setup=True)))
-    assert "Reason: not stated by the ranking stage" in flagged
-    assert "Universe: 187 of 212 passed liquidity/data gates." in flagged  # the footer is still sent
+    assert "📝 <b>Reason:</b> not stated by the ranking stage" in flagged
+    assert "🔬 <b>Universe:</b> 187 of 212 passed liquidity/data gates (88%)" in flagged  # the footer is still sent
 
 
 # ----------------------------------------------------------------------------------- escaping / XSS
@@ -275,6 +296,7 @@ def test_every_dynamic_value_is_escaped(payload):
         assert_telegram_safe([message])
     assert_telegram_safe([render_alert(payload, payload, payload, created_at=payload)])
     assert_telegram_safe(render_alert_digest([{"level": payload, "code": payload, "message": payload}]))
+    assert_telegram_safe([render_unit_failure(payload, payload, payload)])
 
 
 BAD_URLS = [
@@ -311,7 +333,7 @@ def test_unsafe_urls_are_dropped_and_never_printed(url):
     messages = render_final_report(make_ctx([cand]))
     assert_telegram_safe(messages)
     text = "\n".join(messages)
-    assert "Main catalyst: Fake headline - Fake Wire" in lines(messages)
+    assert "📰 <b>Main catalyst:</b> Fake headline - Fake Wire" in lines(messages)
     assert "<a " not in text and "(link)" not in text and "javascript" not in text.lower()
     assert "example.test" not in text and "alert(1)" not in text
 
@@ -325,24 +347,28 @@ def test_http_and_https_links_are_kept_and_escaped_inside_href():
         cand = make_candidate(catalysts=[Catalyst(headline="Fake", url=url)])
         messages = render_final_report(make_ctx([cand]))
         assert_telegram_safe(messages)
-        assert f'Main catalyst: Fake (<a href="{shown}">link</a>)' in lines(messages)
+        assert f'📰 <b>Main catalyst:</b> Fake (<a href="{shown}">link</a>)' in lines(messages)
 
 
 # ---------------------------------------------------------------------------------- catalyst provenance
-@pytest.mark.parametrize(("fields", "tag"), [
-    (dict(rumour=True, source_class="social"), "[RUMOUR - unconfirmed; social media]"),
-    (dict(rumour=False, source_class="exchange_filing", n_independent=3), "[exchange filing; 3 independent sources]"),
-    (dict(source_class="media", n_independent=2, n_conflicts=1), "[media report; 2 independent sources; 1 conflicting]"),
-    (dict(source_class="unknown"), "[unverified source]"),
+@pytest.mark.parametrize(("fields", "trust"), [
+    (dict(rumour=True, source_class="social"), "🚩 <b>RUMOUR - unconfirmed</b> · social media"),
+    (dict(rumour=False, source_class="exchange_filing", n_independent=3), "🔎 exchange filing · 3 independent sources"),
+    (dict(source_class="media", n_independent=2, n_conflicts=1), "🔎 media report · 2 independent sources · 1 conflicting"),
+    (dict(source_class="unknown"), "🔎 unverified source"),
     (dict(n_independent=1, n_conflicts=0), None),
     (dict(), None),
 ], ids=["rumour", "filing", "conflict", "unknown", "single-source", "no-provenance"])
-def test_a_catalyst_shows_how_far_it_can_be_trusted(fields, tag):
+def test_a_catalyst_shows_how_far_it_can_be_trusted(fields, trust):
     cand = make_candidate(catalysts=[Catalyst(headline="Fake headline", source="Fake Wire", **fields)])
     messages = render_final_report(make_ctx([cand]))
     assert_telegram_safe(messages)
-    want = "Main catalyst: Fake headline - Fake Wire" + (f" {tag}" if tag else "")
-    assert want in lines(messages)
+    got = lines(messages)
+    at = got.index("📰 <b>Main catalyst:</b> Fake headline - Fake Wire")
+    if trust:
+        assert got[at + 1] == trust  # the trust line sits directly under the catalyst
+    else:
+        assert not any(ln.startswith(("🚩", "🔎")) for ln in got)  # older snapshots do not grow a provenance line
 
 
 def test_hostile_provenance_values_never_reach_the_message():
@@ -350,7 +376,7 @@ def test_hostile_provenance_values_never_reach_the_message():
                                               n_independent="many", n_conflicts=float("nan"))])
     messages = render_final_report(make_ctx([cand]))
     assert_telegram_safe(messages)
-    assert "Main catalyst: Fake - Wire" in lines(messages)
+    assert "📰 <b>Main catalyst:</b> Fake - Wire" in lines(messages)
     assert "RUMOUR" not in "\n".join(messages)
 
 
@@ -384,27 +410,30 @@ def test_missing_and_non_finite_values_render_as_n_a_never_as_numbers():
     assert_telegram_safe(messages)
     got = lines(messages)
     for line in (
-        "<b>#1 FAKECO - STRONG</b>",
-        "P(range &gt; 3%): n/a (calibrated)   [1%: n/a | 3%: n/a]",
-        "P(unusual for this stock): n/a",
-        "Expected intraday range: n/a (80% interval n/a)   Max excursion from open (q50/q90): n/a / n/a",
-        "Direction (secondary, not a trade signal): P(up close) n/a / P(down close) n/a",
-        "Main catalyst: none identified",
-        "Global-to-India chain: n/a",
-        "Confirmations: none",
-        "Contradictions: none",
-        "Priced-in assessment: not assessed",
-        "Liquidity and data quality: pass | turnover n/a | est. round-trip cost n/a",
-        "Model drivers (diagnostic, not causal): n/a",
-        "Market regime: n/a",
-        "Data freshness: n/a",
-        "Missing feeds: none",
-        "Model uncertainty: n/a",
-        "Universe: n/a of n/a passed liquidity/data gates.",
+        "🥇 <b>#1 FAKECO</b> · 🔥 <b>STRONG</b>",
+        "📊 P(range &gt; 3%): <b>n/a</b> (calibrated)",
+        "🔢 1%: n/a · 3%: n/a",
+        "✨ P(unusual for this stock): n/a",
+        "📏 Expected intraday range: <b>n/a</b> · 80% interval n/a",
+        "📐 Max excursion from open (q50 / q90): n/a / n/a",
+        "🧭 Direction (secondary, not a trade signal): P(up close) n/a · P(down close) n/a",
+        "📰 <b>Main catalyst:</b> none identified",
+        "🔗 <b>Global-to-India chain:</b> n/a",
+        "✅ <b>Confirmations:</b> none",
+        f"{style.WARN} <b>Contradictions:</b> none",
+        "💸 <b>Priced-in assessment:</b> not assessed",
+        "💧 <b>Liquidity and data quality:</b> ✅ pass · turnover n/a · est. round-trip cost n/a",
+        "🧩 <b>Model drivers</b> (diagnostic, not causal): n/a",
+        "🌍 <b>Market regime:</b> n/a",
+        "📡 <b>Data freshness:</b> n/a",
+        "✅ <b>Missing feeds:</b> none",
+        "❓ <b>Model uncertainty:</b> n/a",
+        "🔬 <b>Universe:</b> n/a of n/a passed liquidity/data gates",
     ):
         assert line in got, line
     text = "\n".join(messages)
     assert not _BAD_NUMBER.search(text) and "0.1234" not in text
+    assert "<code>█" not in text and "<code>░" not in text  # no probability, so no bar
 
 
 def test_completely_empty_candidate_and_context_still_render():
@@ -412,36 +441,37 @@ def test_completely_empty_candidate_and_context_still_render():
     messages = render_final_report(ReportContext("", "final", "", "fake-model", "validated", candidates=[bare]))
     assert_telegram_safe(messages)
     text = "\n".join(messages)
-    assert "<b>#1 UNKNOWN - n/a</b>" in text and "Snapshot: n/a" in text
-    assert "P(range &gt; n/a): n/a (calibrated)" in text and not _BAD_NUMBER.search(text)
+    assert "<b>#1 UNKNOWN</b> · 🔹 <b>n/a</b>" in text and "· 🕒 n/a" in text
+    assert "📊 P(range &gt; n/a): <b>n/a</b> (calibrated)" in text and not _BAD_NUMBER.search(text)
     odd = "\n".join(render_final_report(make_ctx(trade_date="<b>bad</b>-and-long")))
-    assert "Date: &lt;b&gt;bad&lt;/b&gt; |" in odd and "-and-long" not in odd
-    assert "Date: 2026-11-02 (Mon) |" in "\n".join(render_final_report(make_ctx(trade_date="2026-11-02T00:00:00")))
+    assert "📅 &lt;b&gt;bad&lt;/b&gt; ·" in odd and "-and-long" not in odd
+    assert "📅 Mon 02 Nov 2026 ·" in "\n".join(render_final_report(make_ctx(trade_date="2026-11-02T00:00:00")))
 
 
 def test_wrongly_typed_collections_degrade_gracefully_instead_of_crashing():
     ctx = make_ctx(candidates=3.14, missing_feeds=7, notes=None, regime=["x"])
     text = "\n".join(render_final_report(ctx))
-    assert "<b>NO HIGH-CONVICTION SETUP today</b>" in text and "Missing feeds: 7" in text and "Market regime: n/a" in text
+    assert "🛑 <b>NO HIGH-CONVICTION SETUP today</b>" in text and "<b>Missing feeds:</b> 7" in text
+    assert "<b>Market regime:</b> n/a" in text
     odd_candidate = make_candidate(catalysts=5, drivers=2.5, confirmations={"x": 1})
-    assert "Main catalyst: none identified" in "\n".join(render_final_report(make_ctx([odd_candidate])))
+    assert "📰 <b>Main catalyst:</b> none identified" in "\n".join(render_final_report(make_ctx([odd_candidate])))
     summary = "\n".join(render_evening_report(make_summary(rows=5.0, missing_symbols=3.5, rolling=[1], baseline_hit_rates=None)))
-    assert "No evaluated picks for this date." in summary and "Missing symbols: 3.5" in summary
-    assert "Rolling record (out-of-sample): n/a" in summary
+    assert "📋 No evaluated picks for this date." in summary and "<b>Missing symbols:</b> 3.5" in summary
+    assert "<b>Rolling record (out-of-sample):</b> n/a" in summary
 
 
 def test_liquidity_warning_when_liquidity_or_data_quality_fails():
     for override in ({"liquidity_ok": False}, {"data_quality": "warning"}, {"data_quality": "stale"}):
         text = "\n".join(render_final_report(make_ctx([make_candidate(**override)])))
-        assert "Liquidity and data quality: warning - liquid | turnover Rs 412.5 cr" in text
+        assert f"💧 <b>Liquidity and data quality:</b> {style.WARN} warning - liquid · turnover ₹412.5 cr" in text
 
 
 # ----------------------------------------------------------------------------- numbers and probabilities
 def test_probabilities_are_rounded_percentages_never_raw_scores():
     p = {"hit_1": 0.625, "hit_2": 0.0, "hit_3": 1.0, "hit_5": 0.995, "up": 0.004, "down": 0.6234, "raw_score": 0.8765}
     text = "\n".join(render_final_report(make_ctx([make_candidate(p=p)])))
-    assert "[1%: 63% | 2%: 0% | 3%: 100% | 5%: 100%]" in text
-    assert "P(up close) 0% / P(down close) 62%" in text
+    assert "🔢 1%: 63% · 2%: 0% · 3%: 100% · 5%: 100%" in text
+    assert "P(up close) 0% · P(down close) 62%" in text
     for raw in ("0.625", "0.6234", "62.3", "0.8765", "0.995"):
         assert raw not in text
 
@@ -450,15 +480,62 @@ def test_non_integer_thresholds_sort_numerically_and_pick_the_primary():
     p = {"hit_10": 0.05, "hit_2.5": 0.55, "hit_1": 0.9, "hit_2_5": 0.5, "unusual": 0.3, "up": 0.5, "down": 0.5}
     cand = make_candidate(p=p, primary_threshold=2.5)
     text = "\n".join(render_final_report(make_ctx([cand])))
-    assert "P(range &gt; 2.5%):" in text and "[1%: 90% | 2.5%: 5" in text and "| 10%: 5%]" in text
+    assert "P(range &gt; 2.5%):" in text and "🔢 1%: 90% · 2.5%: 5" in text and "· 10%: 5%" in text
 
 
 def test_range_and_cost_formatting_edge_cases():
     cand = make_candidate(range={"q10": -0.04, "q50": 0.04, "q90": 12.345, "exc_q50": -0.0, "exc_q90": 7}, est_cost_pct=0.0, turnover_cr=1234567.89)
     text = "\n".join(render_final_report(make_ctx([cand])))
-    assert "Expected intraday range: 0.0% (80% interval 0.0-12.3%)" in text
-    assert "Max excursion from open (q50/q90): 0.0% / 7.0%" in text
-    assert "turnover Rs 1,234,567.9 cr | est. round-trip cost 0.00%" in text
+    assert "📏 Expected intraday range: <b>0.0%</b> · 80% interval 0.0-12.3%" in text
+    assert "📐 Max excursion from open (q50 / q90): 0.0% / 7.0%" in text
+    assert "turnover ₹1,234,567.9 cr · est. round-trip cost 0.00%" in text
+
+
+# ------------------------------------------------------------------------------------ probability bar
+@pytest.mark.parametrize(("p", "bar"), [(0.624, "██████░░░░"), (0.05, "█░░░░░░░░░"), (0.0, "░░░░░░░░░░"), (1.0, "██████████")])
+def test_a_calibrated_probability_gets_a_bar_that_matches_the_percentage(p, bar):
+    cand = make_candidate(p={"hit_3": p, "unusual": 0.4, "up": 0.5, "down": 0.5})
+    assert f"<code>{bar}</code>" in lines(render_final_report(make_ctx([cand])))
+
+
+def test_a_heuristic_score_never_gets_a_bar_and_says_it_is_not_calibrated():
+    text = "\n".join(render_final_report(make_ctx([make_candidate()], model_status="baseline")))
+    assert "(heuristic, NOT calibrated)" in text and "<code>" not in text.replace("<code>fake-model-0.1</code>", "")
+
+
+def test_an_impossible_probability_draws_no_bar():
+    cand = make_candidate(p={"hit_3": 1.7, "unusual": 0.4, "up": 0.5, "down": 0.5})
+    text = "\n".join(render_final_report(make_ctx([cand])))
+    assert "P(range &gt; 3%): <b>n/a</b>" in text and "█" not in text and "░" not in text
+
+
+# ------------------------------------------------------------------------------- freshness and regime
+def test_freshness_rows_carry_a_traffic_light_that_follows_the_status():
+    fresh = {"A": "ok (3 min old)", "B": "WARN - one late", "C": "STALE - quote is 600 min old", "D": "MISSING - none", "E": "???"}
+    got = lines(render_final_report(make_ctx(freshness=fresh)))
+    for line in ("🟢 A: ok (3 min old)", "🟡 B: WARN - one late", "🟠 C: STALE - quote is 600 min old", "🔴 D: MISSING - none", "⚪ E: ???"):
+        assert line in got, line
+
+
+def test_missing_feeds_are_flagged_with_a_roadwork_sign_instead_of_a_tick():
+    text = "\n".join(render_final_report(make_ctx(missing_feeds=["GIFT Nifty: quote is 600 min old"])))
+    assert "🚧 <b>Missing feeds:</b> GIFT Nifty: quote is 600 min old" in text
+
+
+def test_the_regime_shows_gift_nifty_and_the_known_labels_with_icons():
+    regime = {"trend": "bull", "volatility": "normal-vol", "risk": "risk-on", "event": "F&O expiry day", "gift_nifty": "+0.40%"}
+    text = "\n".join(render_final_report(make_ctx(regime=regime)))
+    assert ("🌍 <b>Market regime:</b> 📈 Trend: bull · 🌊 Volatility: normal-vol · 🚦 Risk: risk-on · "
+            "📌 Event: F&amp;O expiry day · 🌅 GIFT Nifty: +0.40%") in text
+
+
+@pytest.mark.parametrize(("snapshot", "label"), [
+    ("2026-11-02 09:12:00 IST", "🕘 09:12 IST"), ("2026-11-02 08:45:00 IST", "🕗 08:45 IST"),
+    ("2026-11-02 00:05:00 IST", "🕛 00:05 IST"), ("2026-11-02 13:30:00 IST", "🕐 13:30 IST"),
+    ("sometime", "🕒 sometime"),
+])
+def test_the_clock_face_follows_the_snapshot_hour(snapshot, label):
+    assert f" · {label}" in "\n".join(render_final_report(make_ctx(snapshot_ist=snapshot)))
 
 
 # --------------------------------------------------------------------------------------------- caps
@@ -480,27 +557,27 @@ def test_lengths_and_item_counts_are_capped():
     messages = render_final_report(make_ctx([cand]))
     assert_telegram_safe(messages)
     got = lines(messages)
-    assert f"Main catalyst: {'H' * 137}... - {'S' * 37}... (<a" in "\n".join(got)
+    assert f"📰 <b>Main catalyst:</b> {'H' * 137}... - {'S' * 37}... (<a" in "\n".join(got)
     assert "H" * 141 not in "\n".join(got) and "Third must not appear" not in "\n".join(got)
-    assert "Also: Second headline" in got
-    assert "Confirmations: conf 0; conf 1; conf 2" in got
-    assert "Contradictions: contra 0; contra 1; contra 2" in got
-    assert "Model drivers (diagnostic, not causal): drv 0; drv 1; drv 2" in got
-    assert "Global-to-India chain: chain 0" in got and "chain 1" not in "\n".join(got)
-    assert f"Priced-in assessment: {'P' * 197}..." in got
+    assert "📰 <b>Also:</b> Second headline" in got
+    assert "✅ <b>Confirmations:</b> conf 0; conf 1; conf 2" in got
+    assert f"{style.WARN} <b>Contradictions:</b> contra 0; contra 1; contra 2" in got
+    assert "🧩 <b>Model drivers</b> (diagnostic, not causal): drv 0; drv 1; drv 2" in got
+    assert "🔗 <b>Global-to-India chain:</b> chain 0" in got and "chain 1" not in "\n".join(got)
+    assert f"💸 <b>Priced-in assessment:</b> {'P' * 197}..." in got
 
 
 def test_control_characters_and_newlines_are_flattened():
     cand = make_candidate(catalysts=[Catalyst(headline="line one\nline\ttwo\x00\x1b[31m \u202eevil\u202c", source="Wire")])
     text = "\n".join(render_final_report(make_ctx([cand])))
-    assert "Main catalyst: line one line two[31m evil - Wire" in text
+    assert "📰 <b>Main catalyst:</b> line one line two[31m evil - Wire" in text
     assert "\x00" not in text and "\x1b" not in text and "\u202e" not in text and "\u202c" not in text
 
 
 def test_lone_surrogates_are_stripped_so_every_message_is_valid_utf8():
     cand = make_candidate(catalysts=[Catalyst(headline="broken \ud83d feed \udc00 text", source="Wire")], name="Fa\ud800ke")
     messages = render_final_report(make_ctx([cand]))
-    assert "Main catalyst: broken feed text - Wire" in "\n".join(messages)
+    assert "📰 <b>Main catalyst:</b> broken feed text - Wire" in "\n".join(messages)
     for message in messages:
         message.encode("utf-8")  # raises on any lone surrogate
 
@@ -527,14 +604,14 @@ def test_long_reports_split_into_numbered_balanced_messages():
     messages = render_final_report(make_ctx(cands))
     assert_telegram_safe(messages)
     assert len(messages) >= 4
-    assert messages[0].startswith("<b>MONSTER AI | NSE LARGE-MOVE SCAN</b>")
+    assert messages[0].startswith("🚀 <b>MONSTER AI</b> · NSE large-move scan")
     for index, message in enumerate(messages, 1):
-        assert message.endswith(f"<i>(part {index}/{len(messages)})</i>")
+        assert message.endswith(f"<i>📄 part {index}/{len(messages)}</i>")
     assert all("Universe:" not in m and DISCLAIMER not in m for m in messages[:-1])
     assert "Universe:" in messages[-1] and DISCLAIMER in messages[-1]
     text = "\n".join(messages)
     for rank in range(1, 13):
-        assert text.count(f"<b>#{rank} SYM{rank:02d} - STRONG</b>") == 1
+        assert text.count(f"<b>#{rank} SYM{rank:02d}</b> · 🔥 <b>STRONG</b>") == 1
 
 
 def test_maximally_escaped_content_still_fits_every_message():
@@ -561,13 +638,15 @@ def test_maximally_escaped_content_still_fits_every_message():
 
 
 def test_regime_and_freshness_pairs_are_capped_with_a_remainder_note():
-    ctx = make_ctx(regime={f"k{i}": "v" for i in range(14)}, missing_feeds=[f"feed{i}" for i in range(14)])
+    ctx = make_ctx(regime={f"k{i}": "v" for i in range(14)}, missing_feeds=[f"feed{i}" for i in range(14)],
+                   freshness={f"f{i}": "ok (x)" for i in range(14)})
     text = "\n".join(render_final_report(ctx))
-    assert "k9=v, +4 more" in text and "k10" not in text
-    assert "Missing feeds: feed0, feed1, feed2, feed3, feed4, feed5, feed6, feed7, feed8, feed9" in text
+    assert "🔹 k9: v · +4 more" in text and "k10" not in text
+    assert "🟢 f9: ok (x)\n+4 more" in text and "f10" not in text
+    assert "<b>Missing feeds:</b> feed0, feed1, feed2, feed3, feed4, feed5, feed6, feed7, feed8, feed9" in text
     assert "Notes:" not in text
     noted = "\n".join(render_final_report(make_ctx(notes=["first", "second"])))
-    assert "Notes: first; second" in noted
+    assert "📝 <b>Notes:</b> first; second" in noted
 
 
 # ------------------------------------------------------------------------------------- evening report
@@ -603,66 +682,69 @@ def test_evening_report_golden_lines_and_table():
     assert_telegram_safe(messages)
     got = lines(messages)
     for line in (
-        "<b>MONSTER AI | EVENING EVALUATION</b>",
-        "Date: 2026-11-02 (Mon) | Stage: FINAL | Model: fake-model-0.1 | Target: intraday range &gt; 3% of open",
-        "<b>PROVISIONAL: vendor data, official file pending</b>",
-        "Top-3 hit rate: 1/2 (CI 9%-91%)",
-        "Baseline hit rates: atr 40%, random 20%",
-        "Mean actual range: model picks 3.1% | baselines: atr 2.9%, random 2.2%",
-        "Rolling record (out-of-sample): hit_rate_30d 41%, brier_30d 0.190, n_days 42, weird n/a",
-        "Calibration: Slightly overconfident at the top bin",
-        "Data-quality notes: note A; note &lt;B&gt;",
-        "Missing symbols: MISS1, MISS2",
-        f"<i>{EVENING_NOTE}</i>",
+        "🌆 <b>MONSTER AI</b> · Evening evaluation",
+        "🎯 <b>FINAL</b> · 📅 Mon 02 Nov 2026",
+        "🧠 Model <code>fake-model-0.1</code>",
+        "📏 Target: intraday range &gt; 3% of the open",
+        "🟡 <b>PROVISIONAL: vendor data, official file pending</b>",
+        "🏁 <b>Top-3 hit rate:</b> 1/2 (CI 9%-91%)",
+        "🆚 <b>Baseline hit rates:</b> atr 40%, random 20%",
+        "📐 <b>Mean actual range:</b> model picks 3.1% | baselines: atr 2.9%, random 2.2%",
+        "📈 <b>Rolling record (out-of-sample):</b> hit_rate_30d 41%, brier_30d 0.190, n_days 42, weird n/a",
+        "🧮 <b>Calibration:</b> Slightly overconfident at the top bin",
+        "🧹 <b>Data-quality notes:</b> note A; note &lt;B&gt;",
+        "🚫 <b>Missing symbols:</b> MISS1, MISS2",
+        f"💡 <i>{EVENING_NOTE}</i>",
     ):
         assert line in got, line
     assert EVENING_NOTE == "A single day is noise; judge the model only on the rolling out-of-sample record."
     table = re.search(r"<pre>(.*?)</pre>", messages[0], re.DOTALL).group(1).strip("\n").split("\n")
     fields = [ln.replace("&amp;", "&").split() for ln in table]
     assert fields[0] == ["#", "SYMBOL", "TIER", "P(3%)", "RANGE", "DIR", "HIT"]
-    assert fields[1] == ["1", "FAKECO", "MODERATE", "62%", "4.1%", "+1.2%", "yes"]
-    assert fields[2] == ["2", "DUMMY&CO", "WATCH", "35%", "2.0%", "-0.8%", "no"]
-    assert fields[3] == ["3", "NOTRADED", "WATCH", "n/a", "n/a", "n/a", "n/a"]
+    assert fields[1] == ["1", "FAKECO", "MODERATE", "62%", "4.1%", "+1.2%", "✅"]
+    assert fields[2] == ["2", "DUMMY&CO", "WATCH", "35%", "2.0%", "-0.8%", "❌"]
+    assert fields[3] == ["3", "NOTRADED", "WATCH", "n/a", "n/a", "n/a", "➖"]
     assert "DUMMY&amp;CO" in "\n".join(got) and "<pre>" in messages[0] and "</pre>" in messages[0]
+    assert any(ln.startswith("📋 <b>Picks against what happened</b>") and "✅" in ln and "❌" in ln for ln in got)
 
 
 def test_evening_report_validated_flag_and_missing_statistics():
     text = "\n".join(render_evening_report(make_summary(provisional=False)))
-    assert "<b>VALIDATED: official exchange data</b>" in text and "PROVISIONAL" not in text
+    assert "🟢 <b>VALIDATED: official exchange data</b>" in text and "PROVISIONAL" not in text
     bare = EveningSummary("2026-11-02", "pre", 2.5, "fake-model-0.1")
     got = lines(render_evening_report(bare))
     for line in (
-        "No evaluated picks for this date.",
-        "Top-N hit rate: n/a (no evaluated picks)",
-        "Baseline hit rates: n/a",
-        "Mean actual range: model picks n/a",
-        "Rolling record (out-of-sample): n/a",
-        "<b>PROVISIONAL: vendor data, official file pending</b>",
+        "📋 No evaluated picks for this date.",
+        "🏁 <b>Top-N hit rate:</b> n/a (no evaluated picks)",
+        "🆚 <b>Baseline hit rates:</b> n/a",
+        "📐 <b>Mean actual range:</b> model picks n/a",
+        "📈 <b>Rolling record (out-of-sample):</b> n/a",
+        "🟡 <b>PROVISIONAL: vendor data, official file pending</b>",
     ):
         assert line in got, line
-    assert "Stage: PRELIMINARY" in "\n".join(got) and "Target: intraday range &gt; 2.5% of open" in "\n".join(got)
-    assert not any(ln.startswith(("Calibration", "Data-quality", "Missing symbols")) for ln in got)
+    assert "🎯 <b>PRELIMINARY</b>" in "\n".join(got) and "📏 Target: intraday range &gt; 2.5% of the open" in "\n".join(got)
+    assert not any(ln.startswith(("🧮", "🧹", "🚫")) for ln in got)
 
 
 def test_evening_report_confidence_interval_variants_and_row_cap():
     as_list = "\n".join(render_evening_report(make_summary(model_hit_ci=[0.2, 0.8])))
-    assert "Top-3 hit rate: 1/2 (CI 20%-80%)" in as_list
+    assert "<b>Top-3 hit rate:</b> 1/2 (CI 20%-80%)" in as_list
     for impossible in (1.5, -0.1):
         invalid = "\n".join(render_evening_report(make_summary(model_hit_rate=impossible)))
-        assert "Top-3 hit rate: n/a (no evaluated picks)" in invalid
+        assert "<b>Top-3 hit rate:</b> n/a (no evaluated picks)" in invalid
     for ci in (None, (0.2,), ("a", "b"), (None, 0.5)):
-        assert "Top-3 hit rate: 1/2" in "\n".join(render_evening_report(make_summary(model_hit_ci=ci)))
+        assert "<b>Top-3 hit rate:</b> 1/2" in "\n".join(render_evening_report(make_summary(model_hit_ci=ci)))
         assert "(CI" not in "\n".join(render_evening_report(make_summary(model_hit_ci=ci)))
     many = [EveningRow(f"S{i:02d}", i, "WATCH", 0.3, 1.0, 1.0, 0.1, False) for i in range(1, 26)]
     text = "\n".join(render_evening_report(make_summary(rows=many, n=25, model_hit_rate=0.0, model_hit_ci=None)))
-    assert "S20" in text and "S21" not in text and "... +5 more" in text and "Top-25 hit rate: 0/25" in text
+    assert "S20" in text and "S21" not in text and "... +5 more" in text and "<b>Top-25 hit rate:</b> 0/25" in text
 
 
 def test_evening_report_missing_symbols_are_capped_and_hit_rate_n_comes_from_summary():
     many = [f"M{i:02d}" for i in range(20)]
     text = "\n".join(render_evening_report(make_summary(missing_symbols=many)))
-    assert "Missing symbols: M00, M01, M02, M03, M04, M05, M06, M07, M08, M09, M10, M11, M12, M13, M14 (+5 more)" in text
-    assert "Top-3 hit rate: 1/2" in text  # x/n uses the evaluated count, not the number of table rows
+    assert "<b>Missing symbols:</b> M00, M01, M02, M03, M04, M05, M06, M07, M08, M09, M10, M11, M12, M13, M14 (+5 more)" in text
+    assert "<b>Top-3 hit rate:</b> 1/2" in text  # x/n uses the evaluated count, not the number of table rows
 
 
 def test_evening_rows_are_sorted_by_rank_and_escape_everything():
@@ -670,7 +752,7 @@ def test_evening_rows_are_sorted_by_rank_and_escape_everything():
     messages = render_evening_report(make_summary(rows=rows, stage="<x>", rolling={"<k>": 0.5}, baseline_hit_rates={"<b>": 0.1}))
     assert_telegram_safe(messages)
     text = "\n".join(messages)
-    assert text.index("A&amp;1") < text.index("&lt;B&gt;2") and "Stage: &lt;X&gt;" in text
+    assert text.index("A&amp;1") < text.index("&lt;B&gt;2") and "🎯 <b>&lt;X&gt;</b>" in text
     assert "&lt;k&gt; 0.500" in text and "&lt;b&gt; 10%" in text
 
 
@@ -680,30 +762,32 @@ def test_failure_notice_states_reason_and_never_implies_no_setups():
     assert_telegram_safe(messages)
     got = lines(messages)
     for line in (
-        "<b>MONSTER AI | REPORT WITHHELD</b>",
-        "Date: 2026-11-02 (Mon) | Stage: FINAL",
-        "Reason: deadline missed",
-        "Details: feed=yahoo; age=2 d",
+        "🛑 <b>MONSTER AI</b> · REPORT WITHHELD",
+        "🎯 <b>FINAL</b> · 📅 Mon 02 Nov 2026",
+        "❗ <b>Reason:</b> deadline missed",
+        "🔎 <b>Details:</b> feed=yahoo; age=2 d",
+        "🛠 <b>Next step:</b> <code>sudo monster-ai logs --job final_scan</code>",
     ):
         assert line in got, line
-    last = got[-1]
-    assert last.startswith("<b>No candidate list was published for this date.</b>") and "not a market signal" in last
+    note = next(ln for ln in got if ln.startswith("💡"))
+    assert note.startswith("💡 <b>No candidate list was published for this date.</b>") and "not a market signal" in note
 
 
 @pytest.mark.parametrize(
     "details, expected",
     [
         (None, None),
-        ("plain text", "Details: plain text"),
-        (["a", "", "b"], "Details: a; b"),
-        (("x",), "Details: x"),
-        ({"k": "v<1>"}, "Details: k=v&lt;1&gt;"),
+        ("plain text", "🔎 <b>Details:</b> plain text"),
+        (["a", "", "b"], "🔎 <b>Details:</b> a; b"),
+        (("x",), "🔎 <b>Details:</b> x"),
+        ({"k": "v<1>"}, "🔎 <b>Details:</b> k=v&lt;1&gt;"),
     ],
 )
 def test_failure_notice_details_variants(details, expected):
     got = lines(render_failure_notice("2026-11-02", "pre", "stale data", details))
-    assert "Stage: PRELIMINARY" in "\n".join(got)
-    detail_lines = [ln for ln in got if ln.startswith("Details:")]
+    assert "🎯 <b>PRELIMINARY</b>" in "\n".join(got)
+    assert "sudo monster-ai logs --job prelim_scan" in "\n".join(got)
+    detail_lines = [ln for ln in got if ln.startswith("🔎")]
     assert detail_lines == ([expected] if expected else [])
 
 
@@ -711,22 +795,40 @@ def test_failure_notice_handles_odd_inputs_and_huge_details():
     messages = render_failure_notice("bad", "weird<stage>", "", "q" * 20000)
     assert_telegram_safe(messages)
     text = "\n".join(messages)
-    assert "Stage: WEIRD&lt;STAGE&gt;" in text and "Reason: n/a" in text and "Date: bad |" in text
-    assert "Details: " + "q" * 697 + "..." in text
-    assert "Stage: n/a" in "\n".join(render_failure_notice("2026-11-02", None, "x"))
+    assert "<b>WEIRD&lt;STAGE&gt;</b>" in text and "<b>Reason:</b> n/a" in text and "📅 bad" in text
+    assert "<b>Details:</b> " + "q" * 697 + "..." in text
+    assert "<code>sudo monster-ai jobs</code>" in text  # an unknown stage: point at the job list, not at a guessed job
+    assert "🎯 <b>n/a</b>" in "\n".join(render_failure_notice("2026-11-02", None, "x"))
 
 
 def test_render_alert_golden_and_limits():
     assert render_alert("error", "feed_down", "yahoo <down> & out") == (
-        "<b>[ERROR] MONSTER AI alert</b> <code>feed_down</code>\nyahoo &lt;down&gt; &amp; out"
+        "🟠 <b>ERROR</b> · <code>feed_down</code>\nyahoo &lt;down&gt; &amp; out"
     )
     stamped = render_alert("warning", "disk", "low", created_at="2026-11-02T03:00:00Z")
-    assert stamped.endswith("\n<i>2026-11-02 08:30 IST</i>") and stamped.startswith("<b>[WARNING] MONSTER AI alert</b>")
-    assert render_alert("", "", "") == "<b>[INFO] MONSTER AI alert</b> <code>n/a</code>\nn/a"
+    assert stamped.endswith("\n<i>🕗 2026-11-02 08:30 IST</i>") and stamped.startswith("🟡 <b>WARNING</b>")
+    assert render_alert("", "", "") == "🔵 <b>INFO</b> · <code>n/a</code>\nn/a"
     assert "IST" not in render_alert("info", "x", "y", created_at="garbage")
     huge = render_alert("critical", "x", "<" * 10000)
     assert_telegram_safe([huge])
     assert huge.splitlines()[1].endswith("...") and len(huge) <= 3900
+
+
+def test_alerts_have_a_severity_colour_and_good_news_gets_a_tick():
+    for level, icon in (("critical", "🔴"), ("error", "🟠"), ("warning", "🟡"), ("warn", "🟡"), ("info", "🔵"), ("weird", "⚪")):
+        assert render_alert(level, "x", "y").startswith(f"{icon} <b>")
+    assert render_alert("info", "bootstrap_complete", "done").startswith("🎉 <b>INFO</b>")
+    assert render_alert("info", "health_recovered", "ok").startswith("✅ <b>INFO</b>")
+
+
+def test_alerts_suggest_the_first_command_to_run_unless_the_message_already_does():
+    got = lines([render_alert("error", "scan_final_failed", "blocked by the data-quality gate")])
+    assert "🛠 <b>Next step:</b> <code>sudo monster-ai logs --job final_scan</code>" in got
+    assert "🛠 <b>Next step:</b> <code>sudo monster-ai logs --job collect_india</code>" in lines(
+        [render_alert("error", "job_failed_collect_india", "x")])
+    assert "🛠" not in render_alert("warning", "daemon_restarted", "restarted. See: python -m app.cli logs --role daemon")
+    assert "🛠" not in render_alert("error", "something_new", "no suggestion for an unknown code")
+    assert "<code>sudo monster-ai logs</code>" in render_alert("error", "job_failed_bad name!", "x")  # an unsafe suffix is never echoed
 
 
 def test_alert_digest_batches_into_one_message_with_ist_times():
@@ -738,14 +840,40 @@ def test_alert_digest_batches_into_one_message_with_ist_times():
     messages = render_alert_digest(alerts)
     assert_telegram_safe(messages)
     assert messages == [
-        "<b>MONSTER AI | 3 ALERTS</b>\n"
-        "[ERROR] <code>feed_down</code> (2026-11-02 08:30 IST): yahoo down\n"
-        "[WARNING] <code>disk_low</code>: 1.2 GB free &lt;warn&gt;\n"
-        "[INFO] <code>n/a</code>: n/a"
+        "🔔 <b>MONSTER AI</b> · 3 alerts\n"
+        f"{style.RULE}\n"
+        "🟠 <b>ERROR</b> · <code>feed_down</code> · 🕗 2026-11-02 08:30 IST\n"
+        "yahoo down\n"
+        "🟡 <b>WARNING</b> · <code>disk_low</code>\n"
+        "1.2 GB free &lt;warn&gt;\n"
+        "🔵 <b>INFO</b> · <code>n/a</code>\n"
+        "n/a\n"
+        "🛠 <b>Next step:</b> <code>sudo monster-ai health</code> · <code>sudo monster-ai logs</code>"
     ]
     many = [{"level": "error", "code": f"c{i}", "message": "m" * 400} for i in range(40)]
     split = render_alert_digest(many)
     assert_telegram_safe(split) and len(split) > 1
+
+
+# ---------------------------------------------------------------------------------------- unit failure
+def test_unit_failure_shows_the_unit_the_time_and_the_log_lines():
+    text = render_unit_failure("monster-ai.service", "line <1>\nline & 2", "2026-11-02T03:00:00Z")
+    assert_telegram_safe([text])
+    got = lines([text])
+    assert got[0] == "🚨 <b>Service failed</b> · <code>monster-ai.service</code>"
+    assert "<i>🕗 2026-11-02 08:30 IST</i>" in got and "📜 <b>Last journal lines</b>" in got
+    assert "<pre>line &lt;1&gt;" in text and "line &amp; 2</pre>" in text
+    assert "🛠 <b>Next step:</b> <code>journalctl -u monster-ai.service -n 100 --no-pager</code>" in got
+    assert "<pre>no log lines</pre>" in render_unit_failure("a.service", "")
+    assert "🕗" not in render_unit_failure("a.service", "x")  # no time given: none invented
+
+
+def test_unit_failure_keeps_the_newest_lines_of_a_huge_tail_and_never_echoes_an_unsafe_unit_name():
+    tail = "\n".join(f"old line {i}" for i in range(2000)) + "\nthe newest line <&>"
+    text = render_unit_failure("bad unit; rm -rf /", tail)
+    assert_telegram_safe([text])
+    assert "the newest line &lt;&amp;&gt;" in text and "old line 0\n" not in text and "<pre>..." in text
+    assert "journalctl" not in text and "<code>bad unit; rm -rf /</code>" in text  # shown escaped, but never as a command
 
 
 # ------------------------------------------------------------------------------------- test message
@@ -769,19 +897,22 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
     text = render_test_message(configured)
     assert_telegram_safe([text])
     got = lines([text])
-    assert got[0] == "<b>MONSTER AI online</b>"
-    assert "Mode: shadow (research output only; the system never places orders)" in got
-    assert "Telegram: report chat configured | alerts to a separate chat | prelim report off | evening report on" in got
-    assert any(ln.startswith("Targets: primary range threshold 3% | thresholds 1, 2, 3, 5% | top-N 5 | universe fno_nifty100") for ln in got)
-    assert "Schedule (IST): prelim 08:45:00 | final scan 09:08:45 | cutoff 09:12:00 | deadline 09:14:30" in got
-    assert any(ln.startswith("Integrations: LLM configured | off-box backup configured") for ln in got)
+    assert got[0] == "🤖 <b>MONSTER AI online</b> ✅"
+    assert "🧭 <b>Mode:</b> shadow - research output only; the system never places orders" in got
+    assert "🔹 Report chat: ✅ configured" in got and "🔹 Alerts go to: a separate chat" in got
+    assert "🔹 Preliminary report: ⚪ off · evening report: ✅ on" in got
+    assert any(ln.startswith("🎯 <b>Targets:</b> primary range threshold 3% · thresholds 1, 2, 3, 5% · top-N 5 · universe fno_nifty100") for ln in got)
+    for line in ("🔹 08:45:00 preliminary scan", "🔹 09:08:45 final scan", "🔹 09:12:00 report cutoff · 09:14:30 delivery deadline"):
+        assert line in got, line
+    assert any(ln.startswith("🔌 <b>Integrations:</b> LLM ✅ configured · off-box backup ✅ configured") for ln in got)
     for secret in (*secrets.values(), "1001", "2002"):
         assert secret not in text
     bare = "\n".join(lines([render_test_message(settings)]))
-    assert "report chat NOT configured | alerts to the same chat" in bare and "LLM off | off-box backup off" in bare
+    assert "Report chat: ❌ NOT configured" in bare and "Alerts go to: the same chat" in bare
+    assert "LLM ⚪ off · off-box backup ⚪ off" in bare
 
 
 def test_test_message_tolerates_partial_settings_objects():
     text = render_test_message(SimpleNamespace(mode="live", range_thresholds=(1.0, math.nan, 2.0)))
     assert_telegram_safe([text])
-    assert "Mode: live" in text and "thresholds 1, 2%" in text and "Environment: n/a" in text
+    assert "<b>Mode:</b> live" in text and "thresholds 1, 2%" in text and "<b>Environment:</b> n/a" in text

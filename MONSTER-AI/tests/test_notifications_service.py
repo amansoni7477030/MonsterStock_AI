@@ -157,7 +157,7 @@ def test_final_report_is_sent_and_recorded_in_the_ledger(svc, fake_client, store
     result = svc.send_report(make_ctx())
     assert (result.status, result.reason, result.message_ids, result.attempts) == ("sent", None, [101], 1)
     chat, text, options = fake_client.sent[0]
-    assert chat == "1001" and text.startswith("<b>MONSTER AI | NSE LARGE-MOVE SCAN</b>")
+    assert chat == "1001" and text.startswith("🚀 <b>MONSTER AI</b> · NSE large-move scan")
     assert options == {"deadline": at_ist("2026-11-02", "09:14:30")}
     row = store.get_delivery("telegram", KEY)
     assert (row["status"], row["kind"], row["trade_date"], row["attempts"]) == ("sent", "final_report", "2026-11-02", 1)
@@ -233,7 +233,7 @@ def test_non_retryable_failure_alerts_the_alert_chat_immediately(svc, fake_clien
     assert result.status == "failed" and "403" in result.reason
     assert len(fake_client.sent) == 1
     chat, text, _ = fake_client.sent[0]
-    assert chat == "2002" and "[ERROR] MONSTER AI alert" in text and "telegram_delivery_failed" in text
+    assert chat == "2002" and text.startswith("🟠 <b>ERROR</b> · <code>telegram_delivery_failed</code>")
     assert store.pending_alerts() == []
 
 
@@ -256,7 +256,7 @@ def test_prelim_report_respects_the_setting(cfg, store, fake_clock):
 
     on = NotificationService(dataclasses.replace(cfg, send_prelim_report=True), store, client=client, clock=fake_clock)
     sent = on.send_report(make_ctx(stage="pre"))
-    assert sent.status == "sent" and "PRELIMINARY (08:45 scan)" in client.sent[0][1]
+    assert sent.status == "sent" and "<b>PRELIMINARY</b> (08:45 scan)" in client.sent[0][1]
     assert client.sent[0][2] == {}  # the preliminary report has no send-by deadline
     assert store.get_delivery("telegram", "pre_report:2026-11-02")["status"] == "sent"
     assert store.get_delivery("telegram", KEY) is None
@@ -304,15 +304,15 @@ def test_force_sends_a_late_report_with_a_late_prefix(svc, fake_client, store, f
     result = svc.send_report(make_ctx(), force=True)
     assert result.status == "sent"
     chat, text, options = fake_client.sent[0]
-    assert chat == "1001" and LATE_PREFIX == "LATE - sent after the deadline, for the record only"
-    assert text.startswith(f"{LATE_PREFIX}\n\n<b>MONSTER AI | NSE LARGE-MOVE SCAN</b>")
+    assert chat == "1001" and LATE_PREFIX == "⏰ <b>LATE</b> - sent after the deadline, for the record only"
+    assert text.startswith(f"{LATE_PREFIX}\n\n🚀 <b>MONSTER AI</b> · NSE large-move scan")
     assert options == {} and store.get_delivery("telegram", KEY)["status"] == "sent"
 
 
 def test_force_before_the_deadline_is_not_labelled_late(svc, fake_client):
     assert svc.send_report(make_ctx(), force=True).status == "sent"
     chat, text, options = fake_client.sent[0]
-    assert text.startswith("<b>MONSTER AI") and "LATE" not in text and options == {}
+    assert text.startswith("🚀 <b>MONSTER AI") and "LATE" not in text and options == {}
 
 
 def test_late_prefix_never_pushes_a_message_over_the_limit(svc, fake_client, fake_clock, monkeypatch):
@@ -458,7 +458,7 @@ def test_evening_report_flow(svc, fake_client, store, cfg, fake_clock):
     summary = make_summary()
     result = svc.send_evening(summary)
     assert result.status == "sent" and fake_client.sent[0][0] == "1001"
-    assert "EVENING EVALUATION" in fake_client.sent[0][1]
+    assert "Evening evaluation" in fake_client.sent[0][1]
     row = store.get_delivery("telegram", "evening:2026-11-02")
     assert (row["status"], row["kind"], row["trade_date"]) == ("sent", "evening_report", "2026-11-02")
     assert svc.send_evening(summary).status == "duplicate" and len(fake_client.sent) == 1
@@ -478,7 +478,7 @@ def test_failure_notice_goes_to_the_alert_chat_once_per_stage_and_redacts_secret
     assert result.status == "sent"
     chat, text, options = fake_client.sent[0]
     assert chat == "2002" and options == {}
-    assert "<b>MONSTER AI | REPORT WITHHELD</b>" in text and "Reason: stale data (&lt;redacted&gt;)" in text
+    assert "🛑 <b>MONSTER AI</b> · REPORT WITHHELD" in text and "<b>Reason:</b> stale data (&lt;redacted&gt;)" in text
     assert TOKEN not in text
     row = store.get_delivery("telegram", "final_failure:2026-11-02")
     assert (row["status"], row["kind"]) == ("sent", "failure_notice")
@@ -515,7 +515,7 @@ def test_send_test_uses_a_unique_key_each_time_and_hides_secrets(svc, fake_clien
     first, second = svc.send_test(), svc.send_test()
     assert first.status == second.status == "sent" and len(fake_client.sent) == 2
     text = fake_client.sent[0][1]
-    assert "MONSTER AI online" in text and "Mode: shadow" in text and TOKEN not in text
+    assert "MONSTER AI online" in text and "<b>Mode:</b> shadow" in text and TOKEN not in text
     keys = [r["dedupe_key"] for r in store.conn.execute("SELECT dedupe_key FROM deliveries")]
     assert len(set(keys)) == 2 and all(k.startswith("test:") for k in keys)
 
@@ -541,7 +541,7 @@ def test_alert_is_deduplicated_and_delivered_immediately(svc, fake_client, store
     assert svc.alert("ERROR", "feed_down", "yahoo down", dedupe_key="yahoo") is True
     assert len(fake_client.sent) == 1
     chat, text, _ = fake_client.sent[0]
-    assert chat == "2002" and "[ERROR] MONSTER AI alert" in text and "yahoo down" in text
+    assert chat == "2002" and text.startswith("🟠 <b>ERROR</b>") and "yahoo down" in text
     assert store.pending_alerts() == []
 
     assert svc.alert("error", "feed_down", "yahoo down", dedupe_key="yahoo") is False
@@ -595,7 +595,7 @@ def test_flush_batches_pending_alerts_into_one_message(svc, fake_client, store):
     assert svc.flush_alerts() == 3
     assert len(fake_client.sent) == 1 and fake_client.sent[0][0] == "2002"
     text = fake_client.sent[0][1]
-    assert "<b>MONSTER AI | 3 ALERTS</b>" in text and all(f"code{i}" in text for i in range(3))
+    assert "🔔 <b>MONSTER AI</b> · 3 alerts" in text and all(f"code{i}" in text for i in range(3))
     assert store.pending_alerts() == [] and svc.flush_alerts() == 0 and len(fake_client.sent) == 1
 
 
@@ -611,7 +611,7 @@ def test_flush_of_a_single_alert_uses_the_plain_alert_format(svc, fake_client, s
     store.add_alert("error", "disk_low", "1.2 GB free")
     assert svc.flush_alerts() == 1
     assert fake_client.sent[0][1] == (
-        "<b>[ERROR] MONSTER AI alert</b> <code>disk_low</code>\n1.2 GB free\n<i>2026-11-02 08:30 IST</i>"
+        "🟠 <b>ERROR</b> · <code>disk_low</code>\n1.2 GB free\n<i>🕗 2026-11-02 08:30 IST</i>"
     )
 
 

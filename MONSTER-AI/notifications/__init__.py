@@ -10,6 +10,7 @@ from notifications.report import (
     render_final_report,
     render_prelim_report,
     render_test_message,
+    render_unit_failure,
 )
 from notifications.service import DeliveryResult, NotificationService
 from notifications.telegram import DeadlineExceeded, TelegramClient, split_message, to_plain_text
@@ -26,6 +27,7 @@ __all__ = [
     "render_final_report",
     "render_prelim_report",
     "render_test_message",
+    "render_unit_failure",
     "split_message",
     "to_plain_text",
 ]

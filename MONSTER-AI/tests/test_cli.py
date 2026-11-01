@@ -268,6 +268,80 @@ def test_alert_unit_sanitises_the_unit_name_and_redacts_logs(cli_env, monkeypatc
     assert run(["alert-unit", "monster-ai.service; rm -rf /"]) == 0
     assert sent["kind"] == "unit_failure" and "monster-ai.service" in sent["text"] and "rm -rf" not in sent["text"]
     assert sent["chat"] == "42"
+    assert sent["text"].startswith("🚨 <b>Service failed</b> · <code>monster-ai.servicerm-rf</code>")  # the sanitised name
+    assert "📜 <b>Last journal lines</b>" in sent["text"] and " IST</i>" in sent["text"]
+
+
+def _preview_env(monkeypatch, *, alert_chat="77"):
+    """Telegram settings plus a fake client that records what the preview sends."""
+    import notifications.telegram as tg
+
+    sent: list[tuple[str, str]] = []
+
+    class RecordingClient:
+        configured = True
+
+        def __init__(self, settings, **kwargs):
+            pass
+
+        def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text))
+            return [len(sent)]
+
+    monkeypatch.setattr(tg, "TelegramClient", RecordingClient)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("TELEGRAM_ALERT_CHAT_ID", alert_chat)
+    return sent
+
+
+def test_telegram_preview_lists_the_kinds_without_needing_telegram(cli_env, capsys):
+    assert run(["telegram-preview", "--list"]) == 0
+    out = capsys.readouterr().out
+    for kind in ("final", "prelim", "no-setup", "evening", "alert", "digest", "failure", "unit", "online"):
+        assert any(line.startswith(kind) for line in out.splitlines()), kind
+
+
+def test_telegram_preview_needs_a_configured_bot_and_a_known_kind(cli_env, capsys):
+    assert run(["telegram-preview"]) == 1 and "not configured" in capsys.readouterr().err
+    assert run(["telegram-preview", "--only", "bogus"]) == 2 and "unknown kind(s) bogus" in capsys.readouterr().err
+
+
+def test_telegram_preview_sends_marked_samples_and_routes_alerts_to_the_alert_chat(cli_env, monkeypatch, capsys):
+    sent = _preview_env(monkeypatch)
+    assert run(["telegram-preview", "--delay", "0", "--only", "final", "alert", "unit"]) == 0
+    assert all(text.startswith("🧪 <b>SAMPLE PREVIEW</b>") for _, text in sent)
+    chats = [chat for chat, _ in sent]
+    assert chats[0] == "42" and set(chats[1:]) == {"77"}  # the report to the report chat, 4 alerts + the unit failure to the alert chat
+    assert len(sent) >= 6 and "made-up data" in capsys.readouterr().out
+
+
+def test_telegram_preview_sends_everything_by_default(cli_env, monkeypatch):
+    from notifications import samples
+
+    sent = _preview_env(monkeypatch)
+    assert run(["telegram-preview", "--delay", "0"]) == 0
+    assert len(sent) >= len(samples.KINDS)
+
+
+def test_telegram_preview_reports_the_reason_when_telegram_fails_midway(cli_env, monkeypatch, capsys):
+    from app.errors import DataUnavailable
+
+    sent = _preview_env(monkeypatch)
+    import notifications.telegram as tg
+
+    real = tg.TelegramClient
+
+    class Flaky(real):
+        def send_message(self, chat_id, text, **kwargs):
+            if len(sent) >= 2:
+                raise DataUnavailable("telegram", "HTTP 429: rate limited by Telegram", retryable=False)
+            return super().send_message(chat_id, text, **kwargs)
+
+    monkeypatch.setattr(tg, "TelegramClient", Flaky)
+    assert run(["telegram-preview", "--delay", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "after 2 message(s)" in err and "HTTP 429: rate limited by Telegram" in err
 
 
 def test_evaluate_and_train_plumbing(cli_env, monkeypatch, capsys):

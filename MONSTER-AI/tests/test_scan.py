@@ -82,7 +82,7 @@ def scan_with_gift(env, source_ts):
 def test_the_report_shows_gift_nifty_while_its_quote_is_fresh(env):
     report = scan_with_gift(env, "2026-11-02T03:14:00Z")  # 08:44 IST, one minute before the scan
     assert report["regime"]["gift_nifty"] == "+0.40%"
-    assert "gift_nifty=+0.40%" in "\n".join(text for _, text in env.telegram.sent)
+    assert "GIFT Nifty: +0.40%" in "\n".join(text for _, text in env.telegram.sent)
 
 
 def test_a_stale_gift_nifty_quote_never_reads_as_todays_hint(env):
