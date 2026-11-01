@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = sorted({ROOT / "README.md", ROOT / "CHANGELOG.md", ROOT / "deployment" / "README.md", *(ROOT / "docs").glob("*.md")})
 DIAGRAM_TYPES = ("flowchart", "graph", "sequenceDiagram", "stateDiagram-v2", "classDiagram", "erDiagram", "gantt", "pie", "timeline")
-MIN_DIAGRAMS = {"README.md": 3, "docs/ARCHITECTURE.md": 15}
+MIN_DIAGRAMS = {"README.md": 3, "docs/ARCHITECTURE.md": 15, "docs/OPERATIONS.md": 2, "deployment/README.md": 1}
 FENCE = re.compile(r"^(```|~~~)")
 LINK = re.compile(r"(?<!!)\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 BLOCK_OPEN = re.compile(r"^\s*(subgraph\b|alt\b|opt\b|loop\b|par\b|critical\b|break\b|rect\b)")
@@ -120,3 +120,46 @@ def test_the_slug_matches_githubs_anchors():
     assert slug("Daily timetable (Asia/Kolkata, trading days)") == "daily-timetable-asiakolkata-trading-days"
     assert slug("Network layer: curl_cffi, bulk fetching, rate limits") == "network-layer-curl_cffi-bulk-fetching-rate-limits"
     assert slug("`monster-ai` **health**") == "monster-ai-health"
+
+
+# ------------------------------------------------------------------------------------ blueprint traceability
+STATUSES = ("✅", "🔧", "⚠️", "🔀")
+ROW = re.compile(r"^\| ((?:\d+|[AB])\.\d+) \|")
+STATUS_CELL = re.compile(r"\| (✅|🔧|⚠️|🔀) \|")
+
+
+def traceability_counts(text: str):
+    """(per-section counts from the tables, the Summary table's rows) of docs/BLUEPRINT_TRACEABILITY.md."""
+    counted: dict[str, list[int]] = {}
+    summary: dict[str, list[int]] = {}
+    section, in_summary = None, False
+    for line in text.split("\n"):
+        heading = re.match(r"^## (§\d+|Appendix [AB])\b", line)
+        if line.startswith("## "):
+            in_summary = line.strip() == "## Summary"
+            section = heading.group(1) if heading else None
+            continue
+        if in_summary and line.startswith("|"):
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if len(cells) == 7 and (cells[0].startswith(("§", "Appendix")) or cells[0] == "Total"):
+                summary[cells[0]] = [int(c) for c in cells[2:]]
+        elif section and ROW.match(line):
+            status = STATUS_CELL.search(line)
+            assert status, f"{section}: row without a status: {line[:60]}"
+            row = counted.setdefault(section, [0, 0, 0, 0, 0])
+            row[STATUSES.index(status.group(1))] += 1
+            row[4] += 1
+    return counted, summary
+
+
+def test_the_traceability_summary_matches_its_tables():
+    counted, summary = traceability_counts(read(ROOT / "docs" / "BLUEPRINT_TRACEABILITY.md"))
+    assert counted and set(summary) == set(counted) | {"Total"}, "every section needs a Summary row and vice versa"
+    for section, row in counted.items():
+        assert summary[section] == row, f"{section}: the Summary says {summary[section]} but the table has {row}"
+    assert summary["Total"] == [sum(r[i] for r in counted.values()) for i in range(5)]
+
+
+def test_every_traceability_row_has_a_unique_id_and_a_known_status():
+    ids = [m.group(1) for line in read(ROOT / "docs" / "BLUEPRINT_TRACEABILITY.md").split("\n") if (m := ROW.match(line))]
+    assert len(ids) == len(set(ids)) and len(ids) > 300

@@ -167,8 +167,8 @@ server with native systemd (no containers).
   about 640 MB resident for the feature build and 565 MB for the model training in the light profile. A training
   attempt that still dies from memory pressure is retried automatically with a leaner profile.
 - The curl_cffi transport, the Yahoo `spark` probe and the NSE endpoints were exercised against the live providers from a development PC.
-- The time-zone guarantees are tested: the five-zone subprocess matrix (UTC, US Pacific, India, New Zealand, UTC+14) passes, and a broad
-  subset of the suite passes with the process zone set to US Pacific (DST).
+- The time-zone guarantees are tested: the five-zone subprocess matrix (UTC, US Pacific, India, New Zealand, UTC+14) passes, and the whole
+  suite passes both in the development PC's own zone (India) and with the process zone forced to US Pacific (DST).
 
 ### Known limitations
 

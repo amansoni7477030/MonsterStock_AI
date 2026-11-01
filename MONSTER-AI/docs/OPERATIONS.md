@@ -170,6 +170,18 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 
 ### No report this morning
 
+```mermaid
+flowchart TB
+    A["No report at 09:12 IST"] --> B["sudo monster-ai jobs:<br/>did final_scan run, and with which status?"]
+    B --> C{"status"}
+    C -->|"blocked by the<br/>data-quality gate"| D["the message lists what is missing;<br/>monster-ai doctor shows unreachable feeds;<br/>retries run until 09:13:30"]
+    C -->|"skipped:<br/>exchange closed"| E{"holiday_inferred<br/>alert?"}
+    E -->|"yes"| E1["NSE itself published no pre-open book:<br/>a real holiday, nothing to do"]
+    E -->|"no"| E2["the calendar thinks it is a holiday:<br/>see The calendar section below"]
+    C -->|"ran, but nothing arrived"| F["Telegram delivery failed: the report is frozen<br/>and re-sent on the next attempt;<br/>after 09:14:30 it is withheld on purpose"]
+    C -->|"failed, or unclear"| G["monster-ai logs --job final_scan -n 200<br/>then monster-ai diag"]
+```
+
 1. `sudo monster-ai jobs` - did `final_scan` run? Which status?
 2. If it says **blocked by the data-quality gate**, the message lists what is missing. Typical causes:
    the previous session's bars are incomplete (provider outage), or the global-feed block is stale (>= 6 critical series).
@@ -248,6 +260,22 @@ sudo monster-ai diag                 # writes /var/lib/monster-ai/diag/diag-<UTC
 Attach that file (versions, offline doctor, settings, health, storage, database summary, log tails) to the bug report.
 
 ## Logs and diagnostics
+
+Which command to reach for first:
+
+```mermaid
+flowchart TB
+    Q["Something looks wrong"] --> H["sudo monster-ai health:<br/>what is red or yellow?"]
+    H --> W["sudo monster-ai logs:<br/>warnings and errors of every process, newest day"]
+    W --> J{"one job involved?"}
+    J -->|"yes"| J1["monster-ai logs --job NAME:<br/>everything it logged, with its network: line"]
+    J -->|"no"| J2["monster-ai logs --role all --level INFO --since 2h<br/>or --grep TEXT"]
+    J1 --> D{"still unclear?"}
+    J2 --> D
+    D -->|"no"| OK["fix it, then run monster-ai health again"]
+    D -->|"yes"| DG["sudo monster-ai diag: a redacted bundle with versions,<br/>doctor, settings, health, storage, database summary, log tails"]
+    DG --> BUG["attach the tar.gz to the bug report"]
+```
 
 Where things are written:
 

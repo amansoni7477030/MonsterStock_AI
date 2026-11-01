@@ -57,20 +57,20 @@ on an existing server the weekly Saturday training does it, and `sudo monster-ai
 ## How it works
 
 ```mermaid
-flowchart LR
-    SRC["Yahoo, NSE archives and API,<br/>RSS and GDELT, FRED"] -->|"curl_cffi, rate limited, validated"| DB[("SQLite<br/>single source of truth")]
+flowchart TB
+    SRC["Yahoo, NSE archives and API,<br/>RSS, GDELT, FRED"] -->|"curl_cffi, rate limited, validated"| DB[("SQLite<br/>single source of truth")]
     DB --> FEAT["features<br/>one path for training and live"]
-    NEWS["news_intelligence + event_graph<br/>catalysts, chains, priced-in"] --> RANK
-    DB --> NEWS
+    DB --> NEWS["news_intelligence + event_graph<br/>catalysts, chains, priced-in"]
     FEAT --> GATE{"data-quality gate"}
     GATE --> MODEL["models<br/>calibrated probabilities"]
     MODEL --> RANK["ranking<br/>eligibility, cost, tiers, abstention"]
-    RANK --> FREEZE["immutable snapshot<br/>+ predictions"]
-    FREEZE --> TG(["Telegram report<br/>~09:12 IST"])
+    NEWS --> RANK
+    RANK --> FREEZE["immutable snapshot + predictions"]
+    FREEZE --> TG(["Telegram report ~09:12 IST"])
     FREEZE --> EVAL["evaluation after the close<br/>official bhavcopy"]
+    EVAL --> EVE(["evening report, n and 95 % intervals"])
     EVAL --> TRAIN["weekly walk-forward training<br/>fixed gates, champion / challenger"]
     TRAIN --> MODEL
-    EVAL --> EVE(["evening report<br/>with n and 95 % intervals"])
 ```
 
 - **Data**: Yahoo daily bars (unofficial) and NSE official files (bhavcopy, UDiFF F&O, index lists, pre-open API), news from
@@ -91,57 +91,49 @@ retention, logging, deployment topology) are in [docs/ARCHITECTURE.md](docs/ARCH
 
 ## Whole-code architecture
 
-A layered modular monolith: arrows point from a layer to the layers it uses, and every layer also uses the platform package
-`app/`.
+A layered modular monolith: each layer uses only the layers below it (the arrows to the outside world are the HTTPS calls), and every
+layer also uses the platform package `app/`.
 
 ```mermaid
 flowchart TB
-    subgraph L0["Entry points"]
-        direction LR
-        UNITS["systemd units<br/>monster-ai daemon, -bootstrap,<br/>-health.timer, -alert@, -dashboard"]
-        CLI["app.cli<br/>init, doctor, scan, train, backtest, models,<br/>backup, health, logs, storage, diag ..."]
-        DASH["dashboard<br/>read-only FastAPI, loopback"]
+    subgraph L0["Entry points - start and run everything below"]
+        UNITS["systemd units"]
+        CLI["app.cli"]
+        DASH["dashboard<br/>read-only"]
     end
-    subgraph L1["automation/ - control plane"]
-        direction LR
-        SCHED["scheduler + schedule<br/>ledger-based daemon"]
-        RUNNER["runner + jobspec<br/>one child process per job"]
-        JOBS["jobs<br/>all job bodies"]
-        SCAN["scan<br/>pre and final scans"]
-        BOOT["bootstrap<br/>12-step first run"]
-        HEALTHM["health<br/>checks and alerts"]
-        RETM["retention<br/>bounded storage"]
-        CALM["calendar<br/>any-year exchange calendar"]
+    subgraph L1["automation/ - control plane, orchestrates the layers below"]
+        SCHED["scheduler, schedule<br/>runner, jobspec"]
+        JOBS["jobs, scan,<br/>bootstrap"]
+        HEALTHM["health, retention"]
+        CALM["calendar"]
         CTXM["context, intel,<br/>graph_learning"]
     end
-    subgraph L2["Domain logic"]
-        direction LR
-        FEAT["features<br/>builder, technical, fno, global, regime,<br/>sector, similar_day, labels, live, loader"]
-        MOD["models<br/>specialists, training, calibration, inference,<br/>registry, artifacts, bundle, signing, external"]
-        RANK["ranking<br/>ranker, signals, costs, types"]
-        NEWS["news_intelligence<br/>dedup, entities, events, priced_in,<br/>source_quality, pipeline, llm"]
-        GRAPH["event_graph<br/>seed, sensitivity, propagation, repository"]
-        BT["backtesting<br/>evaluate, metrics, walkforward, live_record"]
-        NOTIF["notifications<br/>telegram, report renderers, delivery ledger"]
+    subgraph L2["Domain logic - reads and writes the data layer"]
+        FEAT["features"]
+        MOD["models"]
+        RANK["ranking"]
+        NEWS["news_intelligence"]
+        GRAPH["event_graph"]
+        BT["backtesting"]
+        NOTIF["notifications"]
     end
     subgraph L3["Data layer"]
-        direction LR
-        ING["ingestion<br/>http (curl_cffi), yahoo, nse, pipeline, universe,<br/>validation, freshness, adjust, basis, news_sources, registry"]
-        DBL["database<br/>connection, migrate, store (repository),<br/>backup, object_store, remote_backup"]
+        ING["ingestion<br/>http (curl_cffi), yahoo, nse"]
+        DBL["database<br/>store, backup, S3"]
     end
-    subgraph L4["app/ - platform"]
-        PLAT["config, clock, logging_setup, logview, diagnostics, release,<br/>resources, locks, errors, jsonutil, envfile, doctor"]
+    subgraph L4["app/ - platform, used by every layer"]
+        PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS and GDELT, FRED, Telegram, S3, LLM"]
-
-    L0 -->|"start and run"| L1
-    L1 -->|"orchestrates"| L2
-    L1 -->|"reads and writes"| L3
-    L2 -->|"reads and writes"| L3
-    L3 --> L4
+    EXT["External: Yahoo, NSE, RSS, GDELT, FRED, Telegram, S3, LLM"]
+    UNITS ~~~ SCHED
+    SCHED ~~~ FEAT
+    FEAT ~~~ ING
+    ING ~~~ PLAT
     ING -.->|"HTTPS"| EXT
     NOTIF -.->|"HTTPS"| EXT
 ```
+
+The module lists behind each box are in the package table of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#packages).
 
 ## Quick start (development machine)
 
@@ -180,12 +172,10 @@ command is `sudo monster-ai <command>`.
 ## Daily timetable (Asia/Kolkata, trading days)
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph EARLY["Any day"]
         direction TB
-        N1["02:00 Sat: train"]
-        N2["04:00 Sun: refresh_universe"]
-        N3["05:30: refresh_calendar, model_sync"]
+        N1["02:00 Sat: train"] ~~~ N2["04:00 Sun: refresh_universe"] ~~~ N3["05:30: refresh_calendar,<br/>model_sync"]
     end
     subgraph MORN["Trading morning"]
         direction TB
@@ -205,7 +195,6 @@ flowchart LR
         E3 --> E4["23:30 backup"]
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
-    EARLY --> MORN --> EVE
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
     class M7,M8,M9 critical
 ```

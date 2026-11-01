@@ -40,34 +40,16 @@ Companion documents: [README](../README.md) (overview and quick start), [OPERATI
 
 ```mermaid
 flowchart LR
-    subgraph SRC["Public data sources - no paid keys required"]
-        YF["Yahoo Finance<br/>chart + spark endpoints"]
-        NSEA["NSE archives<br/>bhavcopy, F&O, index lists"]
-        NSEJ["NSE public JSON API<br/>pre-open, GIFT Nifty, filings, holidays"]
-        RSS["Publisher RSS/Atom feeds<br/>and GDELT"]
-        MAC["FRED and economic calendar<br/>(optional)"]
+    SRC["Public data sources<br/>Yahoo, NSE, RSS, GDELT, FRED<br/>no paid keys required"] -->|"curl_cffi,<br/>rate limited"| MON
+    subgraph SERVER["Your server: 1 GB RAM, native systemd, no containers"]
+        direction TB
+        MON["MONSTER AI<br/>daemon + job processes"] <--> DB[("SQLite WAL<br/>+ logs, backups, models")]
     end
-    subgraph SERVER["Your server - 1 GB RAM, native systemd, no containers"]
-        MON["MONSTER AI<br/>scheduler daemon + short-lived job processes"]
-        DB[("SQLite WAL<br/>monster.db")]
-        FILES["Logs, backups, model files,<br/>disposable cache"]
-        MON <--> DB
-        MON --> FILES
-    end
-    subgraph OPT["Optional"]
-        S3[("S3-compatible store<br/>off-box backups, signed models")]
-        GHA["GitHub Actions worker<br/>external training"]
-        LLM["OpenAI-compatible LLM<br/>event extraction"]
-    end
-    TG["Telegram bot<br/>reports and alerts"]
-    YOU(("You"))
-    SRC -->|"curl_cffi, rate limited"| MON
-    MON -->|"09:12 IST report, alerts"| TG
-    TG --> YOU
-    MON <--> S3
-    GHA <--> S3
-    MON -.-> LLM
-    YOU -.->|"sudo monster-ai ... / SSH tunnel"| MON
+    MON -->|"09:12 IST report,<br/>alerts"| TG["Telegram bot"] --> YOU(("You"))
+    YOU -.->|"sudo monster-ai /<br/>SSH tunnel"| MON
+    MON <-.->|"optional"| S3[("S3-compatible store<br/>backups, signed models")]
+    MON -.->|"optional"| LLM["OpenAI-compatible LLM"]
+    GHA["GitHub Actions worker<br/>external training"] <-.-> S3
 ```
 
 Everything the system knows lives in **one SQLite file**. There is no message bus, no container and no second process
@@ -75,54 +57,45 @@ holding state: a crash can only lose the work of the current job, and every job 
 
 ## Whole-code architecture
 
-The code base is a layered modular monolith. Arrows point from a layer to the layers it uses; every layer also uses the
-platform package `app/` (configuration, clock, logging).
+The code base is a layered modular monolith. Each layer uses only the layers below it (the arrows to the outside world are the
+HTTPS calls), and every layer also uses the platform package `app/` (configuration, clock, logging). The module lists behind each
+box are in the [package table](#packages) below.
 
 ```mermaid
 flowchart TB
-    subgraph L0["Entry points"]
-        direction LR
-        UNITS["systemd units<br/>monster-ai daemon, -bootstrap,<br/>-health.timer, -alert@, -dashboard"]
-        CLI["app.cli<br/>init, doctor, scan, train, backtest, models,<br/>backup, health, logs, storage, diag ..."]
-        DASH["dashboard<br/>read-only FastAPI, loopback"]
+    subgraph L0["Entry points - start and run everything below"]
+        UNITS["systemd units"]
+        CLI["app.cli"]
+        DASH["dashboard<br/>read-only"]
     end
-    subgraph L1["automation/ - control plane"]
-        direction LR
-        SCHED["scheduler + schedule<br/>ledger-based daemon"]
-        RUNNER["runner + jobspec<br/>one child process per job"]
-        JOBS["jobs<br/>all job bodies"]
-        SCAN["scan<br/>pre and final scans"]
-        BOOT["bootstrap<br/>12-step first run"]
-        HEALTHM["health<br/>checks and alerts"]
-        RETM["retention<br/>bounded storage"]
-        CALM["calendar<br/>any-year exchange calendar"]
+    subgraph L1["automation/ - control plane, orchestrates the layers below"]
+        SCHED["scheduler, schedule<br/>runner, jobspec"]
+        JOBS["jobs, scan,<br/>bootstrap"]
+        HEALTHM["health, retention"]
+        CALM["calendar"]
         CTXM["context, intel,<br/>graph_learning"]
     end
-    subgraph L2["Domain logic"]
-        direction LR
-        FEAT["features<br/>builder, technical, fno, global, regime,<br/>sector, similar_day, labels, live, loader"]
-        MOD["models<br/>specialists, training, calibration, inference,<br/>registry, artifacts, bundle, signing, external"]
-        RANK["ranking<br/>ranker, signals, costs, types"]
-        NEWS["news_intelligence<br/>dedup, entities, events, priced_in,<br/>source_quality, pipeline, llm"]
-        GRAPH["event_graph<br/>seed, sensitivity, propagation, repository"]
-        BT["backtesting<br/>evaluate, metrics, walkforward, live_record"]
-        NOTIF["notifications<br/>telegram, report renderers, delivery ledger"]
+    subgraph L2["Domain logic - reads and writes the data layer"]
+        FEAT["features"]
+        MOD["models"]
+        RANK["ranking"]
+        NEWS["news_intelligence"]
+        GRAPH["event_graph"]
+        BT["backtesting"]
+        NOTIF["notifications"]
     end
     subgraph L3["Data layer"]
-        direction LR
-        ING["ingestion<br/>http (curl_cffi), yahoo, nse, pipeline, universe,<br/>validation, freshness, adjust, basis, news_sources, registry"]
-        DBL["database<br/>connection, migrate, store (repository),<br/>backup, object_store, remote_backup"]
+        ING["ingestion<br/>http (curl_cffi), yahoo, nse"]
+        DBL["database<br/>store, backup, S3"]
     end
-    subgraph L4["app/ - platform"]
-        PLAT["config, clock, logging_setup, logview, diagnostics, release,<br/>resources, locks, errors, jsonutil, envfile, doctor"]
+    subgraph L4["app/ - platform, used by every layer"]
+        PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS and GDELT, FRED, Telegram, S3, LLM"]
-
-    L0 -->|"start and run"| L1
-    L1 -->|"orchestrates"| L2
-    L1 -->|"reads and writes"| L3
-    L2 -->|"reads and writes"| L3
-    L3 --> L4
+    EXT["External: Yahoo, NSE, RSS, GDELT, FRED, Telegram, S3, LLM"]
+    UNITS ~~~ SCHED
+    SCHED ~~~ FEAT
+    FEAT ~~~ ING
+    ING ~~~ PLAT
     ING -.->|"HTTPS"| EXT
     NOTIF -.->|"HTTPS"| EXT
 ```
@@ -140,48 +113,48 @@ Dependency rules, checked against the import graph:
 The control plane in more detail:
 
 ```mermaid
-flowchart LR
+flowchart TB
     CLID["app.cli daemon"] --> RD["run_daemon"]
-    RD --> SCH["Scheduler<br/>tick every few seconds"]
-    SCH --> ENG["ScheduleEngine<br/>SCHEDULE table + job_runs ledger<br/>+ ExchangeCalendar + IST clock"]
+    RD --> SCH["Scheduler: tick every few seconds"]
+    SCH --> ENG["ScheduleEngine<br/>SCHEDULE table, job_runs ledger,<br/>calendar and IST clock"]
     ENG --> DUE["due jobs<br/>(run key, attempt, window)"]
-    DUE --> GATE{"disk and RAM ok?<br/>heavy lock free?"}
-    GATE -- yes --> LAUNCH["SubprocessLauncher<br/>python -m app.cli run-job NAME"]
-    GATE -- no --> WAIT["deferred, logged"]
-    LAUNCH --> EXE["runner.execute_job<br/>locks, job log context,<br/>RSS watchdog, timeout"]
-    EXE --> BODY["jobs.NAME(ctx)<br/>or scan.run_scan / bootstrap"]
-    BODY --> LED[("job_runs ledger<br/>kv, alerts")]
-    SCH --> HB["heartbeat: systemd watchdog,<br/>heartbeat file, DB row"]
-    SCH --> BOOTQ["_maybe_bootstrap<br/>until bootstrap.state = done"]
+    DUE --> GATE{"first runnable job:<br/>disk and RAM ok for a heavy job?"}
+    GATE -- "no: skip it, try the next due job" --> DUE
+    GATE -- yes --> LAUNCH["python -m app.cli run-job NAME<br/>(child process)"]
+    LAUNCH --> EXE["runner.execute_job<br/>locks, log context, RSS watchdog, timeout"]
+    EXE --> BODY["jobs.NAME(ctx), scan.run_scan,<br/>bootstrap"]
+    BODY --> LED[("job_runs ledger, kv, alerts")]
+    SCH --> HB["heartbeat: systemd watchdog,<br/>file, DB row"]
+    SCH --> BOOTQ["bootstrap until<br/>bootstrap.state = done"]
 ```
 
 ## Data flow
 
 ```mermaid
-flowchart LR
-    subgraph IN["Ingestion (curl_cffi, validated, deadline-bounded)"]
+flowchart TB
+    subgraph IN["Ingestion: curl_cffi, validated, deadline-bounded"]
         Y["Yahoo<br/>daily bars, quotes"]
         A["NSE archives<br/>official bhavcopy, F&O"]
         J["NSE API<br/>pre-open, GIFT, filings"]
         R["RSS, GDELT,<br/>filings, calendar"]
     end
-    Y --> V["validation<br/>schema, ranges, dates, size"]
+    Y --> V["validation: schema, ranges, dates, size"]
     A --> V
     J --> V
     R --> NI["news_intelligence<br/>dedup, entities, events, priced-in"]
-    V --> DB[("SQLite - single source of truth<br/>bars, F&O, quotes, news, events,<br/>snapshots, predictions, outcomes")]
+    V --> DB[("SQLite - single source of truth")]
     NI --> DB
     DB --> EG["event_graph<br/>chains, sector sensitivities"]
-    DB --> F["features<br/>one code path for training AND live"]
+    DB --> F["features: one code path for training AND live"]
     F --> Q{"data-quality gate<br/>ok, degraded or blocked"}
     Q --> M["models.inference<br/>champion or labelled baseline"]
-    M --> K["ranking<br/>eligibility, costs, tiers, abstention"]
+    M --> K["ranking: eligibility, costs, tiers, abstention"]
     EG --> K
     NI --> K
-    K --> S["freeze immutable snapshot<br/>+ predictions"]
-    S --> D["notifications<br/>idempotent delivery ledger"]
+    K --> S["freeze immutable snapshot + predictions"]
+    S --> D["notifications: idempotent delivery ledger"]
     D --> T(["Telegram report 09:12 IST"])
-    S --> E["backtesting.evaluate<br/>after the close: official bhavcopy"]
+    S --> E["backtesting.evaluate after the close<br/>official bhavcopy"]
     E --> O[("outcomes, rolling metrics")]
     O --> EV(["evening report"])
     O --> TR["weekly walk-forward training<br/>gates, champion / challenger"]
@@ -194,12 +167,10 @@ All times are Asia/Kolkata. The authoritative table is `SCHEDULE` in [automation
 the daemon derives "what is due" from the `job_runs` ledger, never from a clock tick.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph EARLY["Any day (night and early morning)"]
         direction TB
-        N1["02:00 Sat: train"]
-        N2["04:00 Sun: refresh_universe"]
-        N3["05:30: refresh_calendar, model_sync"]
+        N1["02:00 Sat: train"] ~~~ N2["04:00 Sun: refresh_universe"] ~~~ N3["05:30: refresh_calendar,<br/>model_sync"]
     end
     subgraph MORN["Trading morning"]
         direction TB
@@ -219,7 +190,6 @@ flowchart LR
         E3 --> E4["23:30 backup"]
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
-    EARLY --> MORN --> EVE
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
     class M7,M8,M9 critical
 ```
@@ -250,35 +220,26 @@ after their window (or on a later day) when the server was down.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant SCH as Scheduler daemon
-    participant RUN as Job process (run-job final_scan)
+    participant SCH as Scheduler
+    participant RUN as final_scan job
     participant NSE as NSE API
-    participant DQ as Data-quality gate
-    participant FEA as Feature builder
-    participant MOD as Model registry
-    participant RNK as Ranker and news graph
     participant DB as SQLite
     participant TG as Telegram
 
-    SCH->>RUN: start at 09:08:45 (the ledger says it is due)
-    RUN->>DB: trading day? frozen snapshot already there?
+    SCH->>RUN: start at 09:08:45
+    RUN->>DB: trading day? snapshot frozen?
     alt a frozen snapshot exists
-        RUN->>TG: re-send the frozen report, nothing is recomputed
+        RUN->>TG: re-send it, no recompute
     else first run of the day
-        RUN->>NSE: GIFT Nifty and the pre-open book (deadline-bounded polls)
-        NSE-->>RUN: prices, or nothing (a book stamped on an earlier day is ignored)
-        RUN->>DQ: previous session complete? global block fresh?
+        RUN->>NSE: GIFT + pre-open book
+        NSE-->>RUN: prices, or nothing
+        Note over RUN: data-quality gate (freshness, coverage)
         alt blocked
-            DQ-->>RUN: blocked with reasons
-            RUN->>DB: alert scan_final_failed
+            RUN->>DB: alert scan_final_failed, no report
         else ok or degraded
-            RUN->>FEA: point-in-time features at the cutoff
-            FEA->>MOD: champion model, or the labelled heuristic baseline
-            MOD-->>RUN: calibrated probabilities and uncertainty
-            RUN->>RNK: eligibility, costs, catalysts, chains, tiers
-            RNK-->>RUN: top N, or no setup with the reason
-            RUN->>DB: freeze snapshot and predictions in ONE transaction
-            RUN->>TG: deliver through the ledger (idempotent, deadline 09:14:30)
+            Note over RUN: features, champion model or baseline, tiers
+            RUN->>DB: freeze snapshot + predictions (one transaction)
+            RUN->>TG: deliver via ledger, deadline 09:14:30
         end
     end
 ```
@@ -468,42 +429,36 @@ Each bootstrap step records its own status in `bootstrap.steps`; `init`, `univer
 can fail or be skipped without blocking the timetable (they are retried by the regular jobs).
 
 ```mermaid
-flowchart LR
+flowchart TB
     S["step starts"] --> A{"already done?"}
     A -- yes --> D["skip: already done"]
     A -- no --> B{"crashed twice before<br/>and not required?"}
-    B -- yes --> K["mark skipped: earlier attempts died<br/>mid-step (out of memory?)"]
+    B -- yes --> K["mark skipped: earlier attempts<br/>died mid-step (out of memory?)"]
     B -- no --> R["save status running"]
     R --> X["run the step"]
     X -- "done, skipped or failed" --> W["save status and detail"]
     X -- "exception" --> F["status failed, logged with traceback"]
-    X -- "process killed: OOM, reboot" --> C["row stays running, counts as a crash next time"]
+    X -- "process killed: OOM, reboot" --> C["row stays running:<br/>counts as a crash next time"]
 ```
 
 ```mermaid
 flowchart TB
-    subgraph L1["Inside a job"]
-        A1["per-job timeout (JobSpec.timeout_min)"]
-        A2["RSS watchdog (JOB_MAX_RSS_MB) aborts and retries, leaner"]
-        A3["bounded retries with back-off, caller deadlines"]
+    subgraph L1["1. Inside a job"]
+        direction TB
+        A1["per-job timeout"] ~~~ A2["RSS watchdog:<br/>abort, retry leaner"] ~~~ A3["bounded retries,<br/>back-off, deadlines"]
     end
-    subgraph L2["Scheduler daemon"]
-        B1["ledger decides what is due: nothing runs twice"]
-        B2["one child at a time, critical jobs preempt"]
-        B3["disk and RAM gates defer heavy jobs"]
-        B4["heartbeat: systemd watchdog, heartbeat file, DB row"]
-        B5["unclean-restart detection: daemon_restarted alert"]
+    subgraph L2["2. Scheduler daemon"]
+        direction TB
+        B1["ledger: nothing<br/>runs twice"] ~~~ B2["one child at a time,<br/>critical jobs preempt"] ~~~ B3["disk and RAM gates<br/>defer heavy jobs"] ~~~ B4["heartbeat: watchdog,<br/>file, DB row"] ~~~ B5["daemon_restarted<br/>alert"]
     end
-    subgraph L3["systemd"]
-        C1["Restart=always, WatchdogSec=180"]
-        C2["MemoryHigh / MemoryMax, OOMScoreAdjust"]
-        C3["health timer every 5 minutes, independent of the daemon"]
+    subgraph L3["3. systemd"]
+        direction TB
+        C1["Restart=always,<br/>WatchdogSec=180"] ~~~ C2["MemoryHigh /<br/>MemoryMax"] ~~~ C3["health timer<br/>every 5 minutes"]
     end
-    subgraph L4["Operator signals"]
-        D1["Telegram alerts: de-duplicated, queued while Telegram is down"]
-        D2["monster-ai health, logs, diag, storage"]
+    subgraph L4["4. Operator signals"]
+        direction TB
+        D1["Telegram alerts,<br/>queued while down"] ~~~ D2["monster-ai health,<br/>logs, diag, storage"]
     end
-    L1 --> L2 --> L3 --> L4
 ```
 
 ## Network layer: curl_cffi, bulk fetching, rate limits
@@ -565,7 +520,7 @@ flowchart TB
 | GDELT, economic calendar | minimum spacing 6 s / 1 s, a few queries per run |
 
 ```mermaid
-flowchart LR
+flowchart TB
     U["universe ~250 stocks"] --> OFF["NSE archive: ONE file per day<br/>official bars for every stock"]
     OFF --> DB[("SQLite")]
     OFF -. "names missing from the file" .-> REPAIR["Yahoo chart request,<br/>only for those names"]
@@ -643,9 +598,9 @@ A server in any time zone produces the same results. The rules, enforced by test
   identical results equal to values worked out by hand.
 
 ```mermaid
-flowchart LR
+flowchart TB
     OS["server clock and zone<br/>any TZ, DST, NTP steps"] --> PIN["pin_process_timezone()<br/>process zone forced to UTC"]
-    PIN --> CLK["app.clock<br/>timezone-aware instants + monotonic time"]
+    PIN --> CLK["app.clock<br/>aware instants + monotonic time"]
     CLK -->|"stored"| DB[("SQLite<br/>UTC ISO-8601 with Z")]
     CLK -->|"market logic"| IST["ist_date, at_ist<br/>Asia/Kolkata (+05:30 fallback)"]
     IST --> USE["calendar, schedule windows,<br/>scan cutoffs, deadlines"]
@@ -714,22 +669,22 @@ Every process (daemon, each job child, CLI commands, the dashboard) logs through
   log tails) to attach to a bug report.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph PROCS["Every process"]
         D["daemon"]
-        J["job children: run-job NAME"]
+        J["job children"]
         C["CLI commands"]
         W["dashboard"]
     end
-    PROCS --> LG["logging_setup<br/>redaction, job context,<br/>display-zone stamps"]
+    PROCS --> LG["logging_setup: redaction, job context,<br/>display-zone stamps"]
     LG --> F1["logs/ROLE-YYYY-MM-DD.log<br/>25 MB x 4 files per day"]
     LG --> F2["logs/errors-YYYY-MM-DD.log<br/>WARNING and above, all roles"]
-    LG --> JD["stderr -> journald"]
+    LG --> JD["stderr to journald"]
     CR["crash hooks: excepthook, threads,<br/>unraisable, faulthandler"] --> F1
     CR --> FL["logs/fault-ROLE.log"]
-    F1 --> LV["monster-ai logs<br/>level, job, text, time, follow"]
+    F1 --> LV["monster-ai logs:<br/>level, job, text, time, follow"]
     F2 --> LV
-    F1 --> DG["monster-ai diag<br/>redacted tar.gz bundle"]
+    F1 --> DG["monster-ai diag:<br/>redacted bundle"]
     F2 --> DG
     HKJ["housekeeping: prune_logs<br/>30 days and 150 MB"] -.-> F1
 ```
@@ -771,27 +726,19 @@ Off-box backups use the same S3-compatible store and are pruned to the local ret
 
 ```mermaid
 flowchart TB
-    PC["your PC<br/>deploy_remote.ps1 or deploy_remote.sh"] -->|"ssh + tar, env file shredded afterwards"| INST
+    PC["your PC<br/>deploy_remote.ps1 or .sh"] -->|"ssh + tar, env file shredded afterwards"| INST
     subgraph SRV["Ubuntu 22.04/24.04 or Debian 12 server"]
-        INST["install.sh - idempotent, 14 steps<br/>atomic release swap, automatic rollback"]
+        INST["install.sh<br/>idempotent, 14 steps, atomic swap, rollback"]
         subgraph SD["systemd units"]
-            U1["monster-ai.service<br/>scheduler daemon, Type=notify, WatchdogSec=180,<br/>Restart=always, MemoryHigh 750M"]
-            U2["monster-ai-bootstrap.service<br/>first-run setup, resumable"]
-            U3["monster-ai-health.timer and .service<br/>every 5 minutes, independent of the daemon"]
-            U4["monster-ai-alert@.service<br/>OnFailure alert"]
-            U5["monster-ai-dashboard.service<br/>optional, loopback only"]
+            direction TB
+            U1["monster-ai.service<br/>daemon, Type=notify, WatchdogSec=180"] ~~~ U2["monster-ai-bootstrap.service<br/>first-run setup, resumable"] ~~~ U3["monster-ai-health.timer<br/>every 5 minutes"] ~~~ U4["monster-ai-alert@.service<br/>OnFailure alert"] ~~~ U5["monster-ai-dashboard.service<br/>optional, loopback"]
         end
         subgraph FS["Filesystem"]
-            OPT["/opt/monster-ai (+ .prev for rollback)"]
-            ETC["/etc/monster-ai/monster.env<br/>root:monster 0640"]
-            VAR["/var/lib/monster-ai<br/>database, backups, models, cache"]
-            LOGD["/var/log/monster-ai<br/>daily logs"]
+            direction TB
+            OPT["/opt/monster-ai<br/>(+ .prev for rollback)"] ~~~ ETC["/etc/monster-ai/monster.env<br/>root:monster 0640"] ~~~ VAR["/var/lib/monster-ai<br/>database, backups, models, cache"] ~~~ LOGD["/var/log/monster-ai<br/>daily logs"]
         end
         INST --> SD
-        INST --> OPT
-        U1 --> VAR
-        U1 --> LOGD
-        U1 -.->|"reads"| ETC
+        SD --> FS
         U1 -->|"spawns"| JOBS["job processes<br/>python -m app.cli run-job NAME"]
     end
     JOBS -->|"HTTPS only"| NET["Yahoo, NSE, RSS, GDELT, Telegram,<br/>optional S3 and LLM"]
