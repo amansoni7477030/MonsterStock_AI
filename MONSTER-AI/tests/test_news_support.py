@@ -118,6 +118,22 @@ def ok(content: Any) -> FakeResponse:
     return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
 
 
+def web_pages(*pages: tuple[str, str, str]) -> list[dict[str, Any]]:
+    """The ``executed_tools`` of a Groq browser_search reply, in the shape captured from a live call: one record per tool step,
+    each holding ``search_results.results[]`` of (url, title, text) pages."""
+    results = [{"title": title, "url": url, "content": text, "score": 1} for url, title, text in pages]
+    return [{"name": "browser.search", "type": "browser_search", "arguments": "{}", "output": "", "index": 0,
+             "search_results": {"results": results}}]
+
+
+def web_ok(content: Any, pages: tuple[tuple[str, str, str], ...] = ()) -> FakeResponse:
+    """A chat reply with ``content`` plus the tool records of the pages the search returned."""
+    message: dict[str, Any] = {"content": content}
+    if pages:
+        message["executed_tools"] = web_pages(*pages)
+    return FakeResponse(200, {"choices": [{"message": message}]})
+
+
 def jev_answers(event="order_win", p=0.82, conf=0.78, rumour=0.05, denial=0.02, level=3.2, sev_conf=0.7,
                 polarity=(0.7, 0.1, 0.2), pol_conf=0.6, company=True):
     """The ``answers`` of a valid Jev response to the questions the judge asks (``polarity`` = P(good), P(bad), P(flat))."""
