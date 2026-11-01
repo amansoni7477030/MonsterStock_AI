@@ -56,6 +56,8 @@ from news_intelligence.remote import (
     Quota,
     RemoteJudge,
     clamp,
+    describe_status,
+    error_reason,
     prune_prefix,
     retry_after_seconds,
 )
@@ -350,28 +352,29 @@ class JevJudge(RemoteJudge):
             if self.out_of_time:
                 raise OutOfTime()
             try:
-                status, payload, _text, headers = self.send(
+                status, payload, text, headers = self.send(
                     "POST", self._url(), self.settings.typesafe_api_key,
                     self.budgeted_timeout(float(self.settings.jev_timeout_sec)), body,
                 )
             except (requests.RequestException, OSError) as exc:
                 last = f"transport error {type(exc).__name__}"
-                status, payload, headers = -1, None, {}
+                status, payload, text, headers = -1, None, "", {}
             if status == 200:
                 usage = payload.get("usage") if isinstance(payload, dict) else None
                 if isinstance(usage, dict):
                     self._count_tokens(usage.get("input_tokens"), usage.get("output_tokens"))
                 return payload
+            reason = error_reason(payload, text) if status != -1 else ""
             if status in FATAL_STATUS:
-                raise Fatal(f"http {status}")
+                raise Fatal(describe_status(status, reason))
             if status in (429, 529):
                 wait = retry_after_seconds(headers)
                 if wait is not None and wait > RETRY_AFTER_CAP_SEC:
                     raise Quota(wait)
             if status != -1 and status not in RETRYABLE_STATUS:
-                raise RuntimeError(f"http {status}")
+                raise RuntimeError(describe_status(status, reason))
             if status != -1:
-                last = f"http {status}"
+                last = describe_status(status, reason)
             attempt += 1
             if attempt < self.max_attempts:
                 delay = min(self.backoff_cap, self.backoff_base * 2 ** (attempt - 1))
