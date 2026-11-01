@@ -203,11 +203,11 @@ def test_prelim_scan_repairs_an_incomplete_previous_session_before_scanning(sett
 @pytest.mark.parametrize(("missing", "repaired"), [(2, False), (3, True)])
 def test_prelim_scan_repairs_only_below_the_coverage_threshold(settings, store, fake_clock, panel, monkeypatch, missing, repaired):
     populate_store(store, panel, skip_last_for=missing)  # 22 of 24 = 92 % is complete enough; 21 of 24 = 88 % is not
-    calls = []
-    monkeypatch.setattr(jobs, "ensure_session_bars", lambda ctx, session, **kw: calls.append(session) or {})
-    stub_scan(monkeypatch, [])
+    order = []
+    monkeypatch.setattr(jobs, "ensure_session_bars", lambda ctx, session, **kw: order.append("repair") or {})
+    stub_scan(monkeypatch, order)
     jobs.prelim_scan(make_job_context(settings, store, fake_clock))
-    assert bool(calls) is repaired
+    assert order == (["repair", "scan:pre"] if repaired else ["scan:pre"])
 
 
 def test_a_failed_repair_never_stops_the_preliminary_scan(settings, store, fake_clock, panel, monkeypatch):

@@ -36,13 +36,14 @@ def test_migrations_apply_once_and_are_idempotent(tmp_path):
 def test_the_macro_tables_migration_drops_only_the_two_unused_tables_and_their_registry_rows(tmp_path):
     versions = {m.version: m.name for m in discover()}
     assert versions[5] == "drop_unused_macro_tables"
-    older = tmp_path / "older"
-    older.mkdir()
-    for version, name in versions.items():
-        if version < 5:
-            shutil.copy(MIGRATIONS_DIR / f"{version:04d}_{name}.sql", older)
+    before_5, through_5 = tmp_path / "before_5", tmp_path / "through_5"  # later migrations must not change this test
+    for folder, last in ((before_5, 4), (through_5, 5)):
+        folder.mkdir()
+        for version, name in versions.items():
+            if version <= last:
+                shutil.copy(MIGRATIONS_DIR / f"{version:04d}_{name}.sql", folder)
     conn = connect(tmp_path / "m.db")
-    assert apply_migrations(conn, older) == [1, 2, 3, 4]
+    assert apply_migrations(conn, before_5) == [1, 2, 3, 4]
 
     def names(kind):
         return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = ? AND name NOT LIKE 'sqlite_%'", (kind,))}
@@ -60,13 +61,13 @@ def test_the_macro_tables_migration_drops_only_the_two_unused_tables_and_their_r
         conn.execute("INSERT INTO source_health (source_id, consecutive_failures) VALUES (?, 9)", (source_id,))
     conn.execute("INSERT INTO kv (key, value, updated_at) VALUES ('keep', 'me', '2026-11-01T00:00:00Z')")
 
-    assert apply_migrations(conn, MIGRATIONS_DIR) == [5] and current_version(conn) == 5
+    assert apply_migrations(conn, through_5) == [5] and current_version(conn) == 5
     assert tables_before - names("table") == {"macro_observations", "econ_calendar"} and not names("table") - tables_before
     assert indexes_before - names("index") == {"idx_econ_calendar_time"} and not names("index") - indexes_before
     assert [r[0] for r in conn.execute("SELECT source_id FROM sources")] == ["yahoo_daily"]
     assert [r[0] for r in conn.execute("SELECT source_id FROM source_health")] == ["yahoo_daily"]
     assert conn.execute("SELECT value FROM kv WHERE key = 'keep'").fetchone()[0] == "me"
-    assert apply_migrations(conn, MIGRATIONS_DIR) == []  # applied once
+    assert apply_migrations(conn, through_5) == []  # applied once
     assert check_integrity(conn)
 
 
