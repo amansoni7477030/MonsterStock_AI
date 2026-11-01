@@ -236,9 +236,10 @@ VARS: tuple[Var, ...] = (
     Var("llm_web_search", "LLM_WEB_SEARCH", "true", _bool,
         "Let the Groq gpt-oss model check a news item on the web (Groq's built-in browser_search tool) before it is judged: do "
         "independent outlets report the same facts, did anyone deny it, is it old news. Only for company news that matters and "
-        "is not first-hand (never exchange filings), only on Groq with a gpt-oss model, never part of a backtest. It bills extra "
-        "tokens and a search fee, and needs a plan with a large per-minute token limit (the free tier's 8K TPM is too small): when "
-        "it fails the item is judged without it. false = off.", "LLM"),
+        "is not first-hand (never exchange filings), only on Groq with a gpt-oss model, never part of a backtest. A search reads "
+        "pages worth about 4,000-12,000 input tokens and Groq bills the tool on top (measured on a free-tier key, where it works: "
+        "only the request itself counts against the per-minute limit); when it fails the item is judged without it. "
+        "false = off.", "LLM"),
     Var("llm_web_max_per_run", "LLM_WEB_MAX_PER_RUN", "8", _int,
         "Cost cap: web checks per news job (a job drains a backlog in up to four batches that share it). 0 = off.", "LLM"),
     # -- jev -----------------------------------------------------------------------------------------------

@@ -93,6 +93,11 @@ def defang(text: str) -> str:
     return _CLOSING_TAG.sub(r"< /\1>", text)
 
 
+def strip_links(text: str, replacement: str = "") -> str:
+    """``text`` with every web link replaced (by nothing, or by ``replacement``)."""
+    return _LINK.sub(replacement, text)
+
+
 def one_line(value: Any, limit: int = MAX_FIELD_CHARS) -> str:
     """``value`` as single-line text without control characters or prompt tags, at most ``limit`` characters long."""
     text = defang(_CONTROL.sub(" ", "" if value is None else str(value)))
@@ -161,7 +166,7 @@ class WebBrief:
         confirmed = str(raw.get("confirmed") or "").strip().lower()
         facts: list[str] = []
         for item in raw.get("facts") if isinstance(raw.get("facts"), list) else ():
-            text = one_line(_LINK.sub("", item), MAX_FACT_CHARS) if isinstance(item, str) else ""
+            text = one_line(strip_links(item), MAX_FACT_CHARS) if isinstance(item, str) else ""
             if text and injection_reason(text) is None and len(facts) < MAX_FACTS:  # a page that instructs the reader is not a fact
                 facts.append(text)
         sources: list[str] = []

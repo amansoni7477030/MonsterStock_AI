@@ -114,7 +114,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         coverage="Structured event extraction from news text: event type, entities with their direction, severity, horizon, event time and a verbatim evidence quote",
         timestamp_meaning="n/a", update_frequency="On demand (cost-capped: per-run call and time budgets, 14-day result cache)",
         history_depth="n/a",
-        rate_limits="Groq free tier: ~30 requests and ~8k tokens per minute per model (tokens bind first); a long Retry-After starts a cooldown that survives between runs",
+        rate_limits="Groq free tier (measured live): 8,000 tokens per minute and 1,000 requests per day per model, about 2,000 tokens per extraction, so roughly 4 extractions per minute per model; a rate-limited model hands over to the fallback model at once, a short Retry-After is waited out, a long one starts a cooldown that survives between runs",
         license_notes="Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.",
         failure_behavior="Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health",
         backup_source="rules", criticality="optional",
@@ -126,7 +126,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         timestamp_meaning="n/a",
         update_frequency="On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job, 30% of the LLM time box, 1-day result cache)",
         history_depth="Live web only: never used for backtests or replays",
-        rate_limits="Needs a plan whose per-minute token limit exceeds one web search (the free tier's 8k does not): HTTP 413 or a rejected tool backs the check off for 6 h",
+        rate_limits="Works on Groq's free tier (verified live: the search's page reads, 4,000-12,000 input tokens, do not count against the 8,000 tokens per minute; only the request does); HTTP 413 or a rejected tool backs the check off for 6 h",
         license_notes="Governed by Groq's terms (built-in tools are not HIPAA covered and are not available on regional endpoints); only public news text is sent - never keys, positions or other data.",
         failure_behavior="The item is extracted and judged without the web check; repeated failures appear in source health",
         backup_source="llm_extraction", criticality="optional",
@@ -205,7 +205,8 @@ def _fetch_strategy() -> dict[str, str]:
             "gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is "
             "nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, "
             "circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is "
-            "validated field by field before it reaches the extraction or Jev."),
+            "validated field by field, and the sources it cites are checked against the pages the search tool really returned "
+            "(`executed_tools`), before it reaches the extraction or Jev."),
         "jev_judgment": (
             f"not scraped: `POST {JEV_BASE_URL}{JEV_PATH}` with the pinned model `JEV_MODEL` (Bearer key `TYPESAFE_API_KEY`). The "
             "article is the typed `state` and the atomic questions (event type, rumour, denial, severity, direction) are answered "

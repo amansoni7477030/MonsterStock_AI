@@ -152,7 +152,7 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Timestamp meaning:** n/a
 - **Update frequency:** On demand (cost-capped: per-run call and time budgets, 14-day result cache)
 - **History depth:** n/a
-- **Rate limits:** Groq free tier: ~30 requests and ~8k tokens per minute per model (tokens bind first); a long Retry-After starts a cooldown that survives between runs
+- **Rate limits:** Groq free tier (measured live): 8,000 tokens per minute and 1,000 requests per day per model, about 2,000 tokens per extraction, so roughly 4 extractions per minute per model; a rate-limited model hands over to the fallback model at once, a short Retry-After is waited out, a long one starts a cooldown that survives between runs
 - **Transport and request strategy:** not scraped: the provider's own API through a `requests` session. `GROQ_API_KEY` selects Groq (`openai/gpt-oss-120b`, then `openai/gpt-oss-20b` when the first is rate-limited or retired; strict JSON-schema output with a per-model capability ladder); `LLM_API_BASE` + `LLM_MODEL` select any other OpenAI-compatible provider. Per-run call and time budgets, a 14-day result cache keyed by the article text, bounded retries that honour `Retry-After` (up to 30 s; a longer wait is a quota and starts a cooldown of at most 6 h that survives between runs).
 - **Licensing:** Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.
 - **Failure behaviour:** Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health
@@ -165,8 +165,8 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Timestamp meaning:** n/a
 - **Update frequency:** On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job, 30% of the LLM time box, 1-day result cache)
 - **History depth:** Live web only: never used for backtests or replays
-- **Rate limits:** Needs a plan whose per-minute token limit exceeds one web search (the free tier's 8k does not): HTTP 413 or a rejected tool backs the check off for 6 h
-- **Transport and request strategy:** not scraped: the same Groq chat endpoint, with `tools=[{"type": "browser_search"}]` and `tool_choice=required` on a gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is validated field by field before it reaches the extraction or Jev.
+- **Rate limits:** Works on Groq's free tier (verified live: the search's page reads, 4,000-12,000 input tokens, do not count against the 8,000 tokens per minute; only the request does); HTTP 413 or a rejected tool backs the check off for 6 h
+- **Transport and request strategy:** not scraped: the same Groq chat endpoint, with `tools=[{"type": "browser_search"}]` and `tool_choice=required` on a gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is validated field by field, and the sources it cites are checked against the pages the search tool really returned (`executed_tools`), before it reaches the extraction or Jev.
 - **Licensing:** Governed by Groq's terms (built-in tools are not HIPAA covered and are not available on regional endpoints); only public news text is sent - never keys, positions or other data.
 - **Failure behaviour:** The item is extracted and judged without the web check; repeated failures appear in source health
 - **Backup source:** llm_extraction

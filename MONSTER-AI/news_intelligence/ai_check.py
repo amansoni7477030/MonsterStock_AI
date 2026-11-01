@@ -11,6 +11,7 @@ Nothing is cached, counted or written: the services run without a store.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,6 +28,7 @@ from news_intelligence.remote import RemoteJudge
 from news_intelligence.web import WebResearcher
 
 SERVICES = ("llm", "web", "jev")
+_PINNED_JEV = re.compile(r"jev-\d+(?:\.\d+)+")  # a versioned model id, as opposed to an alias such as jev-latest
 SAMPLE_TITLE = "Reliance Industries bags Rs 5,000 crore order from NTPC for solar modules"
 SAMPLE_TEXT = (
     "Reliance Industries has received a Rs 5,000 crore order from NTPC for supply of solar modules over three years, the "
@@ -70,11 +72,14 @@ class AiCheck:
 def _explain(reason: str | None, key_name: str) -> str:
     """The recorded failure reason with the usual remedy attached."""
     reason = reason or "no answer"
-    if "http 401" in reason or "http 403" in reason:
+    lowered = reason.lower()
+    if "http 401" in lowered or "http 403" in lowered:
         return f"{reason}: the key was rejected, check {key_name}"
-    if "http 404" in reason:
+    if any(word in lowered for word in ("unknown model", "model_not_found", "does not exist", "decommission")):
+        return f"{reason}: this key cannot use that model, check LLM_MODEL / LLM_FALLBACK_MODEL / JEV_MODEL"
+    if "http 404" in lowered:
         return f"{reason}: model or endpoint not found, check the model name"
-    if "rate limit" in reason:
+    if "rate limit" in lowered:
         return f"{reason}: the provider's quota is used up, try again later"
     return reason
 
@@ -167,12 +172,16 @@ def check_jev(
         return AiCheck("jev", "Jev", "off", "not configured (set TYPESAFE_API_KEY)")
     label = "Jev (TypeSafe AI)"
     judge = JevJudge(settings, session=session, clock=clock, resolver=resolver)
-    wanted = [str(settings.jev_model)]
+    # The model list shows only the aliases (jev-latest, jev-preview): a pinned version such as jev-1.14.0 is valid but never
+    # listed, so it is proven by the real request below and not by the list.
+    pinned = _PINNED_JEV.fullmatch(str(settings.jev_model)) is not None
+    wanted = [] if pinned else [str(settings.jev_model)]
     failed, remarks = _prelude("jev", label, judge, JEV_BASE_URL + "/v1/models", settings.typesafe_api_key, "TYPESAFE_API_KEY", wanted)
     if failed is not None:
         return failed
     if not deep:
-        return _verdict("jev", label, remarks, "key accepted", None)
+        note = f"key accepted (pinned {settings.jev_model} is not in the alias list; a full ai-test proves it)" if pinned else "key accepted"
+        return _verdict("jev", label, remarks, note, None)
     started = judge.clock.monotonic()
     judgment = judge.judge(SAMPLE_TITLE, SAMPLE_TEXT, company="Reliance Industries Limited", source_kind="media",
                            context=sample_context(judge.clock.now()))
