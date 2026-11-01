@@ -130,7 +130,17 @@ re-scan adds a new snapshot without ever editing an old one.
 - Probabilities come from calibrated models. The heuristic baseline is always labelled "(heuristic, NOT calibrated)".
 - Conviction tiers (STRONG >= 55 %, MODERATE >= 40 %, WATCH >= 25 % calibrated P, each with an uncertainty ceiling) are capped
   at **WATCH unless the model is `validated`**.
-- When nothing qualifies the report says **"no setup"** and why; it never pads the list.
+- The uncertainty ceilings are **relative, not absolute**. Uncertainty (0 reliable .. 1 unreliable; not a probability) rises with
+  the probability itself, because the names most likely to have a large range are the volatile ones with the widest
+  intervals and the most specialist disagreement; a fixed ceiling therefore made STRONG unreachable on real data, and one
+  pooled ceiling would abstain on every hot day. At training time the model records how uncertain its own held-out daily
+  top-15 names were at each calibrated-probability level (`unc_scales.pick_curve`: median and 85th percentile). A live pick is
+  judged against names of **similar probability**: STRONG needs uncertainty at or below their median, MODERATE at or below
+  their 85th percentile. A pick (or a whole day) that is unusually unreliable for its level therefore still abstains. Models
+  without a curve (older artifacts, the heuristic baseline) use `MAX_UNCERTAINTY_STRONG` / `MAX_UNCERTAINTY_MODERATE`. The
+  ranking itself is unaffected: it stays by probability.
+- When nothing qualifies the report says **"no setup"** and why; it never pads the list. The reason names the actual cause
+  (low probability, uncertainty above the model's usual range for its picks, conflicting evidence) with counts.
 - A report that would be delivered after the 09:14:30 deadline is withheld (the alert is queued and sent later).
 - Ranking uses the calibrated range probability only. The report states that a wide range does not imply a profitable
   trade or a directional close; the direction head is a diagnostic and is near chance in out-of-sample tests.

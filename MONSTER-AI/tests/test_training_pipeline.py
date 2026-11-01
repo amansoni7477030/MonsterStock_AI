@@ -10,7 +10,7 @@ import pytest
 from automation import jobs
 from automation.scan import run_scan
 from models import training
-from models.inference import ModelBundle
+from models.inference import ModelBundle, pick_uncertainty_ceilings
 from models.registry import ModelRegistry
 from tests.seed_data import SMALL_TRAIN as SMALL
 from tests.seed_data import make_job_context, panel_ending, populate_store
@@ -81,6 +81,23 @@ def test_scan_with_a_trained_model_labels_status_and_never_exceeds_watch_unless_
         assert 0.0 <= c["p"]["hit_3"] <= 1.0 and c["range"]["q10"] <= c["range"]["q50"] <= c["range"]["q90"]
         assert c["drivers"], "model explanations should be attached"
     assert any(not p["is_baseline"] for p in env.store.predictions_for("2026-11-02", stage="pre", baselines=None))
+
+
+def test_trained_model_learns_what_uncertainty_is_normal_at_each_probability_level(env, trained_pre):
+    bundle = ModelRegistry(env.store, env.settings).active_bundle("pre")
+    curve = bundle.meta["unc_scales"]["pick_curve"]
+    assert curve["n"] >= 30 and len(curve["p"]) >= 2
+    levels = [curve["p"][0], curve["p"][-1]]
+    strong, moderate = pick_uncertainty_ceilings(bundle.meta, levels)
+    assert strong.tolist() == [curve["p50"][0], curve["p50"][-1]] and moderate.tolist() == [curve["p85"][0], curve["p85"][-1]]
+    assert all(0.0 < s <= m <= 1.0 for s, m in zip(strong, moderate, strict=True))
+
+
+def test_the_report_tells_the_reader_what_the_tiers_compare_uncertainty_with(env, trained_pre):
+    env.clock.set(PRELIM)
+    assert run_scan(make_job_context(env.settings, env.store, env.clock), "pre").status == "success"
+    report = env.store.latest_snapshot("2026-11-02", "pre")["payload"]["report"]
+    assert report["uncertainty_note"].startswith("tiers compare each pick's uncertainty with the model's held-out names")
 
 
 def test_final_scan_uses_the_gap_model_for_names_with_a_preopen_price(env, trained_final):

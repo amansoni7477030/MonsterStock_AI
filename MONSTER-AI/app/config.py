@@ -141,8 +141,11 @@ VARS: tuple[Var, ...] = (
     Var("tier_strong_p", "TIER_STRONG_P", "0.55", _float, "Calibrated P(range >= primary) for STRONG.", "Targets"),
     Var("tier_moderate_p", "TIER_MODERATE_P", "0.40", _float, "Calibrated P for MODERATE.", "Targets"),
     Var("tier_watch_p", "TIER_WATCH_P", "0.25", _float, "Calibrated P for WATCH; below this a name is not listed.", "Targets"),
-    Var("max_uncertainty_strong", "MAX_UNCERTAINTY_STRONG", "0.35", _float, "Uncertainty ceiling for STRONG.", "Targets"),
-    Var("max_uncertainty_moderate", "MAX_UNCERTAINTY_MODERATE", "0.55", _float, "Uncertainty ceiling for MODERATE.", "Targets"),
+    Var("max_uncertainty_strong", "MAX_UNCERTAINTY_STRONG", "0.35", _float,
+        "Fallback uncertainty ceiling for STRONG, used only for a model with no learned reference "
+        "(trained models use the median uncertainty of held-out names of similar probability).", "Targets"),
+    Var("max_uncertainty_moderate", "MAX_UNCERTAINTY_MODERATE", "0.55", _float,
+        "Fallback uncertainty ceiling for MODERATE (trained models use the 85th percentile of those names).", "Targets"),
     Var("max_cost_to_range_ratio", "MAX_COST_TO_RANGE_RATIO", "0.25", _float,
         "Reject candidates whose round-trip cost exceeds this share of the median expected range.", "Targets"),
     # -- schedule (IST) ----------------------------------------------------------------------------------

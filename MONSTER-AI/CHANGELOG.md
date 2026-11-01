@@ -31,7 +31,9 @@ server with native systemd (no containers).
   artifact format without pickle, champion/challenger registry with integrity checks, rollback and automatic fallback to
   a labelled heuristic baseline.
 - **Ranking** (`ranking/`): eligibility, conviction tiers capped at WATCH unless the model is validated, contradiction and
-  cost checks, explicit "no setup" when nothing qualifies, baseline pickers for comparison.
+  cost checks, explicit "no setup" when nothing qualifies, baseline pickers for comparison. The uncertainty ceilings of the
+  tiers are learned per model, as a function of probability, from the uncertainty of its own held-out top names (an
+  absolute ceiling made STRONG unreachable on real data), and the "no setup" reason names the real cause with counts.
 - **News and event graph** (`news_intelligence/`, `event_graph/`): deduplication, entity linking, rule-based event
   extraction with an optional LLM (every claim needs a verifiable quote), source quality, "already priced in" detection
   (market reactions are refreshed after each news run and again at the final scan), supply-chain and sector impact

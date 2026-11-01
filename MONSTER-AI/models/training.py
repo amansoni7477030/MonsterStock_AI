@@ -39,6 +39,12 @@ from models.specialists import META_CONTEXT, specialists_for
 
 log = logging.getLogger(__name__)
 
+# The uncertainty reference describes the held-out daily top CURVE_POOL_FACTOR x top_n names (those that can be near the top),
+# at CURVE_BINS probability levels of at least CURVE_MIN_ROWS rows each.
+CURVE_POOL_FACTOR = 3
+CURVE_BINS = 8
+CURVE_MIN_ROWS = 30
+
 
 class TrainingError(RuntimeError):
     """Training cannot proceed (insufficient history, degenerate labels, interrupted)."""
@@ -383,13 +389,13 @@ def train_stage(
     std = spec_std
     spread = (q90 - q10) / np.clip(meta_oof["q:range_q50"], 1e-6, None)
     dist = Xv[:, names.index("x_sim_dist_mean")] if "x_sim_dist_mean" in names else np.array([np.nan])
-    unc_scales = {
+    unc_scales: dict[str, Any] = {
         "spec_std_p95": _p(std[valid_meta], 95, 0.1), "spread_p95": _p(spread[valid_meta], 95, 2.0),
         "dist_median": _p(dist, 50, 0.0), "dist_p95": _p(dist, 95, 1.0), "drift_p95": 0.15,
     }
     unc_scales.update(_pick_uncertainty_reference(
-        score=meta_oof[f"cls:{primary}"], day=mday, hold=hold, std=std, spread=spread, dist_all=dist, meta_rows=meta_rows,
-        Xv=Xv, names=names, stats=stats, scales=unc_scales, top_n=cfg.top_n))
+        score=meta_oof[f"cls:{primary}"], to_p=cal_deploy[primary].transform, day=mday, hold=hold, std=std, spread=spread,
+        dist_all=dist, meta_rows=meta_rows, Xv=Xv, names=names, stats=stats, scales=unc_scales, top_n=cfg.top_n))
 
     created = iso(now) if now else iso(datetime.now().astimezone())
     version = f"m-{(now or datetime.now().astimezone()).strftime('%Y%m%d-%H%M%S')}-{cfg.stage}"
@@ -434,17 +440,38 @@ def daily_top_rows(score: np.ndarray, day: np.ndarray, mask: np.ndarray, n: int)
     return order[position < n]
 
 
-def _pick_uncertainty_reference(
-    *, score: np.ndarray, day: np.ndarray, hold: np.ndarray, std: np.ndarray, spread: np.ndarray, dist_all: np.ndarray,
-    meta_rows: np.ndarray, Xv: np.ndarray, names: list[str], stats: dict[str, Any], scales: dict[str, float], top_n: int,
-) -> dict[str, float]:
-    """What uncertainty is NORMAL for this model's own picks: the median and 85th percentile of the uncertainty of its daily
-    top-``top_n`` out-of-sample picks in the holdout.
+def uncertainty_curve(p: np.ndarray, unc: np.ndarray, *, bins: int = CURVE_BINS, min_rows: int = CURVE_MIN_ROWS) -> dict[str, Any] | None:
+    """Median and 85th percentile of ``unc`` at a few probability levels: equal-count bins of ``p``, each described by its
+    median probability. Bins whose medians coincide (a calibrated probability is a step function) are merged. ``None`` when
+    there are too few rows for even one stable bin."""
+    ok = np.isfinite(p) & np.isfinite(unc)
+    p, unc = p[ok], unc[ok]
+    count = min(bins, len(p) // min_rows)
+    if count < 1:
+        return None
+    levels: dict[float, list[tuple[float, float]]] = {}
+    for part in np.array_split(np.argsort(p, kind="stable"), count):
+        levels.setdefault(float(np.median(p[part])), []).append((float(np.percentile(unc[part], 50)), float(np.percentile(unc[part], 85))))
+    centers = sorted(levels)
+    return {
+        "p": centers, "p50": [float(np.mean([q[0] for q in levels[c]])) for c in centers],
+        "p85": [float(np.mean([q[1] for q in levels[c]])) for c in centers], "n": int(len(p)),
+    }
 
-    Uncertainty is level-dependent (the highest-probability names are volatile ones, with wide forecast intervals and more
-    specialist disagreement), so a fixed ceiling cannot work: it made the STRONG tier unreachable on real data. A live pick is
-    judged against its comparable cases instead, which still flags an abnormal day (everything above the usual range)."""
-    rows = daily_top_rows(score, day, hold, top_n)
+
+def _pick_uncertainty_reference(
+    *, score: np.ndarray, to_p: Callable[[np.ndarray], np.ndarray], day: np.ndarray, hold: np.ndarray, std: np.ndarray,
+    spread: np.ndarray, dist_all: np.ndarray, meta_rows: np.ndarray, Xv: np.ndarray, names: list[str], stats: dict[str, Any],
+    scales: dict[str, float], top_n: int,
+) -> dict[str, Any]:
+    """What uncertainty is NORMAL at each probability level for this model's own picks: the uncertainty (median and 85th
+    percentile) of its daily top ``CURVE_POOL_FACTOR x top_n`` held-out names, as a function of their calibrated probability.
+
+    Uncertainty is level-dependent: the names most likely to move a lot are volatile, with wide forecast intervals and more
+    specialist disagreement, so a fixed ceiling made the STRONG tier unreachable on real data, and one pooled ceiling would
+    abstain on every hot day. A live pick is judged against held-out names of similar probability instead, which still flags
+    a name (or a day) that is abnormal for its level."""
+    rows = daily_top_rows(score, day, hold, top_n * CURVE_POOL_FACTOR)
     if not len(rows):
         return {}
     band = [n for n in stats.get("features", {}) if n in names]
@@ -457,7 +484,8 @@ def _pick_uncertainty_reference(
         drift = np.zeros(len(rows))
     dist = dist_all[meta_rows[rows]] if len(dist_all) == len(Xv) else np.full(len(rows), np.nan)
     unc = combine_uncertainty(std[rows], spread[rows], dist, drift, scales)
-    return {"pick_p50": float(np.percentile(unc, 50)), "pick_p85": float(np.percentile(unc, 85)), "pick_n": int(len(rows))}
+    curve = uncertainty_curve(to_p(score[rows]), unc)
+    return {"pick_curve": curve} if curve else {}
 
 
 BASELINE_SCORERS = {"atr": "t_atr14_pct", "range20": "t_range_mean20", "volume": "t_rvol1", "recent_range": "t_range_prev",

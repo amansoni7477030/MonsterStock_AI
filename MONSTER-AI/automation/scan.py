@@ -10,6 +10,7 @@ frozen report instead of recomputing, so what is evaluated later is precisely wh
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
@@ -29,7 +30,7 @@ from features.live import LiveFeatures, build_live_features
 from features.schema import FEATURE_VERSION
 from ingestion.freshness import DataQuality, assess_data_quality, ist_label
 from ingestion.pipeline import collect_gift, collect_preopen
-from models.inference import Bundle, ModelBundle, check_columns
+from models.inference import Bundle, ModelBundle, check_columns, pick_uncertainty_ceilings
 from ranking.ranker import RankInput, RankResult, p_and_range, rank
 from ranking.types import ReportContext
 
@@ -52,6 +53,7 @@ class Scored:
     status: str
     notes: list[str] = field(default_factory=list)
     n_fallback: int = 0
+    ceilings: dict[str, tuple[float, float]] = field(default_factory=dict)  # symbol -> (STRONG, MODERATE) uncertainty limits
 
 
 # ------------------------------------------------------------------------------------------------ timing
@@ -148,6 +150,7 @@ def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
         parts.append((main, X))
 
     frames, predictions, explainers = [], [], {}
+    ceilings: dict[str, tuple[float, float]] = {}
     versions, statuses = [], []
     for bundle, frame in parts:
         used, preds = _predict(bundle, frame, registry, bundle.stage, notes, ctx.store)
@@ -155,11 +158,21 @@ def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
         predictions.append(preds)
         versions.append(used.version)
         statuses.append(used.status)
+        ceilings.update(_uncertainty_limits(used, preds))
         for position, symbol in enumerate(frame.index):
             explainers[symbol] = _explainer(used, frame, position)
     features = pd.concat(frames).reindex(X.index)
     preds = pd.concat(predictions).reindex(X.index)
-    return Scored(features, preds, explainers, versions[0], _weakest(*statuses), notes, n_fallback)
+    return Scored(features, preds, explainers, versions[0], _weakest(*statuses), notes, n_fallback, ceilings)
+
+
+def _uncertainty_limits(bundle: Bundle, preds: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """symbol -> (STRONG, MODERATE) uncertainty ceilings for the names this model scored; empty when it learned none."""
+    limits = pick_uncertainty_ceilings(bundle.meta, preds["p_primary"].to_numpy(dtype=float))
+    if limits is None:
+        return {}
+    strong, moderate = limits
+    return {symbol: (float(s), float(m)) for symbol, s, m in zip(preds.index, strong, moderate, strict=True) if math.isfinite(s)}
 
 
 def _explainer(bundle: Bundle, frame: pd.DataFrame, position: int) -> Callable[[], list[str]]:
@@ -297,6 +310,7 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
             last_close=_last_closes(store, live.last_bar), catalysts=catalysts, chains=intel.chains(top, cutoff),
             reacted=intel.reacted(top, cutoff), quality_status=quality.status, quality_notes=quality.messages[:3],
             explainer=lambda symbol: scored.explainers[symbol]() if symbol in scored.explainers else [],
+            uncertainty_ceilings=scored.ceilings,
         ),
         s,
     )
@@ -340,5 +354,13 @@ def _build_report(
         no_setup_reason=result.no_setup_reason,
         regime=regime.describe(m.get("m_trend"), m.get("m_volreg"), m.get("m_risk"), m.get("m_expiry_share")),
         freshness=quality.freshness(), missing_feeds=quality.missing_feeds(), notes=notes[:5],
-        universe_size=result.n_universe, n_eligible=result.n_eligible,
+        universe_size=result.n_universe, n_eligible=result.n_eligible, uncertainty_note=_uncertainty_note(scored),
     )
+
+
+def _uncertainty_note(scored: Scored) -> str:
+    """Tells the reader what the conviction tiers compare each pick's uncertainty with (empty: the fixed fallback ceilings)."""
+    if not scored.ceilings:
+        return ""
+    return ("tiers compare each pick's uncertainty with the model's held-out names of similar probability "
+            "(STRONG: at or below their median, MODERATE: at or below their 85th percentile)")

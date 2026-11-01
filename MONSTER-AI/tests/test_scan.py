@@ -58,6 +58,7 @@ def test_prelim_scan_freezes_snapshot_and_reports_baseline(env):
     payload = snap["payload"]
     assert {"report", "table", "features", "baselines", "excluded", "meta"} <= set(payload)
     assert payload["report"]["model_status"] == "baseline"
+    assert payload["report"]["uncertainty_note"] == ""  # the heuristic has no learned reference to explain
     assert len(payload["table"]) > 10 and payload["features"]["columns"]
     model_rows = env.store.predictions_for("2026-11-02", stage="pre", baselines=False)
     base_rows = env.store.predictions_for("2026-11-02", stage="pre", baselines=True)

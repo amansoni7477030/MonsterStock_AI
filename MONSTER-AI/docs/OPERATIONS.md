@@ -249,3 +249,9 @@ with the same key and bucket. Rotating the key: change both sides, then run the 
   order logic in this system.
 - `shadow` and `baseline` outputs are research aids. Only `validated` models may show STRONG/MODERATE tiers, and only a live
   shadow record of weeks to months should be allowed to inform any decision.
+- The footer line `Model uncertainty:` says what the tiers compare each pick's uncertainty with: the model's own held-out names
+  of **similar probability** (STRONG: at or below their median, MODERATE: at or below their 85th percentile), not a universal
+  scale; the `max candidate uncertainty` next to it is on the 0-1 scale where higher means less reliable. When the report says
+  "no setup", the reason lists the causes with counts, for example `model uncertainty above the usual range for names of
+  similar probability (4 of 5)`; that means those picks are unusually unreliable compared with names of the same probability
+  in the model's own history, not that the probabilities are low.

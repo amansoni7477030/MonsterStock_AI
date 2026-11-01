@@ -55,7 +55,7 @@ def combine_uncertainty(
     """0 (reliable) .. 1 (unreliable); NOT a probability. 0.35 x specialist disagreement + 0.25 x forecast-interval width
     + 0.20 x similar-day distance + 0.20 x feature drift, each divided by its out-of-sample 95th percentile (``scales``) and
     clipped to [0, 1]. A missing disagreement or distance counts as the middle (0.5). Shared by inference and training, which
-    uses it to learn what is normal for the model's own top picks."""
+    uses it to learn what is normal at each probability level."""
     a = np.where(np.isfinite(spec_std), np.clip(spec_std / max(scales.get("spec_std_p95", 0.1), 1e-6), 0, 1), 0.5)
     b = np.clip(spread / max(scales.get("spread_p95", 2.0), 1e-6), 0, 1)
     lo, hi = scales.get("dist_median", 0.0), scales.get("dist_p95", 1.0)
@@ -64,15 +64,33 @@ def combine_uncertainty(
     return np.clip(0.35 * a + 0.25 * b + 0.20 * c + 0.20 * d, 0.0, 1.0)
 
 
-def pick_uncertainty_ceilings(meta: dict[str, Any]) -> tuple[float, float] | None:
-    """(STRONG, MODERATE) uncertainty ceilings learned from this model's own out-of-sample daily top picks, or ``None`` for a
-    model without them (older artifacts, the heuristic baseline): the caller then falls back to the configured constants."""
-    scales = meta.get("unc_scales") or {}
-    strong, moderate = scales.get("pick_p50"), scales.get("pick_p85")
-    numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (strong, moderate))
-    if numeric and 0.0 < strong <= moderate <= 1.0:
-        return float(strong), float(moderate)
-    return None
+def _finite_numbers(values: Any) -> np.ndarray | None:
+    """``values`` as a 1-D float array, or ``None`` unless it is a non-empty list of finite real numbers."""
+    if not isinstance(values, list) or not values:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
+        return None
+    return np.asarray(values, dtype=float)
+
+
+def pick_uncertainty_ceilings(meta: dict[str, Any], p: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    """(STRONG, MODERATE) uncertainty ceilings for names whose calibrated probability is ``p`` (NaN where ``p`` is NaN).
+
+    Uncertainty rises with the probability itself (the likeliest large movers are the volatile names), so a name is judged
+    against held-out names of SIMILAR probability: STRONG needs uncertainty at or below their median, MODERATE at or below
+    their 85th percentile. ``meta['unc_scales']['pick_curve']`` stores those two quantiles at a few probability levels and is
+    read by linear interpolation (flat beyond the ends). ``None`` for a model without a valid curve (older artifacts, the
+    heuristic baseline): the caller then falls back to the configured constants."""
+    curve = (meta.get("unc_scales") or {}).get("pick_curve")
+    if not isinstance(curve, dict):
+        return None
+    level, strong, moderate = (_finite_numbers(curve.get(key)) for key in ("p", "p50", "p85"))
+    if level is None or strong is None or moderate is None or not len(level) == len(strong) == len(moderate):
+        return None
+    if np.any(np.diff(level) <= 0) or np.any(strong <= 0) or np.any(strong > moderate) or np.any(moderate > 1.0):
+        return None
+    p = np.asarray(p, dtype=float)
+    return np.interp(p, level, strong), np.interp(p, level, moderate)
 
 
 class ModelBundle:

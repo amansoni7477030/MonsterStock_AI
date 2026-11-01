@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import zlib
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +43,8 @@ class RankInput:
     quality_status: str = "ok"  # ok | degraded
     quality_notes: list[str] = field(default_factory=list)
     explainer: Any = None  # callable(symbol) -> list[str]
+    # symbol -> (STRONG, MODERATE) uncertainty ceilings learned by the model that scored it; absent = configured constants
+    uncertainty_ceilings: Mapping[str, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -90,18 +93,27 @@ def p_and_range(pr: pd.Series) -> tuple[dict[str, float], dict[str, float]]:
     return {k: v for k, v in p.items() if v is not None}, {k: v for k, v in rng.items() if v is not None}
 
 
+def _base_level(p: float, uncertainty: float, cfg: Settings, ceilings: tuple[float, float] | None) -> int:
+    """Tier level (1 WATCH .. 3 STRONG) from probability and uncertainty alone.
+
+    ``ceilings`` = (STRONG, MODERATE) uncertainty limits learned from the scoring model's own out-of-sample top picks;
+    without them (older models, the baseline) the configured constants apply."""
+    strong_cap, moderate_cap = ceilings or (cfg.max_uncertainty_strong, cfg.max_uncertainty_moderate)
+    if p >= cfg.tier_strong_p and uncertainty <= strong_cap:
+        return 3
+    if p >= cfg.tier_moderate_p and uncertainty <= moderate_cap:
+        return 2
+    return 1
+
+
 def decide_tier(
     p: float, uncertainty: float, n_contradictions: int, dq_warning: bool, model_status: str, cfg: Settings,
+    ceilings: tuple[float, float] | None = None,
 ) -> str | None:
     """Conviction tier from calibrated probability, then downgrade rules. ``None`` = below the listing threshold."""
     if not p or p != p or p < cfg.tier_watch_p:
         return None
-    if p >= cfg.tier_strong_p and uncertainty <= cfg.max_uncertainty_strong:
-        level = 3
-    elif p >= cfg.tier_moderate_p and uncertainty <= cfg.max_uncertainty_moderate:
-        level = 2
-    else:
-        level = 1
+    level = _base_level(p, uncertainty, cfg, ceilings)
     if n_contradictions >= 2:
         level -= 1
     if dq_warning:
@@ -109,6 +121,30 @@ def decide_tier(
     if model_status != "validated":
         level = 1  # shadow / baseline: never presented as a strong signal
     return TIER_BY_RANK[max(level, 1)]
+
+
+BLOCKER_TEXT = {
+    "probability": "probability below the {moderate_p:.0%} MODERATE threshold",
+    "uncertainty": "model uncertainty above the usual range for names of similar probability",
+    "contradictions": "conflicting evidence",
+}
+
+
+def why_below_moderate(
+    p: float, uncertainty: float, n_contradictions: int, cfg: Settings, ceilings: tuple[float, float] | None,
+) -> str:
+    """The first reason a listed name of a validated model stayed at WATCH (a key of ``BLOCKER_TEXT``)."""
+    if p < cfg.tier_moderate_p:
+        return "probability"
+    if _base_level(p, uncertainty, cfg, ceilings) < 2:
+        return "uncertainty"
+    return "contradictions"
+
+
+def describe_blockers(blockers: Mapping[str, int], total: int, cfg: Settings) -> str:
+    """'cause (n of total)' for each cause that held names back, most common first."""
+    ordered = sorted(blockers.items(), key=lambda kv: (-kv[1], list(BLOCKER_TEXT).index(kv[0])))
+    return "; ".join(f"{BLOCKER_TEXT[key].format(moderate_p=cfg.tier_moderate_p)} ({n} of {total})" for key, n in ordered)
 
 
 def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> RankResult:
@@ -137,6 +173,7 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
     pool = pool.sort_values(["p_primary", "raw", "rng_q50", "uncertainty"], ascending=[False, False, False, True], kind="mergesort")
 
     candidates: list[Candidate] = []
+    blockers: Counter[str] = Counter()
     for symbol in pool.index:
         if len(candidates) >= top_n:
             break
@@ -147,10 +184,13 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
         contra = contradictions(row, events, _round(pr["uncertainty"], 3), spec_std)
         notes = data_quality_notes(row, bool(inp.instruments.get(symbol, {}).get("is_fno")), inp.stage)
         dq_warning = bool(notes) or inp.quality_status != "ok"
-        tier = decide_tier(float(pr["p_primary"]), float(pr["uncertainty"]), contra.count, dq_warning, inp.model_status, settings)
+        p_symbol, unc_symbol, ceilings = float(pr["p_primary"]), float(pr["uncertainty"]), inp.uncertainty_ceilings.get(symbol)
+        tier = decide_tier(p_symbol, unc_symbol, contra.count, dq_warning, inp.model_status, settings, ceilings)
         table.at[symbol, "tier"] = tier
         if tier is None:
             continue
+        if tier == "WATCH" and inp.model_status == "validated":
+            blockers[why_below_moderate(p_symbol, unc_symbol, contra.count, settings, ceilings)] += 1
         reacted, total = inp.reacted.get(symbol, (0, len(events)))
         priced_text, _score = priced_in(row, reacted, total)
         info = inp.instruments.get(symbol, {})
@@ -190,7 +230,8 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
         elif not candidates:
             reason = f"no eligible name reached the minimum probability {settings.tier_watch_p:.0%} (best {best_p:.0%})"
         else:
-            reason = f"no candidate reached MODERATE conviction (best P = {best_p:.0%}, threshold {settings.tier_moderate_p:.0%})"
+            reason = (f"no candidate reached MODERATE conviction (best P = {best_p:.0%}): "
+                      f"{describe_blockers(blockers, len(candidates), settings)}")
     return RankResult(
         candidates=candidates, no_setup=no_setup, no_setup_reason=reason, n_universe=len(feats), n_eligible=int(elig.sum()),
         excluded=excluded, baselines=baseline_picks(feats, elig, inp.stage, inp.trade_date, top_n), table=table,
