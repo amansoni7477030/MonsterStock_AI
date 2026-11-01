@@ -21,7 +21,8 @@ server with native systemd (no containers).
 - **Data layer** (`ingestion/`, `database/`): Yahoo, NSE archive and NSE API clients with bounded retries, circuit
   breakers and rate limits; validation; freshness / data-quality gate with an explicit blocked / degraded / ok verdict;
   source catalogue ([docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)); SQLite (WAL) with versioned migrations; verified,
-  optionally gpg-encrypted online backups; Muhurat and short-session handling.
+  optionally gpg-encrypted online backups; Muhurat and short-session handling; a pre-open book stamped on an earlier
+  session is ignored instead of being mistaken for today's.
 - **One feature path for training and live scoring** (`features/`): technical, F&O, global, regime, calendar, sector and
   similar-day features, strictly point-in-time (price/volume shifted one session, global series by availability),
   guarded by leakage tests, with a float32 column-streamed builder sized for 1 GB.

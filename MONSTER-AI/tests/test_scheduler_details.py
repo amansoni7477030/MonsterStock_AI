@@ -14,7 +14,12 @@ import pytest
 from app.resources import ResourceStatus
 from automation import scheduler as sched
 from automation.schedule import Due, ScheduleEntry
-from tests.test_scheduler import FakeLauncher, Handle, env, ist  # noqa: F401  (fixtures shared with the main scheduler tests)
+from tests.scheduler_support import FakeLauncher, Handle, ist, make_env
+
+
+@pytest.fixture()
+def env(store, settings, fake_clock):
+    return make_env(store, settings, fake_clock)
 
 
 # --------------------------------------------------------------------------------------- systemd notify

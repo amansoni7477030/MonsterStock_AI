@@ -144,15 +144,17 @@ class FakeIntel:
 
 
 class FakeNseApi:
-    """Scripted NSE API: ``books`` is a list of row-lists returned one per call (the last one repeats)."""
+    """Scripted NSE API: ``books`` is a list of row-lists returned one per call (the last one repeats), stamped ``book_ts``
+    (the book's own timestamp; set it to an earlier day to simulate NSE serving the previous session's book)."""
 
     def __init__(self, books: list[list[dict[str, Any]]] | None = None, *, fail: bool = False, gift: dict | None = None,
-                 holidays: list[dict[str, Any]] | None = None) -> None:
+                 holidays: list[dict[str, Any]] | None = None, book_ts: str = "02-Nov-2026 09:08:30") -> None:
         self.books = books or []
         self.calls = 0
         self.fail = fail
         self.gift = gift
         self._holidays = holidays
+        self.book_ts = book_ts
 
     def preopen(self, key: str = "ALL", symbols: Any = None):
         from app.errors import DataUnavailable
@@ -162,7 +164,7 @@ class FakeNseApi:
         if self.fail:
             raise DataUnavailable("nse", "simulated block", retryable=True)
         rows = self.books[min(self.calls - 1, len(self.books) - 1)] if self.books else []
-        return PreopenSnapshot(rows=rows, source_ts="02-Nov-2026 09:08:30")
+        return PreopenSnapshot(rows=rows, source_ts=self.book_ts)
 
     def gift_nifty(self):
         return self.gift

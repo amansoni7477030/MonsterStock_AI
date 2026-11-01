@@ -142,6 +142,18 @@ def test_the_preliminary_scan_does_not_recheck_market_reactions(env):
     assert ctx.intel().calls == []  # the 08:10 news job already did it; nothing new is known before the open
 
 
+def test_final_scan_ignores_a_pre_open_book_from_the_previous_session(env):
+    env.clock.set(FINAL_TIME)
+    ctx = env.make()
+    ctx._cache["nse_api"] = FakeNseApi(books=[preopen_rows(env.panel, env.panel.symbols)], book_ts="30-Oct-2026 09:07:48")
+    result = run_scan(ctx, "final")
+    assert result.status == "success", result.message  # gives up on the book after a few empty polls instead of waiting for it
+    snap = env.store.latest_snapshot("2026-11-02", "final")
+    assert snap["payload"]["open_source"] == {} and snap["payload"]["meta"]["n_fallback"] == len(env.panel.symbols)
+    assert any("no pre-open price" in n for n in snap["payload"]["report"]["notes"])
+    assert env.store.latest_preopen("2026-11-02") == {}
+
+
 def test_final_report_after_deadline_is_withheld_but_snapshot_is_frozen(env):
     env.clock.set(datetime(2026, 11, 2, 3, 52, tzinfo=UTC))  # 09:22 IST, past the 09:14:30 deadline
     result = run_scan(env.make(), "final")

@@ -204,6 +204,15 @@ def test_refresh_preopen_reports_an_unavailable_book(env):
     assert result.status == "failed" and "unavailable" in result.message
 
 
+def test_refresh_preopen_treats_the_previous_sessions_book_as_unavailable(env):
+    env.clock.set(datetime(2026, 11, 2, 3, 30, 30, tzinfo=UTC))
+    ctx = ctx_for(env)
+    ctx._cache["nse_api"] = FakeNseApi(books=[preopen_rows(env.panel, env.panel.symbols)], book_ts="30-Oct-2026 09:07:48")
+    result = jobs.refresh_preopen(ctx)
+    assert result.status == "failed" and "unavailable" in result.message
+    assert env.store.latest_preopen("2026-11-02") == {}  # Friday's equilibrium prices must not become Monday's opening gap
+
+
 def test_refresh_preopen_skips_when_nse_is_disabled(env, settings):
     cfg = settings.__class__(**{**settings.__dict__, "nse_enabled": False})
     assert jobs.refresh_preopen(make_job_context(cfg, env.store, env.clock)).status == "skipped"

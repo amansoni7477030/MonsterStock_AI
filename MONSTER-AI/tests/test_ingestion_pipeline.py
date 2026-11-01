@@ -298,6 +298,39 @@ def test_collect_preopen_and_gift(store):
     assert pl.collect_gift(store, FakeNse(gift=gift))["price"] == 23242.5
     assert store.latest_live_quote("GIFT_NIFTY")["change_pct"] == 0.68
     assert pl.collect_gift(store, FakeNse(error=DataUnavailable("nse_api", "x"))) is None
+
+
+@pytest.mark.parametrize("stamp, kept", [
+    ("2026-11-02T03:38:00Z", True),    # 09:08 IST on the trade date
+    ("2026-10-30T03:38:00Z", False),   # the previous session's book
+    ("2026-11-01T19:00:00Z", True),    # 00:30 IST on the 2nd: judged by the IST date, not the UTC date
+    ("2026-11-02T18:45:00Z", False),   # 00:15 IST on the 3rd
+    ("02-Nov-2026 09:08:30", True),    # NSE's own display format (naive: Indian time)
+    ("30-Oct-2026 09:07:48", False),
+    (None, True),                      # nothing to judge by: kept rather than discarding a book that may be perfectly good
+])
+def test_a_pre_open_book_is_judged_by_its_ist_date(stamp, kept):
+    rows = pl.fresh_preopen_rows(PreopenSnapshot(stamp, [{"symbol": "AAA", "iep": 100.0}]), "2026-11-02")
+    assert bool(rows) is kept
+
+
+def test_a_book_served_from_the_previous_session_is_never_stored_as_todays(store):
+    stale = PreopenSnapshot("2026-10-30T03:38:00Z", [{"symbol": "AAA", "iep": 100.0, "final_price": 101.0, "prev_close": 99.0}])
+    result = pl.collect_preopen(store, FakeNse(stale), "2026-11-02", ["AAA"])
+    assert result is not None and result.rows == [] and result.source_ts == "2026-10-30T03:38:00Z"  # callers see "not published"
+    assert store.latest_preopen("2026-11-02") == {}
+    assert store.conn.execute("SELECT COUNT(*) FROM source_health WHERE source_id = 'nse_api_market'").fetchone()[0] == 0  # not a delivery
+
+
+def test_only_the_rows_stamped_today_are_stored(store):
+    mixed = PreopenSnapshot("2026-11-02T03:38:00Z", [
+        {"symbol": "NEW", "iep": 100.0, "final_price": 101.0, "row_ts": "2026-11-02T03:37:30Z"},
+        {"symbol": "OLD", "iep": 50.0, "final_price": 51.0, "row_ts": "2026-10-30T03:37:30Z"},  # not refreshed since Friday
+        {"symbol": "UNDATED", "iep": 10.0, "final_price": 11.0},  # takes the snapshot's (fresh) time
+    ])
+    result = pl.collect_preopen(store, FakeNse(mixed), "2026-11-02", ["NEW", "OLD", "UNDATED"])
+    assert [r["symbol"] for r in result.rows] == ["NEW", "UNDATED"]
+    assert sorted(store.latest_preopen("2026-11-02")) == ["NEW", "UNDATED"]
     health = {h["source_id"]: h for h in store.source_health()}
     assert "nse_api_market" not in health or health["nse_api_market"]["total_failure"] >= 0
 

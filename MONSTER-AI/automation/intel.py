@@ -17,6 +17,9 @@ from ranking.types import Catalyst
 
 log = logging.getLogger(__name__)
 
+PROCESS_BATCH = 600  # rows handled per pipeline call (the pipeline's own default)
+MAX_PROCESS_BATCHES = 4  # a first run or a long outage leaves a backlog: drain up to 2 400 rows in one job, not over several days
+
 
 class Intel:
     def __init__(self, store: Store, settings: Settings, clock: Clock | None = None) -> None:
@@ -68,10 +71,14 @@ class Intel:
         if self.graph is None:
             return {}
         try:
+            from event_graph.repository import GraphRepository
             from event_graph.seed import seed_graph
 
             summary = seed_graph(self.store)
-            return {k: v for k, v in summary.items() if k != "unmapped"} | {"unmapped": len(summary.get("unmapped", []))}
+            size = GraphRepository(self.store).counts()
+            out = {k: v for k, v in summary.items() if k != "unmapped"} | {"unmapped": len(summary.get("unmapped", []))}
+            # what changed in THIS call is usually nothing (the graph is also seeded on first use); the size is what matters
+            return out | {"nodes": size["nodes"], "edges": size["edges"]}
         except Exception as exc:  # noqa: BLE001
             self.errors.append(f"event graph seeding failed ({type(exc).__name__})")
             log.warning("event graph seeding failed: %s", exc)
@@ -93,18 +100,29 @@ class Intel:
 
     # -------------------------------------------------------------------------------------- processing
     def process(self) -> dict[str, Any]:
-        """Turn new articles and filings into events, then check which events the market has already reacted to."""
+        """Turn new articles and filings into events (draining a backlog in bounded batches), then check which events the
+        market has already reacted to."""
         if self.pipeline is None:
             return {"error": "pipeline unavailable"}
+        totals: dict[str, Any] = {}
         try:
-            stats = self.pipeline.process_pending()
-            out = stats.as_dict() if hasattr(stats, "as_dict") else dict(vars(stats))
+            batches = 0
+            while batches < MAX_PROCESS_BATCHES:
+                batches += 1
+                stats = self.pipeline.process_pending(PROCESS_BATCH)
+                counts = stats.as_dict() if hasattr(stats, "as_dict") else dict(vars(stats))
+                for key, value in counts.items():
+                    totals[key] = totals.get(key, 0) + value
+                handled = counts.get("articles_in", 0) + counts.get("filings_in", 0)
+                if handled < PROCESS_BATCH or counts.get("errors", 0):
+                    break  # drained, or something is wrong: do not hammer a failing database
+            totals["batches"] = batches
         except Exception as exc:  # noqa: BLE001
             log.exception("news processing failed")
             self.errors.append(f"news processing failed ({type(exc).__name__})")
             return {"error": type(exc).__name__}
-        out["reactions"] = self.refresh_reactions(self._now())
-        return out
+        totals["reactions"] = self.refresh_reactions(self._now())
+        return totals
 
     def refresh_reactions(self, as_of: datetime) -> int:
         """Fill in whether the market already reacted to recent company events (feeds the "already priced in" logic)."""

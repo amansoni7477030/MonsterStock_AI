@@ -51,11 +51,13 @@ def test_the_graph_is_seeded_once_and_only_again_when_the_seed_changes(store, se
     assert calls == [1, 1]
 
 
-def test_reseeding_reports_counts_without_the_long_unmapped_list_and_is_idempotent(intel):
+def test_reseeding_reports_the_graph_size_without_the_long_unmapped_list_and_is_idempotent(intel):
     first = intel.reseed_graph()
-    assert isinstance(first["unmapped"], int) and "edges_created" in first and first["edges_created"] == 0
+    assert isinstance(first["unmapped"], int) and first["edges_created"] == 0  # the adapter already seeded it on first use
+    assert first["nodes"] > 100 and first["edges"] > 200  # the size is reported whoever did the seeding
     second = intel.reseed_graph()
     assert second["nodes_created"] == 0 and second["edges_created"] == 0 and second["edges_updated"] == 0
+    assert (second["nodes"], second["edges"]) == (first["nodes"], first["edges"])
 
 
 def test_a_broken_seed_is_reported_as_reduced_coverage_not_raised(store, settings, fake_clock, monkeypatch):
@@ -87,6 +89,46 @@ def test_processing_turns_articles_into_events_and_then_checks_market_reactions(
     assert stats["reactions"] >= 0 and len(seen) == 1 and seen[0] == intel.clock.now()
     assert store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
     assert intel.coverage_note() is None
+
+
+class Batches:
+    """A pipeline whose ``process_pending`` reports scripted batch sizes (a backlog being drained)."""
+
+    def __init__(self, sizes, errors=0):
+        self.sizes, self.calls, self.errors = list(sizes), [], errors
+
+    def process_pending(self, max_items=600):
+        self.calls.append(max_items)
+        size = self.sizes.pop(0) if self.sizes else 0
+        counts = {"articles_in": size, "filings_in": 0, "events_created": size // 2, "errors": self.errors}
+        return SimpleNamespace(as_dict=lambda: dict(counts))
+
+    def refresh_reactions(self, as_of, *a, **k):
+        return 3
+
+
+def test_a_backlog_is_drained_in_bounded_batches_and_the_counts_are_summed(intel):
+    from automation import intel as intel_module
+
+    intel.pipeline = Batches([600, 600, 250])
+    totals = intel.process()
+    assert intel.pipeline.calls == [intel_module.PROCESS_BATCH] * 3  # stops as soon as a batch is not full
+    assert totals["articles_in"] == 1450 and totals["events_created"] == 725 and totals["batches"] == 3 and totals["reactions"] == 3
+
+
+def test_draining_is_capped_so_one_job_cannot_run_forever(intel):
+    from automation import intel as intel_module
+
+    intel.pipeline = Batches([600] * 50)
+    totals = intel.process()
+    assert totals["batches"] == intel_module.MAX_PROCESS_BATCHES == len(intel.pipeline.calls)
+    assert totals["articles_in"] == 600 * intel_module.MAX_PROCESS_BATCHES
+
+
+def test_draining_stops_at_the_first_batch_with_errors(intel):
+    intel.pipeline = Batches([600, 600], errors=2)
+    totals = intel.process()
+    assert len(intel.pipeline.calls) == 1 and totals["errors"] == 2 and totals["batches"] == 1
 
 
 def test_a_failing_pipeline_reduces_coverage_without_raising(intel):

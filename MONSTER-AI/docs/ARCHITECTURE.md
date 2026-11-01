@@ -96,7 +96,8 @@ A scan at time *T* may use only what was knowable at *T*.
   taken at the scan cutoff, and a stale series is flagged rather than forward-filled silently.
 - Calendar and results-calendar features are known in advance and are not shifted.
 - Stage `final` adds `p_*` gap features computed from the pre-open price only; names without a pre-open price fall
-  back to the `pre` model (reported as such).
+  back to the `pre` model (reported as such). Pre-open rows are stored only when stamped on the trade date (IST): outside
+  the pre-open session NSE serves the *previous* session's book, and that must never become today's opening gap.
 - Muhurat and other special sessions are removed from the training panel (market-wide volume far below the
   trailing median) and never count as a "missing" session.
 - `tests/test_features_leakage.py` guards this: future data cannot change past features, the current session's path

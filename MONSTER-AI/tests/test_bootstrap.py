@@ -71,6 +71,14 @@ def test_full_bootstrap_completes_and_announces_itself(env):
     assert any(a["code"] == "bootstrap_complete" for a in env.store.pending_alerts(20))
 
 
+def test_the_universe_step_reports_the_size_of_the_event_graph(env):
+    ctx = make_job_context(env.settings, env.store, env.clock)
+    ctx.intel().reseed_graph = lambda: {"nodes": 140, "edges": 260, "nodes_created": 0, "edges_created": 0}
+    outcome = bs.run_bootstrap(ctx)
+    assert "event graph ready (140 nodes, 260 edges)" in outcome.steps["universe"]["detail"]
+    assert "seeded" not in outcome.steps["universe"]["detail"]  # "0 seeded" would be misleading: it was seeded on first use
+
+
 def test_resume_skips_finished_steps_and_retries_the_failed_one(env, monkeypatch):
     monkeypatch.setattr(bs, "backfill_history", env.counted("history", RuntimeError("yahoo blocked")))
     _ctx, first = run(env)

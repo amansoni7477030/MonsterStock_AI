@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shutil
 from pathlib import Path
@@ -22,6 +21,7 @@ import lightgbm as lgb
 
 from app import jsonutil
 from app.errors import ModelArtifactError
+from database.object_store import remove_tree, replace_path
 from models.calibration import Calibrator
 
 MANIFEST = "manifest.json"
@@ -73,8 +73,8 @@ def write_bundle(
     manifest = {"format": 1, "version": meta.get("version"), "files": files}
     (staging / MANIFEST).write_text(jsonutil.dumps(manifest, pretty=True), encoding="utf-8")
     if directory.exists():
-        shutil.rmtree(directory)
-    os.replace(staging, directory)
+        remove_tree(directory)
+    replace_path(staging, directory)  # rides out the short "access denied" spells a Windows virus scanner can cause
     return manifest
 
 

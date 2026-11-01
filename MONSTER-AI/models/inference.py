@@ -41,6 +41,40 @@ def make_meta_frame(sp: dict[str, np.ndarray], X: pd.DataFrame, meta_context: li
     return frame
 
 
+def drift_share(values: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """Per row, the share of known feature values outside the training band [lo, hi] (0 when nothing is known)."""
+    known = np.isfinite(values)
+    outside = (values < lo) | (values > hi)
+    with np.errstate(all="ignore"):
+        return (outside & known).sum(axis=1) / np.maximum(known.sum(axis=1), 1)
+
+
+def combine_uncertainty(
+    spec_std: np.ndarray, spread: np.ndarray, dist: np.ndarray, drift: np.ndarray, scales: dict[str, Any],
+) -> np.ndarray:
+    """0 (reliable) .. 1 (unreliable); NOT a probability. 0.35 x specialist disagreement + 0.25 x forecast-interval width
+    + 0.20 x similar-day distance + 0.20 x feature drift, each divided by its out-of-sample 95th percentile (``scales``) and
+    clipped to [0, 1]. A missing disagreement or distance counts as the middle (0.5). Shared by inference and training, which
+    uses it to learn what is normal for the model's own top picks."""
+    a = np.where(np.isfinite(spec_std), np.clip(spec_std / max(scales.get("spec_std_p95", 0.1), 1e-6), 0, 1), 0.5)
+    b = np.clip(spread / max(scales.get("spread_p95", 2.0), 1e-6), 0, 1)
+    lo, hi = scales.get("dist_median", 0.0), scales.get("dist_p95", 1.0)
+    c = np.where(np.isfinite(dist), np.clip((dist - lo) / max(hi - lo, 1e-6), 0, 1), 0.5)
+    d = np.clip(drift / max(scales.get("drift_p95", 0.2), 1e-6), 0, 1)
+    return np.clip(0.35 * a + 0.25 * b + 0.20 * c + 0.20 * d, 0.0, 1.0)
+
+
+def pick_uncertainty_ceilings(meta: dict[str, Any]) -> tuple[float, float] | None:
+    """(STRONG, MODERATE) uncertainty ceilings learned from this model's own out-of-sample daily top picks, or ``None`` for a
+    model without them (older artifacts, the heuristic baseline): the caller then falls back to the configured constants."""
+    scales = meta.get("unc_scales") or {}
+    strong, moderate = scales.get("pick_p50"), scales.get("pick_p85")
+    numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (strong, moderate))
+    if numeric and 0.0 < strong <= moderate <= 1.0:
+        return float(strong), float(moderate)
+    return None
+
+
 class ModelBundle:
     """A trained, calibrated model for one stage. ``predict`` is pure and deterministic."""
 
@@ -142,32 +176,20 @@ class ModelBundle:
 
     # ----------------------------------------------------------------------------------- uncertainty
     def _uncertainty(self, X: pd.DataFrame, mf: pd.DataFrame, out: pd.DataFrame) -> np.ndarray:
-        """0 (reliable) .. 1 (unreliable). NOT a probability: 0.35*specialist disagreement + 0.25*forecast-interval width
-        + 0.20*similar-day distance + 0.20*feature drift, each normalised by its out-of-sample 95th percentile."""
-        s = self.meta.get("unc_scales", {})
+        """0 (reliable) .. 1 (unreliable). NOT a probability; see ``combine_uncertainty`` for the formula."""
         std = mf["sp_std_unusual"].to_numpy(dtype=float) if "sp_std_unusual" in mf else np.full(len(X), np.nan)
-        a = np.where(np.isfinite(std), np.clip(std / max(s.get("spec_std_p95", 0.1), 1e-6), 0, 1), 0.5)
-        spread = (out["rng_q90"] - out["rng_q10"]) / out["rng_q50"].clip(lower=1e-6)
-        b = np.clip(spread.to_numpy(dtype=float) / max(s.get("spread_p95", 2.0), 1e-6), 0, 1)
+        spread = ((out["rng_q90"] - out["rng_q10"]) / out["rng_q50"].clip(lower=1e-6)).to_numpy(dtype=float)
         dist = X["x_sim_dist_mean"].to_numpy(dtype=float) if "x_sim_dist_mean" in X.columns else np.full(len(X), np.nan)
-        lo, hi = s.get("dist_median", 0.0), s.get("dist_p95", 1.0)
-        c = np.where(np.isfinite(dist), np.clip((dist - lo) / max(hi - lo, 1e-6), 0, 1), 0.5)
-        d = self._drift(X) / max(s.get("drift_p95", 0.2), 1e-6)
-        return np.clip(0.35 * a + 0.25 * b + 0.20 * c + 0.20 * np.clip(d, 0, 1), 0.0, 1.0)
+        return combine_uncertainty(std, spread, dist, self._drift(X), self.meta.get("unc_scales", {}))
 
     def _drift(self, X: pd.DataFrame) -> np.ndarray:
         stats = self.stats.get("features", {})
         names = [n for n in stats if n in X.columns and stats[n].get("p99") is not None]
         if not names:
             return np.zeros(len(X))
-        values = X[names].to_numpy(dtype=np.float64)
         lo = np.array([stats[n]["p01"] for n in names])
         hi = np.array([stats[n]["p99"] for n in names])
-        known = np.isfinite(values)
-        outside = (values < lo) | (values > hi)
-        with np.errstate(all="ignore"):
-            share = (outside & known).sum(axis=1) / np.maximum(known.sum(axis=1), 1)
-        return share
+        return drift_share(X[names].to_numpy(dtype=np.float64), lo, hi)
 
     # ------------------------------------------------------------------------------------------ explain
     def explain(self, X: pd.DataFrame, position: int, top: int = 3) -> list[str]:

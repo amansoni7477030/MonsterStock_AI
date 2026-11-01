@@ -98,7 +98,7 @@ def run_bootstrap(ctx: JobContext, *, resume: bool = True, skip_train: bool = Fa
         graph = ctx.intel().reseed_graph()  # sector memberships follow the instrument master
         note = f"{len(result.symbols)} symbols from {result.source}"
         if graph:
-            note += f"; event graph: {graph.get('nodes_created', 0)} nodes, {graph.get('edges_created', 0)} edges seeded"
+            note += f"; event graph ready ({graph.get('nodes', 0)} nodes, {graph.get('edges', 0)} edges)"
         return "done", note + (f" ({'; '.join(result.notes)})" if result.notes else "")
 
     def history() -> tuple[str, str]:

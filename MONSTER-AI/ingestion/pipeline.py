@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
-from app.clock import Clock, get_clock, ist_date
+from app.clock import IST, Clock, get_clock, ist_date, parse_ts
 from app.errors import CircuitOpen, DataUnavailable
 from app.logging_setup import redact
 from database.store import Store
@@ -343,18 +343,37 @@ def backfill_fno(
 
 
 # ---------------------------------------------------------------------------------------- live collection
+def fresh_preopen_rows(snapshot: PreopenSnapshot, trade_date: str) -> list[dict[str, Any]]:
+    """The snapshot's rows that are stamped on ``trade_date`` (IST). Outside the pre-open session, or from a stale cache, the NSE
+    endpoint serves the PREVIOUS session's book; stored under today's date it would turn yesterday's equilibrium prices into a
+    bogus opening gap. A row falls back to the snapshot's own timestamp; with no timestamp at all it cannot be judged and is kept."""
+    day = date.fromisoformat(trade_date)
+    snapshot_stamp = parse_ts(snapshot.source_ts, assume_tz=IST)
+    fresh = []
+    for row in snapshot.rows:
+        stamp = parse_ts(row.get("row_ts"), assume_tz=IST) or snapshot_stamp
+        if stamp is None or ist_date(stamp) == day:
+            fresh.append(row)
+    return fresh
+
+
 def collect_preopen(store: Store, nse: NseApi, trade_date: str, symbols: Iterable[str]) -> PreopenSnapshot | None:
-    """Fetch the NSE pre-open book once and append it (with source and received timestamps) to ``preopen_quotes``."""
+    """Fetch the NSE pre-open book once and append today's rows (with source and received timestamps) to ``preopen_quotes``.
+    A book that is not from ``trade_date`` yet counts as "not published": the returned snapshot has no rows."""
     try:
         snapshot = nse.preopen("ALL", set(symbols))
     except DataUnavailable as exc:
         store.record_source_result("nse_api_market", False, error=redact(str(exc)))
         log.warning("pre-open collection failed: %s", redact(str(exc)))
         return None
-    if snapshot.rows:
-        store.add_preopen_quotes(trade_date, snapshot.rows, snapshot.source_ts)
+    rows = fresh_preopen_rows(snapshot, trade_date)
+    if len(rows) < len(snapshot.rows):
+        log.info("ignoring %d pre-open rows that are not from %s (book stamped %s)", len(snapshot.rows) - len(rows), trade_date,
+                 snapshot.source_ts)
+    if rows:
+        store.add_preopen_quotes(trade_date, rows, snapshot.source_ts)
         store.record_source_result("nse_api_market", True, data_ts=snapshot.source_ts)
-    return snapshot
+    return PreopenSnapshot(snapshot.source_ts, rows)
 
 
 def collect_gift(store: Store, nse: NseApi) -> dict[str, Any] | None:
