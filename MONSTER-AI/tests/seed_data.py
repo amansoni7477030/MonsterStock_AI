@@ -109,6 +109,7 @@ class FakeIntel:
     def __init__(self) -> None:
         self.errors: list[str] = []
         self.pipeline = None
+        self.calls: list[str] = []
 
     def catalysts(self, *_: Any, **__: Any) -> dict:
         return {}
@@ -123,6 +124,22 @@ class FakeIntel:
         return None
 
     def process(self) -> dict:
+        return {}
+
+    def refresh_reactions(self, *_: Any, **__: Any) -> int:
+        self.calls.append("refresh_reactions")
+        return 0
+
+    def reseed_graph(self) -> dict:
+        self.calls.append("reseed_graph")
+        return {}
+
+    def learn_graph(self, *_: Any, **__: Any) -> dict:
+        self.calls.append("learn_graph")
+        return {}
+
+    def prune(self) -> dict:
+        self.calls.append("prune")
         return {}
 
 

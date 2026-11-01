@@ -132,6 +132,14 @@ def test_final_scan_uses_preopen_book_with_preliminary_fallback(env):
     notes = snap["payload"]["report"]["notes"]
     assert any("no pre-open price" in n for n in notes)
     assert any("FINAL" in text for _, text in env.telegram.sent)
+    assert ctx.intel().calls == ["refresh_reactions"]  # pre-open quotes are known: re-check what is already priced in
+
+
+def test_the_preliminary_scan_does_not_recheck_market_reactions(env):
+    env.clock.set(PRELIM_TIME)
+    ctx = env.make()
+    assert run_scan(ctx, "pre").status == "success"
+    assert ctx.intel().calls == []  # the 08:10 news job already did it; nothing new is known before the open
 
 
 def test_final_report_after_deadline_is_withheld_but_snapshot_is_frozen(env):

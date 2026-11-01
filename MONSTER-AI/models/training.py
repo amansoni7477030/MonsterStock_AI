@@ -243,6 +243,7 @@ def train_stage(
     n_days = len(uniq)
     Xv = X.to_numpy(dtype=np.float32)
     labels = {k: Y[k].to_numpy(dtype=np.float64) for k in Y.columns}
+    del Y
     blocks = walk_forward_blocks(n_days, cfg)
     if len(blocks) < 3:
         raise TrainingError(f"insufficient history for walk-forward ({n_days} days, {len(blocks)} usable folds)")
@@ -284,9 +285,15 @@ def train_stage(
     meta_ctx_index = X.index[meta_rows]
     ctx_frame.index = meta_ctx_index
     sp_for_meta = {k: v[meta_rows] for k, v in oof.items()}
+    del oof  # the per-row out-of-fold arrays are only needed at the meta rows from here on
     meta_df = make_meta_frame(sp_for_meta, ctx_frame, ctx_cols)
+    del ctx_frame
     meta_columns = list(meta_df.columns)
     Mv = meta_df.to_numpy(dtype=np.float32)
+    spec_std = meta_df["sp_std_unusual"].to_numpy(dtype=float)
+    del meta_df
+    p_up_oof = sp_for_meta.get("sp_direction_up")
+    del sp_for_meta
     mblock = block_of_row[meta_rows]
     mlabels = {k: v[meta_rows] for k, v in labels.items()}
     cls_heads, quant = _meta_targets(cfg)
@@ -330,10 +337,9 @@ def train_stage(
         reliability[head] = M.reliability_table(cal_eval.transform(p[hold]), y_all[hold]).to_dict("records")
         cal_deploy[head] = fit_calibrator(p[valid_meta], y_all[valid_meta])
 
-    up_key = "sp_direction_up"
-    if up_key in oof:
+    if p_up_oof is not None:
         y_up = mlabels["y_up"]
-        p_up = sp_for_meta[up_key]
+        p_up = p_up_oof
         known = np.isfinite(p_up) & np.isfinite(y_up)
         f2, h2 = known & fit_part, known & hold
         cal_up = fit_calibrator(p_up[f2], y_up[f2]) if f2.sum() >= 300 else Calibrator("identity")
@@ -374,7 +380,7 @@ def train_stage(
     feature_cols = sorted({c for s in active_specs.values() for c in s["columns"]} | set(ctx_cols), key=names.index)
     stats = _quantile_stats(Xv, names, _subsample(all_rows, 150_000, rng))
     stats["features"] = {k: v for k, v in stats["features"].items() if k in feature_cols}
-    std = meta_df["sp_std_unusual"].to_numpy(dtype=float)
+    std = spec_std
     spread = (q90 - q10) / np.clip(meta_oof["q:range_q50"], 1e-6, None)
     dist = Xv[:, names.index("x_sim_dist_mean")] if "x_sim_dist_mean" in names else np.array([np.nan])
     unc_scales = {

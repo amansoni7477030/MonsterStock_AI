@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
 import logging
 import os
 import shutil
@@ -70,28 +71,38 @@ def memory_info() -> dict[str, float | None]:
     return info
 
 
-def _windows_counters() -> Any:  # pragma: no cover - dev machines only
-    class _Counters(ctypes.Structure):
-        _fields_ = [
-            ("cb", ctypes.c_ulong),
-            ("PageFaultCount", ctypes.c_ulong),
-            ("PeakWorkingSetSize", ctypes.c_size_t),
-            ("WorkingSetSize", ctypes.c_size_t),
-            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-            ("PagefileUsage", ctypes.c_size_t),
-            ("PeakPagefileUsage", ctypes.c_size_t),
-        ]
+class _ProcessCounters(ctypes.Structure):
+    """Windows PROCESS_MEMORY_COUNTERS. Defined once at module level: a ctypes type created per call is never reclaimed
+    promptly, so sampling memory every few milliseconds used to leak tens of MB."""
 
-    counters = _Counters()
-    counters.cb = ctypes.sizeof(_Counters)
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _windows_api() -> tuple[Any, Any]:  # pragma: no cover - dev machines only
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Counters), ctypes.c_ulong]
+    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessCounters), ctypes.c_ulong]
     psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+    return kernel32, psapi
+
+
+def _windows_counters() -> Any:  # pragma: no cover - dev machines only
+    kernel32, psapi = _windows_api()
+    counters = _ProcessCounters()
+    counters.cb = ctypes.sizeof(_ProcessCounters)
     if psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
         return counters
     return None

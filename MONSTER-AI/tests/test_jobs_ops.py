@@ -52,7 +52,7 @@ def test_housekeeping_cleans_up_and_reports_disk_state(env):
     result = jobs.housekeeping(make_job_context(env.settings, env.store, env.clock))
     assert result.status == "success" and "MB free" in result.message
     assert env.store.conn.execute("SELECT COUNT(*) FROM alerts WHERE code = 'old'").fetchone()[0] == 0
-    assert result.metrics["news_raw"] == 0 and "models" in result.metrics
+    assert result.metrics["news"] == 0 and "models" in result.metrics
 
 
 def test_housekeeping_runs_emergency_cleanup_when_the_disk_is_critical(env, monkeypatch):
@@ -108,9 +108,11 @@ def test_refresh_universe_updates_membership_and_loads_history(env, monkeypatch)
 
     monkeypatch.setattr(universe_module, "build_universe", lambda *a, **k: Result())
     monkeypatch.setattr(jobs, "backfill_history", lambda *a, **k: IngestReport(ok=2, failed=1))
-    result = jobs.refresh_universe(make_job_context(env.settings, env.store, env.clock))
+    ctx = make_job_context(env.settings, env.store, env.clock)
+    result = jobs.refresh_universe(ctx)
     assert result.status == "success" and result.metrics["universe"] == 3 and result.metrics["history_failed"] == 1
     assert result.metrics["board_meetings"] == 2
+    assert ctx.intel().calls == ["reseed_graph", "learn_graph"]  # memberships follow the new universe, then the edges are re-measured
 
 
 def test_model_sync_and_training_are_gated_by_mode(env):
@@ -129,6 +131,48 @@ def test_train_years_fit_the_row_budget():
     assert jobs.train_years_for(s, 221) == 5  # 320000 / (221 * 252)
     assert jobs.train_years_for(s, 400) == 3  # never below three years
     assert jobs.train_years_for(Settings(train_years=4, train_max_rows=10**9), 221) == 4
+
+
+def test_each_lean_level_drops_a_year_and_halves_the_fit_sample(monkeypatch):
+    from app.config import Settings
+
+    s = Settings(train_years=6, train_max_rows=320000)
+    assert [jobs.train_years_for(s, 221, lean) for lean in (0, 1, 2, 3, 9)] == [5, 4, 3, 3, 3]
+    assert jobs.train_years_for(s, 221, -4) == 5  # nonsense levels are ignored
+
+    monkeypatch.setattr(jobs, "memory_info", lambda: {"total_mb": 1000.0})  # the 1 GB server: light profile
+    assert [jobs.fit_row_cap(s, lean) for lean in (0, 1, 2, 9)] == [60_000, 30_000, 15_000, jobs.MIN_FIT_ROWS]
+    monkeypatch.setattr(jobs, "memory_info", lambda: {"total_mb": 16_000.0})
+    assert jobs.fit_row_cap(s) == 120_000 and jobs.fit_row_cap(Settings(train_max_rows=50_000)) == 50_000
+    monkeypatch.setattr(jobs, "memory_info", lambda: {"total_mb": None})  # unknown RAM: full profile
+    assert jobs.fit_row_cap(s) == 120_000
+
+
+@pytest.mark.parametrize("attempt, options, expected", [
+    (1, {}, 0), (2, {}, 1), (3, {}, 2), (1, {"lean": "1"}, 1), (3, {"lean": "1"}, 2), (1, {"lean": "x"}, 0), (1, {"lean": "-3"}, 0),
+])
+def test_the_lean_level_follows_failed_attempts_or_the_explicit_option(env, attempt, options, expected):
+    ctx = make_job_context(env.settings, env.store, env.clock, attempt=attempt)
+    ctx.options = options
+    assert jobs.lean_level(ctx) == expected
+
+
+def test_a_retried_training_job_uses_the_leaner_profile(env, monkeypatch):
+    from features import live
+    from models import training
+
+    seen = {}
+    monkeypatch.setattr(live, "build_training_features", lambda *a, **k: seen.update(years=k["years"]) or object())
+    monkeypatch.setattr(training, "train_stage", lambda fs, cfg, *a, **k: seen.update(rows=cfg.max_rows_per_fit) or (_ for _ in ()).throw(
+        training.TrainingError("stop here")))
+    monkeypatch.setattr(jobs, "memory_info", lambda: {"total_mb": 1000.0})
+    ctx = make_job_context(env.settings, env.store, env.clock, attempt=2)
+    ctx.options = {"stages": "pre"}
+    result = jobs.train(ctx)
+    assert seen == {"years": 5, "rows": 30_000} and "lean profile, level 1" in result.message
+    ctx = make_job_context(env.settings, env.store, env.clock, attempt=1)
+    ctx.options = {"stages": "pre"}
+    assert "lean" not in jobs.train(ctx).message and seen == {"years": 6, "rows": 60_000}
 
 
 def test_health_check_job_raises_alerts(env):

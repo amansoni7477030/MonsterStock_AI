@@ -330,14 +330,12 @@ def housekeeping(ctx: JobContext) -> JobResult:
     if status.level in {"warn", "crit"}:
         store.add_alert("warning" if status.level == "warn" else "error", "resources", "; ".join(status.messages),
                         dedupe_key=f"resources:{status.level}", dedupe_minutes=360)
-    actions["news_raw"] = _guarded("news retention", ctx.news().prune_raw)
     actions["cache"] = prune_directory(s.cache_dir, max_mb=200, max_age_days=14)
     actions["tmp"] = prune_directory(s.tmp_dir, max_age_days=1)
     registry = ctx.registry()
     actions["models"] = sum(registry.prune(stage) for stage in ("pre", "final"))
-    intel = ctx.intel()
-    if intel.pipeline is not None:
-        actions["events"] = _guarded("event retention", intel.pipeline.prune)
+    # the pipeline's retention detaches event links in bulk (fast); the plain delete is only the fallback without it
+    actions["news"] = ctx.intel().prune() or _guarded("news retention", ctx.news().prune_raw)
     store.conn.execute("DELETE FROM alerts WHERE delivered = 1 AND created_at < ?",
                        ((ctx.clock.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),))
     store.conn.execute("DELETE FROM job_runs WHERE started_at < ?",
@@ -369,7 +367,11 @@ def train(ctx: JobContext) -> JobResult:
         return JobResult("skipped", "TRAINING_MODE=disabled: the heuristic baseline stays in use")
     ctx.ensure_calendar()
     end = ctx.calendar.last_completed_session(ctx.clock.now())
-    years = train_years_for(s, len(universe_symbols(ctx)))
+    lean = lean_level(ctx)
+    years = train_years_for(s, len(universe_symbols(ctx)), lean)
+    fit_rows = fit_row_cap(s, lean)
+    if lean:
+        log.warning("training with the lean profile (level %d): %d years of history, %d rows per fit", lean, years, fit_rows)
     registry = ctx.registry()
     stages = tuple(x for x in ctx.options.get("stages", "pre,final").split(",") if x in {"pre", "final"}) or ("pre", "final")
     outcomes: dict[str, Any] = {}
@@ -380,7 +382,7 @@ def train(ctx: JobContext) -> JobResult:
             cfg = TrainConfig(
                 stage=stage, thresholds=s.range_thresholds, primary_threshold=s.primary_threshold, unusual_k=s.unusual_k,
                 top_n=s.top_n, gate_min_days=s.gate_min_days, gate_max_ece=s.gate_max_ece,
-                gate_min_brier_skill=s.gate_min_brier_skill, max_rows_per_fit=fit_row_cap(s),
+                gate_min_brier_skill=s.gate_min_brier_skill, max_rows_per_fit=fit_rows,
             )
             result = train_stage(fs, cfg, s.models_dir, now=ctx.clock.now(), stop=ctx.expired)
             del fs
@@ -396,24 +398,42 @@ def train(ctx: JobContext) -> JobResult:
         store.add_alert("warning", "training_failed", "; ".join(failures)[:400], dedupe_key=f"train:{ctx.run_key}",
                         dedupe_minutes=720)
     summary = ", ".join(f"{k}: {v.get('status', 'error')}" for k, v in outcomes.items())
+    if lean:
+        summary += f" (lean profile, level {lean})"
     return JobResult("failed" if len(failures) == len(stages) else "success", summary, outcomes)
 
 
-def train_years_for(settings: Any, n_universe: int) -> int:
-    """History used for training: as many years as fit the row budget (RAM-bound on the 1 GB server), at least 3."""
+MIN_TRAIN_YEARS = 3  # with fewer years the walk-forward has too few folds to validate anything
+MIN_FIT_ROWS = 15_000
+
+
+def train_years_for(settings: Any, n_universe: int, lean: int = 0) -> int:
+    """History used for training: as many years as fit the row budget (RAM-bound on the 1 GB server), at least 3.
+    ``lean`` drops one more year per level (see ``lean_level``)."""
     fit = int(settings.train_max_rows / max(n_universe * 252, 1))
-    return max(3, min(settings.train_years, fit))
+    return max(MIN_TRAIN_YEARS, min(settings.train_years, fit) - max(lean, 0))
 
 
 LIGHT_RAM_MB = 1600  # below this total RAM the lighter fitting profile is used
 LIGHT_FIT_ROWS, FULL_FIT_ROWS = 60_000, 120_000
 
 
-def fit_row_cap(settings: Any) -> int:
-    """Rows sampled per booster fit: LightGBM's histogram construction is the memory peak, so small servers sample less."""
+def fit_row_cap(settings: Any, lean: int = 0) -> int:
+    """Rows sampled per booster fit: small servers sample less; every ``lean`` level halves it."""
     total = memory_info()["total_mb"]
     cap = LIGHT_FIT_ROWS if total is not None and total < LIGHT_RAM_MB else FULL_FIT_ROWS
-    return min(cap, settings.train_max_rows)
+    return max(MIN_FIT_ROWS, min(cap, settings.train_max_rows) >> max(lean, 0))
+
+
+def lean_level(ctx: JobContext) -> int:
+    """0 = normal profile. A training attempt that died (memory watchdog, OOM kill) is retried one level leaner per failed
+    attempt, so a server that is too small for the full profile still ends up with a model instead of failing the same way
+    every week. The bootstrap passes the level explicitly through the ``lean`` option."""
+    try:
+        forced = int(ctx.options.get("lean", "0"))
+    except ValueError:
+        forced = 0
+    return max(ctx.attempt - 1, forced, 0)
 
 
 def model_sync(ctx: JobContext) -> JobResult:
@@ -455,6 +475,8 @@ def refresh_universe(ctx: JobContext) -> JobResult:
                               clock=ctx.clock)
     metrics: dict[str, Any] = {"universe": len(result.symbols), "added": result.added, "removed": result.removed,
                                "history_ok": report.ok, "history_failed": report.failed, "source": result.source}
+    metrics["graph"] = ctx.intel().reseed_graph()  # sector memberships follow the instrument master
+    metrics["graph_learning"] = ctx.intel().learn_graph(ctx.run_date)  # measured sensitivities replace priors where the data allows
     if s.nse_enabled:
         day = ctx.run_date
         metrics["board_meetings"] = _guarded("board meetings", ctx.news().collect_board_meetings, ctx.nse_api(), day,

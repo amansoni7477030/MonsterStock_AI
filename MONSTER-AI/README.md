@@ -34,24 +34,29 @@ Python 3.10-3.13 on Linux x86-64/aarch64 (binary wheels only) and Windows for de
 
 ## Server deployment
 
-Target: Ubuntu 22.04/24.04 or Debian 12, 1 vCPU / **1 GB RAM** / 8 GB disk, **native systemd (no containers)**.
+Target: Ubuntu 22.04/24.04 or Debian 12, 1 vCPU / **1 GB RAM** / 8 GB disk, **native systemd (no containers of any kind)**.
+Put the bot token into a local `.env` (copy `.env.example`), then from your PC:
 
+```powershell
+.\deployment\deploy_remote.ps1 -Target ubuntu@203.0.113.10        # Windows
+```
 ```bash
-sudo bash deployment/install.sh --env-file ./monster.env.seed      # or from Windows: deployment\deploy_remote.ps1
+deployment/deploy_remote.sh ubuntu@203.0.113.10                   # Linux / macOS
+sudo bash deployment/install.sh --env-file ./.env --yes           # or directly on the server
 ```
 
 The installer is idempotent: it installs OS packages, creates the unprivileged `monster` user, builds the virtualenv from wheels,
 validates the configuration, discovers your Telegram chat id, initialises the database, installs and starts the systemd units,
 runs the first-time bootstrap in the background and verifies the result; re-running it upgrades and rolls back automatically if
 the new release does not come up. Details: [deployment/README.md](deployment/README.md) and
-[docs/OPERATIONS.md](docs/OPERATIONS.md).
+[docs/OPERATIONS.md](docs/OPERATIONS.md). On the server every command is `sudo monster-ai <command>`.
 
 ## Daily timetable (Asia/Kolkata, trading days)
 
 | Time | Job | Purpose |
 |---|---|---|
 | 06:00-08:30 | `collect_global` | US/Europe/Asia closes, FX, commodities, rates, VIX, GIFT Nifty (retries) |
-| 06:30, 08:10 | `collect_news` | RSS + GDELT + NSE filings, entity/event extraction |
+| 06:30, 08:10 | `collect_news` | RSS + GDELT + NSE filings, entity/event extraction, market-reaction check |
 | 08:00 | `collect_india` | previous-session completeness (official bhavcopy first), results calendar |
 | 08:30 | `preflight` | repair gaps, dry-run the scan so problems surface before 08:45 |
 | 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`) |
@@ -59,18 +64,20 @@ the new release does not come up. Details: [deployment/README.md](deployment/REA
 | 09:08:45 | `final_scan` | final scan with the opening gap, frozen snapshot, **Telegram report by 09:12-09:14:30** |
 | 17:45+ | `ingest_eod` | official end-of-day data (retries until 23:30) |
 | 18:15+ | `evaluate` | outcomes vs baselines, evening report |
-| 23:30 / 23:50 | `backup`, `housekeeping` | online DB backup (+ optional S3), retention |
-| Sat 02:00 | `train` | walk-forward retraining, champion/challenger governance |
+| 23:30 / 23:50 | `backup`, `housekeeping` | verified online DB backup (+ off-box copy when S3 is configured), retention |
+| Sat 02:00 | `train` | walk-forward retraining, champion/challenger governance (`TRAINING_MODE=local-light`) |
 
-Weekly: `refresh_calendar` (Mon), `refresh_universe` (Sun). A ledger (`job_runs`) makes every job restart-safe: missed windows are
+Also every day at 05:30: `refresh_calendar` (NSE holidays) and `model_sync` (external training mode: pull and verify signed models).
+Weekly: `refresh_universe` (Sun). A ledger (`job_runs`) makes every job restart-safe: missed windows are
 recorded and alerted, catch-up jobs run after a reboot, and nothing runs twice.
 
 ## Commands
 
 `python -m app.cli <command>`: `init`, `doctor [--offline] [--json]`, `bootstrap [--resume] [--skip-train]`, `daemon`,
-`jobs`, `scan --stage pre|final [--dry-run] [--date D]`, `evaluate [--date D]`, `train [--stage ..]`, `backtest`,
-`models list|approve|activate|rollback`, `backup [--verify|--restore-latest]`, `health [--json] [--notify]`,
-`telegram-setup`, `telegram-test`, `dashboard`, `env-example`, `version`.
+`run-job NAME [--force] [--dry-run] [--opt K=V]`, `jobs`, `scan --stage pre|final [--dry-run] [--date D]`, `evaluate [--date D]`,
+`train [--stage ..] [--publish]`, `backtest`, `models list|approve|activate|rollback`,
+`backup [--verify|--restore-latest [--remote]]`, `health [--json] [--notify]`, `telegram-setup`, `telegram-test`, `dashboard`,
+`env-example`, `version`.
 
 ## Configuration
 
@@ -78,7 +85,7 @@ All settings are environment variables (12-factor), validated at start-up. `.env
 of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` are required.
 Key knobs: `MONSTER_MODE` (shadow), `UNIVERSE_MODE` (fno_nifty100), `PRIMARY_THRESHOLD` (3.0), `TOP_N` (5), tier probabilities,
 scan times (`FINAL_SCAN_TIME`, `REPORT_CUTOFF_TIME`, `REPORT_DEADLINE_TIME`), data-quality and resource limits, training mode
-(`local-light` or `external` signed models), S3 backup, optional LLM.
+(`local-light`, `external` signed models, or `disabled`), S3 storage for off-box backups and model bundles, optional LLM.
 
 ## How it works
 

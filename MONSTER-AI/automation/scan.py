@@ -285,6 +285,8 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
     scored = score(ctx, stage, live)
 
     intel = ctx.intel()
+    if stage == "final":
+        intel.refresh_reactions(cutoff)  # the pre-open quotes are in by now: sharper "already priced in" detection
     top = scored.preds["p_primary"].dropna().nlargest(ENRICH_POOL).index.tolist()
     catalysts = intel.catalysts(top, cutoff)
     result = rank(

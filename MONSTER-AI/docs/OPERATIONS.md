@@ -161,7 +161,13 @@ Telegram is down, reports and alerts queue in the database and are delivered whe
 `monster-ai health` shows free disk and RAM. Housekeeping runs nightly (cache, logs, temp, news retention, old model
 versions, `VACUUM` on Sundays). Below `MIN_FREE_DISK_MB_CRIT` an emergency cleanup runs and heavy jobs are blocked. A job
 that exceeds its RSS ceiling (`JOB_MAX_RSS_MB`, 720 MB) is aborted and retried; repeated aborts in one bootstrap step skip that
-step instead of looping. If memory pressure is chronic, use `TRAINING_MODE=external` or a larger server.
+step instead of looping.
+
+Training adapts by itself: a weekly `train` run that dies from memory pressure is retried (up to 3 attempts, 15 minutes
+apart), each time one year shorter in history and with half the sample per booster fit ("lean profile" in the job summary and the
+log). The same rule applies to a bootstrap training step that crashed before. On the project's real data (221 stocks, five years) the
+full light profile peaks at about 640 MB (feature build) and 565 MB (training), so a healthy 1 GB server normally never needs it.
+If memory pressure is chronic anyway, use `TRAINING_MODE=external` or a larger server.
 
 ### The daemon is not running
 

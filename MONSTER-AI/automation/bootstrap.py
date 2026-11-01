@@ -95,7 +95,10 @@ def run_bootstrap(ctx: JobContext, *, resume: bool = True, skip_train: bool = Fa
 
     def universe() -> tuple[str, str]:
         result = build_universe(store, s, ctx.nse_archive() if s.nse_enabled else None, ctx.clock.now().date())
+        graph = ctx.intel().reseed_graph()  # sector memberships follow the instrument master
         note = f"{len(result.symbols)} symbols from {result.source}"
+        if graph:
+            note += f"; event graph: {graph.get('nodes_created', 0)} nodes, {graph.get('edges_created', 0)} edges seeded"
         return "done", note + (f" ({'; '.join(result.notes)})" if result.notes else "")
 
     def history() -> tuple[str, str]:
@@ -169,6 +172,8 @@ def run_bootstrap(ctx: JobContext, *, resume: bool = True, skip_train: bool = Fa
     def train() -> tuple[str, str]:
         if skip_train:
             return "skipped", "--skip-train"
+        # a step that already died once (out of memory?) is retried with a leaner profile
+        ctx.options = {**ctx.options, "lean": str(steps.state.get("train", {}).get("crashes", 0))}
         result = jobs.train(ctx) if s.training_mode != "external" else jobs.model_sync(ctx)
         status = {"success": "done", "skipped": "skipped"}.get(result.status, "failed")
         return status, result.message

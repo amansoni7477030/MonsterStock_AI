@@ -119,6 +119,18 @@ def test_steps_that_keep_crashing_are_skipped_not_retried_forever(env):
     assert env.calls.get("train", 0) == 0 and outcome.complete
 
 
+def test_training_after_one_crash_uses_the_lean_profile(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(jobs, "train", lambda ctx: seen.append(dict(ctx.options)) or JobResult("success", "trained"))
+    env.store.kv_set_json(bs.STEPS_KEY, {"train": {"status": "running", "crashes": 0}})  # the first attempt died mid-step
+    run(env)
+    assert seen == [{"lean": "1"}]
+
+    seen.clear()
+    run(env, resume=False)  # a clean first run starts at the normal profile
+    assert seen == [{"lean": "0"}]
+
+
 def test_required_steps_are_always_retried(env):
     env.store.kv_set_json(bs.STEPS_KEY, {"history": {"status": "running", "crashes": 5}})
     _ctx, outcome = run(env)

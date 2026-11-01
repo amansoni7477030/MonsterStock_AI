@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.clock import Clock, get_clock, iso
@@ -43,21 +43,89 @@ class Intel:
         except Exception as exc:  # noqa: BLE001
             self.errors.append(f"event graph unavailable ({type(exc).__name__})")
             log.warning("event graph unavailable: %s", exc)
+        self._ensure_graph()
 
     def _now(self) -> datetime:
         return (self.clock or get_clock()).now()
 
+    # ------------------------------------------------------------------------------------------- graph
+    def _ensure_graph(self) -> None:
+        """Seed the event graph on first use and whenever the shipped seed changed (a cheap fingerprint check otherwise)."""
+        if self.graph is None:
+            return
+        try:
+            from event_graph.seed import SEED_KEY, load_seed, seed_fingerprint
+
+            if self.store.kv_get(SEED_KEY) != seed_fingerprint(load_seed()):
+                self.reseed_graph()
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"event graph seed unavailable ({type(exc).__name__})")
+            log.warning("event graph seed check failed: %s", exc)
+
+    def reseed_graph(self) -> dict[str, Any]:
+        """(Re)load the expert priors and the sector memberships of the current instrument master (idempotent; measured
+        edges are never overwritten). Call after the universe changed."""
+        if self.graph is None:
+            return {}
+        try:
+            from event_graph.seed import seed_graph
+
+            summary = seed_graph(self.store)
+            return {k: v for k, v in summary.items() if k != "unmapped"} | {"unmapped": len(summary.get("unmapped", []))}
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"event graph seeding failed ({type(exc).__name__})")
+            log.warning("event graph seeding failed: %s", exc)
+            return {}
+
+    def learn_graph(self, as_of: date) -> dict[str, Any]:
+        """Weekly: re-estimate the graph's sensitivities from market returns (never raises; the priors simply stay)."""
+        if self.graph is None:
+            return {}
+        try:
+            from automation.calendar import ExchangeCalendar
+            from automation.graph_learning import learn_graph
+
+            return learn_graph(self.store, ExchangeCalendar(self.store), as_of)
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"event graph learning failed ({type(exc).__name__})")
+            log.warning("event graph learning failed: %s", exc)
+            return {}
+
     # -------------------------------------------------------------------------------------- processing
     def process(self) -> dict[str, Any]:
+        """Turn new articles and filings into events, then check which events the market has already reacted to."""
         if self.pipeline is None:
             return {"error": "pipeline unavailable"}
         try:
             stats = self.pipeline.process_pending()
-            return dict(stats.__dict__) if hasattr(stats, "__dict__") else {"processed": str(stats)}
+            out = stats.as_dict() if hasattr(stats, "as_dict") else dict(vars(stats))
         except Exception as exc:  # noqa: BLE001
             log.exception("news processing failed")
             self.errors.append(f"news processing failed ({type(exc).__name__})")
             return {"error": type(exc).__name__}
+        out["reactions"] = self.refresh_reactions(self._now())
+        return out
+
+    def refresh_reactions(self, as_of: datetime) -> int:
+        """Fill in whether the market already reacted to recent company events (feeds the "already priced in" logic)."""
+        if self.pipeline is None:
+            return 0
+        try:
+            return int(self.pipeline.refresh_reactions(as_of))
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"market-reaction check unavailable ({type(exc).__name__})")
+            log.warning("refreshing market reactions failed: %s", exc)
+            return 0
+
+    def prune(self) -> dict[str, int]:
+        """Retention for raw news / filings and the extraction caches (events themselves are kept)."""
+        if self.pipeline is None:
+            return {}
+        try:
+            return dict(self.pipeline.prune())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("news retention failed: %s", exc)
+            return {}
 
     # ------------------------------------------------------------------------------------------ queries
     def catalysts(self, symbols: Sequence[str], as_of: datetime, limit: int = 3) -> dict[str, list[Catalyst]]:

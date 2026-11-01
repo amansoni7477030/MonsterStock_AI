@@ -79,7 +79,7 @@ SCHEDULE: tuple[ScheduleEntry, ...] = (
     E("housekeeping", "23:50", "23:59", days="any", retry_sec=900, max_attempts=2, after=("backup",), catch_up=True),
     # ---- weekly ----------------------------------------------------------------------------------------------
     E("refresh_calendar", "05:30", "07:00", days="any", retry_sec=1800, max_attempts=3, catch_up=True),
-    E("train", "02:00", "06:00", days="any", weekly_dow=5, retry_sec=3600, max_attempts=2, catch_up=True),
+    E("train", "02:00", "06:00", days="any", weekly_dow=5, retry_sec=900, max_attempts=3, catch_up=True),
     E("refresh_universe", "04:00", "12:00", days="any", weekly_dow=6, retry_sec=3600, max_attempts=2, catch_up=True),
     E("model_sync", "05:30", "07:00", days="any", retry_sec=1800, max_attempts=3, catch_up=True),
 )

@@ -65,7 +65,7 @@ the daemon derives "what is due" from the `job_runs` ledger, never from a clock 
 | 18:15 | `evaluate` | outcomes, metrics, evening report |
 | 23:30 / 23:50 | `backup`, `housekeeping` | verified online backup (+ off-box copy), retention, disk guard |
 | Sat 02:00 | `train` | walk-forward retraining (skipped in external mode) |
-| Sun 04:00 | `refresh_universe` | index / F&O membership, history for new names |
+| Sun 04:00 | `refresh_universe` | index / F&O membership, history for new names, event-graph re-seeding and weekly re-estimation of its edge sensitivities |
 | daily 05:30 | `refresh_calendar`, `model_sync` | holiday calendar; pull signed models in external mode |
 
 Critical jobs preempt non-critical ones. Non-trading days run only the "any day" jobs.
@@ -78,7 +78,7 @@ Critical jobs preempt non-critical ones. Non-trading days run only the "any day"
 | [ingestion/](../ingestion) | Yahoo, NSE archive and API clients with bounded retries, circuit breakers and rate limits; validation; universe building; freshness / data-quality gate; source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
 | [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
 | [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION` |
-| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, optional LLM), source quality, "priced in" detection; supply-chain / sector impact propagation |
+| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, optional LLM), source quality, "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
 | [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates, abstention, baselines |
 | [notifications/](../notifications) | Telegram client, report renderers (4096-char safe), idempotent delivery with a ledger and deadline guard |
@@ -198,8 +198,11 @@ Off-box backups use the same S3-compatible store and are pruned to the local ret
 Target: 1 GB RAM, 1 vCPU, 8 GB disk. The daemon is a light process (it never imports pandas, numpy or requests);
 jobs run as short-lived children inside the service's cgroup (`MemoryHigh=750M`, `MemoryMax=880M`, job RSS ceiling
 720 MB). A morning scan took about 11 s on a development PC. Training is the only heavy job: it runs weekly in a
-lighter profile on small servers (smaller fit sample, fewer history years) or externally. The installer adds a
-small swap file as a safety net; swap is not a substitute for RAM.
+lighter profile on small servers (60 000 rows per booster fit, five years of history for a 221-stock universe) or
+externally. Measured on the real data with the light profile: the feature build peaks at about 640 MB resident and the
+model training at about 565 MB. Should a run still die from memory pressure, the retry trains a leaner profile (one year
+less history and half the fit sample per failed attempt). The installer adds a small swap file as a safety net; swap is not
+a substitute for RAM.
 
 ## Design decisions
 
