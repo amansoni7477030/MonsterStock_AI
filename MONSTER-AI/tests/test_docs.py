@@ -51,3 +51,18 @@ def test_every_catalogue_entry_has_the_fields_the_database_register_needs():
 def test_required_documents_exist_and_are_not_empty(name):
     path = ROOT / name
     assert path.is_file() and len(path.read_text(encoding="utf-8")) > 500, f"{name} is missing or too short"
+
+
+def test_the_ai_sources_match_the_code_that_calls_them():
+    """The catalogue names the endpoints and the ``source_health`` rows the services really use (a typo would leave a service
+    reporting into a row nothing lists, and the health check could never warn about it)."""
+    from app.config import GROQ_BASE_URL
+    from news_intelligence.jev import JEV_BASE_URL, JEV_PATH, JevJudge
+    from news_intelligence.llm import LLMExtractor
+
+    rows = {source["source_id"]: source for source in SOURCES}
+    assert {LLMExtractor.SOURCE_ID, JevJudge.SOURCE_ID} <= set(rows)
+    assert rows[JevJudge.SOURCE_ID]["endpoint"] == JEV_BASE_URL + JEV_PATH
+    assert rows[LLMExtractor.SOURCE_ID]["endpoint"].startswith(GROQ_BASE_URL + "/chat/completions")
+    assert all(rows[source_id]["criticality"] == "optional" and rows[source_id]["backup_source"] == "rules"
+               for source_id in (LLMExtractor.SOURCE_ID, JevJudge.SOURCE_ID))  # an AI outage must never block a report

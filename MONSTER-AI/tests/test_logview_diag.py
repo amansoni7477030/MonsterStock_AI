@@ -238,6 +238,19 @@ def test_the_state_listing_shows_the_ai_counters_but_not_the_cached_answers(stor
     assert "llm:abc" not in listing and "jev:abc" not in listing and "news.sig:1" not in listing
 
 
+def test_the_bundle_carries_the_ai_counter_values_and_nothing_else_from_the_cache(store):
+    from app.diagnostics import database_state
+
+    store.kv_set("llm.calls", "17")
+    store.kv_set("jev.failures", "3")
+    store.kv_set("jev.cooldown_until", "2026-11-02T09:30:00Z")
+    store.kv_set_json("news.last_run", {"jev_used": 40, "jev_failed": 3})
+    store.kv_set("jev:deadbeef", '{"res": {"headline": "cached article text"}}')
+    section = database_state(store).split("==== ai services")[1].split("====")[1]
+    assert '"value": "17"' in section and '"value": "3"' in section and "2026-11-02T09:30:00Z" in section and "jev_used" in section
+    assert "cached article text" not in database_state(store)  # the cached answers are never dumped
+
+
 def test_diag_bundles_are_pruned_to_the_newest_few(tmp_path):
     from automation.retention import DIAG_KEEP, prune_diag_bundles
 

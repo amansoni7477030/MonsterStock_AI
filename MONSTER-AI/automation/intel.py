@@ -110,7 +110,7 @@ class Intel:
             batches = 0
             while batches < MAX_PROCESS_BATCHES:
                 batches += 1
-                stats = self.pipeline.process_pending(PROCESS_BATCH)
+                stats = self.pipeline.process_pending(PROCESS_BATCH, new_run=batches == 1)  # one AI run per job, not per batch
                 counts = stats.as_dict() if hasattr(stats, "as_dict") else dict(vars(stats))
                 for key, value in counts.items():
                     totals[key] = totals.get(key, 0) + value

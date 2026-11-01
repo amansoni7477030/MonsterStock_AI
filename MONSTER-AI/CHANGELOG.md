@@ -25,6 +25,10 @@ server with native systemd (no containers).
   `DATA_MAX_MB`, `BACKUP_MAX_MB`, `EVENT_RETENTION_DAYS`, `QUOTE_RETENTION_DAYS`, `RECORD_RETENTION_DAYS`, `OPS_RETENTION_DAYS`,
   `LOG_FORMAT`, `LOG_RETENTION_DAYS`, `LOG_MAX_MB`. `MONSTER_TIMEZONE` now selects the zone of **log stamps only** (market logic is
   always IST).
+- **Optional AI settings** (everything stays off until a key is set): `GROQ_API_KEY`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT`,
+  `LLM_MAX_SECONDS_PER_RUN`, `LLM_MAX_OUTPUT_TOKENS`, `TYPESAFE_API_KEY`, `JEV_MODEL`, `JEV_TIMEOUT_SEC`, `JEV_MAX_ITEMS_PER_RUN`,
+  `JEV_MIN_CONFIDENCE`. `LLM_API_BASE` + `LLM_MODEL` still select another OpenAI-compatible provider; `GROQ_API_KEY` is never sent to
+  any endpoint but Groq's. After adding a key: `sudo systemctl restart monster-ai` and `sudo monster-ai ai-test`.
 - **New dependency** `curl_cffi` (binary wheels for linux x86-64 and aarch64, Python 3.10-3.13; the installer and the CI wheel guard
   cover it).
 - **logrotate** no longer touches the application's own log files (they are daily files pruned by the application); the installer
@@ -86,10 +90,20 @@ server with native systemd (no containers).
   uncertainty of its own held-out top names (an absolute ceiling made STRONG unreachable on real data), and the "no setup" reason
   names the real cause with counts. The news / event-graph enrichment is applied to the names the report can actually list.
 - **News and event graph** (`news_intelligence/`, `event_graph/`): deduplication, entity linking, rule-based event
-  extraction with an optional LLM (every claim needs a verifiable quote), source quality, "already priced in" detection
+  extraction with optional Groq / Jev enrichment (see the next entry), source quality, "already priced in" detection
   (market reactions are refreshed after each news run and again at the final scan), supply-chain and sector impact
   propagation with a seeded expert-prior graph (seeded automatically, re-seeded when the universe changes, and re-measured
   weekly from returns with FDR control; edges without a price series stay labelled priors).
+- **Optional AI for the news layer** (`news_intelligence/llm.py`, `jev.py`, `remote.py`, `ai_check.py`): **Groq** (`openai/gpt-oss-120b`,
+  falling back to `openai/gpt-oss-20b`; strict JSON-schema output with a per-model capability ladder; every claim needs a verbatim
+  quote) and **Jev** (TypeSafe AI, `jev-1.14.0`: one request answers five typed questions - event type, rumour, denial, severity and
+  direction - with calibrated probabilities; merged conservatively: it may add information, never clear a rule-set rumour flag or flag
+  an official filing). Both share one set of rails: a 14-day result cache by text, per-run call and wall-clock budgets, `Retry-After`
+  handling, model fallback, a rate-limit cooldown that survives between runs, a circuit breaker, per-service coverage flags and
+  `source_health` rows (so repeated failures raise `health_source_<id>`). Items the rules already discard are never sent; only public
+  news text leaves the server. Where both answer, a direction on which they disagree is left unknown. They improve the news evidence
+  (catalysts, rumour flags, chains), **not** the calibrated forecast. `monster-ai ai-test` checks the keys with one made-up item
+  (`--list-only` spends no tokens) and `doctor` probes them for free.
 - **Notifications** (`notifications/`): Telegram client, 4096-character-safe renderers (pre-open, final, evening, alerts,
   failure notices, failed-service alerts), idempotent delivery ledger, deadline guard, queued alerts flushed when Telegram returns; catalysts show their
   provenance (rumour flag, source class, independent sources, conflicts) and the regime line shows GIFT Nifty while its quote is fresh.
@@ -122,9 +136,9 @@ server with native systemd (no containers).
   lost server.
 - **Dashboard (optional)** (`dashboard/`): read-only FastAPI view, loopback by default.
 - **CLI** (`app/cli.py`): `init`, `doctor`, `bootstrap`, `daemon`, `run-job`, `jobs`, `scan`, `evaluate`, `train`, `backtest`, `models`,
-  `backup`, `health`, `storage`, `logs`, `diag`, `telegram-setup`, `telegram-test`, `telegram-preview`, `dashboard`, `env-example`, `version`.
-- **Documentation**: [README](README.md), [architecture](docs/ARCHITECTURE.md) with 18 Mermaid diagrams (context, whole-code architecture, data
-  flow, timetable, scan sequence, training, scheduler / bootstrap state machines, HTTP stack, bulk fetching, calendar, time zones,
+  `backup`, `health`, `storage`, `logs`, `diag`, `telegram-setup`, `telegram-test`, `telegram-preview`, `ai-test`, `dashboard`, `env-example`, `version`.
+- **Documentation**: [README](README.md), [architecture](docs/ARCHITECTURE.md) with 20 Mermaid diagrams (context, whole-code architecture, data
+  flow, timetable, scan sequence, news and the optional AI services, training, scheduler / bootstrap state machines, HTTP stack, bulk fetching, calendar, time zones,
   retention, logging, deployment), [operations runbook](docs/OPERATIONS.md), [deployment guide](deployment/README.md), the generated
   [data-source catalogue](docs/DATA_SOURCES.md) and `.env.example` (both checked against the code by tests) and the
   [blueprint traceability matrix](docs/BLUEPRINT_TRACEABILITY.md); a test checks every diagram's structure and every link and anchor.
@@ -218,3 +232,6 @@ small in every case except the first; the gain is less to run, maintain and expl
   limits table in [docs/BLUEPRINT_TRACEABILITY.md](docs/BLUEPRINT_TRACEABILITY.md).
 - Lunar-calendar exchange holidays of a year whose official list is not yet published are confirmed live on the day (no report is sent,
   the operator is told), not predicted.
+- The Groq and Jev integrations were built and tested against scripted responses, never against the live services (no keys existed at
+  build time); `sudo monster-ai ai-test` is the first live test. Groq retires models from time to time, so a model name may need
+  updating (the fallback model and `ai-test` surface it). Jev judges news; it was not evaluated as a price forecaster.

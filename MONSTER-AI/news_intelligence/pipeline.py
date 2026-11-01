@@ -192,16 +192,22 @@ class NewsPipeline:
         self._graph_repo = GraphRepository(store)
         self._cache: dict[tuple, Any] = {}
         self._retries: dict[str, int] = {}
+        self._marks: dict[str, tuple[int, int, int, int]] = {}  # AI counters when the current call started
 
     # ================================================================================== processing
-    def process_pending(self, max_items: int = 600) -> ProcessStats:
+    def process_pending(self, max_items: int = 600, *, new_run: bool = True) -> ProcessStats:
         """Cluster unprocessed filings and articles into events; returns counts. Never duplicates events on re-run. An item
-        that raises stays unprocessed for the next run (an item is attempted once per run) until ``MAX_ATTEMPTS`` is reached."""
+        that raises stays unprocessed for the next run (an item is attempted once per run) until ``MAX_ATTEMPTS`` is reached.
+        ``new_run=False`` continues the AI run of the previous call: a job that drains a backlog in several batches keeps ONE
+        call budget, time box and circuit breaker for the whole job (the counts returned are still those of this call)."""
         started = self.clock.monotonic()
         stats = ProcessStats()
-        for service in (self.llm, self.jev):
-            if service is not None:
-                service.start_run()
+        services = {"llm": self.llm, "jev": self.jev}
+        if new_run:
+            for service in services.values():
+                if service is not None:
+                    service.start_run()
+        self._marks = {name: service.mark() for name, service in services.items() if service is not None}
         now = self.clock.now()
         clusterer = self._load_clusterer(now)
         self._retries = self._load_retries()
@@ -288,16 +294,12 @@ class NewsPipeline:
         self._save_retries()
 
     def _finish(self, stats: ProcessStats, started: float, now: datetime) -> ProcessStats:
-        if self.llm is not None:
-            stats.llm_used = max(0, self.llm.run_calls - self.llm.run_failures)
-            stats.llm_failed = self.llm.run_failures
-            stats.llm_cached = self.llm.run_cache_hits
-            stats.llm_skipped_budget = self.llm.run_budget_skipped
-        if self.jev is not None:
-            stats.jev_used = max(0, self.jev.run_calls - self.jev.run_failures)
-            stats.jev_failed = self.jev.run_failures
-            stats.jev_cached = self.jev.run_cache_hits
-            stats.jev_skipped_budget = self.jev.run_budget_skipped
+        for name, mark in self._marks.items():  # what the AI services did during THIS call (a job may span several)
+            calls, failures, hits, skipped = getattr(self, name).since(mark)
+            setattr(stats, f"{name}_used", max(0, calls - failures))
+            setattr(stats, f"{name}_failed", failures)
+            setattr(stats, f"{name}_cached", hits)
+            setattr(stats, f"{name}_skipped_budget", skipped)
         self._flag_coverage()
         stats.elapsed_sec = round(self.clock.monotonic() - started, 3)
         self.store.kv_set_json("news.last_run", {"at": iso(now), **stats.as_dict()})

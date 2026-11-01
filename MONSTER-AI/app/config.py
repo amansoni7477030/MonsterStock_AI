@@ -200,9 +200,10 @@ VARS: tuple[Var, ...] = (
         "Reasoning effort for reasoning models such as gpt-oss (low = fast and cheap, enough for extraction). Empty = not sent.",
         "LLM"),
     Var("llm_timeout_sec", "LLM_TIMEOUT_SEC", "40", _float, "LLM request timeout.", "LLM"),
-    Var("llm_max_articles_per_run", "LLM_MAX_ARTICLES_PER_RUN", "60", _int, "Cost cap per extraction run.", "LLM"),
+    Var("llm_max_articles_per_run", "LLM_MAX_ARTICLES_PER_RUN", "60", _int,
+        "Cost cap: articles sent to the LLM per news job (a job drains a backlog in up to four batches that share it).", "LLM"),
     Var("llm_max_seconds_per_run", "LLM_MAX_SECONDS_PER_RUN", "240", _int,
-        "Wall-clock cap on the LLM calls of one news run (the rest of the run uses the rules), so rate limits can never delay "
+        "Wall-clock cap on the LLM calls of one news job (the rest of the job uses the rules), so rate limits can never delay "
         "the morning schedule.", "LLM"),
     Var("llm_max_output_tokens", "LLM_MAX_OUTPUT_TOKENS", "1200", _int,
         "Max tokens per extraction response (reasoning models spend part of it on thinking).", "LLM"),
@@ -213,7 +214,8 @@ VARS: tuple[Var, ...] = (
     Var("jev_model", "JEV_MODEL", "jev-1.14.0", _opt_str,
         "Jev model id. A versioned id keeps the confidence thresholds valid; the alias jev-latest moves with releases.", "Jev"),
     Var("jev_timeout_sec", "JEV_TIMEOUT_SEC", "20", _float, "Jev request timeout.", "Jev"),
-    Var("jev_max_items_per_run", "JEV_MAX_ITEMS_PER_RUN", "200", _int, "Cost cap: news items judged per run.", "Jev"),
+    Var("jev_max_items_per_run", "JEV_MAX_ITEMS_PER_RUN", "200", _int,
+        "Cost cap: news items judged by Jev per news job (a job drains a backlog in up to four batches that share it).", "Jev"),
     Var("jev_min_confidence", "JEV_MIN_CONFIDENCE", "0.5", _float,
         "A Jev answer is used only when its confidence reaches this value (0-1; below it the rules decide).", "Jev"),
     # -- training / governance ---------------------------------------------------------------------------

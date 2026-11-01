@@ -128,6 +128,15 @@ class RemoteJudge:
         self.tripped = False
         self._run_started = self.clock.monotonic()
 
+    def mark(self) -> tuple[int, int, int, int]:
+        """The run counters now (calls, failures, cache hits, budget skips): :meth:`since` turns a mark into what happened
+        after it, so one batch of a multi-batch run can be reported on its own."""
+        return self.run_calls, self.run_failures, self.run_cache_hits, self.run_budget_skipped
+
+    def since(self, mark: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        calls, failures, hits, skipped = self.mark()
+        return calls - mark[0], failures - mark[1], hits - mark[2], skipped - mark[3]
+
     def elapsed(self) -> float:
         """Seconds since ``start_run()`` (0 when no run has started)."""
         return 0.0 if self._run_started is None else self.clock.monotonic() - self._run_started

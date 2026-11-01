@@ -99,6 +99,7 @@ calibrated"* and caps every name at WATCH.
 | `run-job NAME [--force] [--dry-run] [--opt K=V]` | run one scheduled job by hand (for example `refresh_calendar`) |
 | `telegram-test`, `telegram-setup` | test message; discover the chat id |
 | `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message (made-up data, each marked *SAMPLE PREVIEW*) |
+| `ai-test [--service llm\|jev] [--list-only] [--json]` | check the optional Groq / Jev keys: one made-up news item through the real code, `OK` or exactly why not (`--list-only` spends no tokens), see [the AI services](#the-ai-services-groq-and-jev) |
 | `bootstrap --resume` | continue a first-run setup that stopped |
 | `version` | the version and the **code fingerprint** (`1.0.0+3fa9c1d2`) that is stamped on every frozen report and model |
 | `dashboard` | optional read-only web view (loopback; use an SSH tunnel) |
@@ -289,7 +290,8 @@ counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.co
 equivalents, plus `jev_retyped`, `jev_rumours`, `jev_denials`).
 
 **Cost and limits.** Each distinct article is sent at most once in 14 days (results are cached by text); items the rules already
-call irrelevant are never sent; each run is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`) and time-boxed. Groq has a
+call irrelevant are never sent; each news job is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`) and time-boxed (240 s / 180 s; a backlog
+drained in several batches shares the cap). Groq has a
 free tier with per-model limits (tokens per minute bind first, which is why the fallback model adds headroom); paid use and Jev are
 priced per token by the providers (at the time of writing Jev was a few cents per million input tokens, which at these caps is well
 under a dollar a month): check their price lists.

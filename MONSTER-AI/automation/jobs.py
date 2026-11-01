@@ -208,7 +208,19 @@ def collect_news(ctx: JobContext) -> JobResult:
         metrics["filings_window"] = f"{start}..{end}"
     metrics["processed"] = ctx.intel().process()
     healthy = rss.success_ratio >= 0.5
-    return JobResult("success" if healthy else "failed", f"{rss.ok}/{rss.attempted} feeds ok, {rss.new_items} new items", metrics)
+    message = f"{rss.ok}/{rss.attempted} feeds ok, {rss.new_items} new items" + ai_note(metrics["processed"])
+    return JobResult("success" if healthy else "failed", message, metrics)
+
+
+def ai_note(processed: dict[str, Any]) -> str:
+    """``; AI: llm 12 used, 3 cached; jev 40 used, 1 failed`` for the optional AI services that did something in this news job
+    (empty when none did), so ``monster-ai jobs`` and the log show each morning what they contributed."""
+    parts = []
+    for name in ("llm", "jev"):
+        used, cached, failed = (int(processed.get(f"{name}_{key}") or 0) for key in ("used", "cached", "failed"))
+        if used or cached or failed:
+            parts.append(f"{name} {used} used" + (f", {cached} cached" if cached else "") + (f", {failed} failed" if failed else ""))
+    return "; AI: " + "; ".join(parts) if parts else ""
 
 
 def filings_window(ctx: JobContext) -> tuple[date, date]:

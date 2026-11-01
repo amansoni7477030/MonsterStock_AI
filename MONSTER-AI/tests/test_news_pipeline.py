@@ -624,6 +624,20 @@ def test_jev_budget_and_cache_show_up_in_the_run_stats(store, jev_settings, fake
     assert len(session.calls) == 4 and len(events(store)) == 4
 
 
+def test_a_continued_run_shares_one_budget_and_each_call_reports_only_its_own_counts(store, jev_settings, fake_clock):
+    limited = dataclasses.replace(jev_settings, jev_max_items_per_run=2)
+    pipe, session, _ = jev_pipe(store, limited, fake_clock, jev_response())
+    for i, name in enumerate(("TCS", "Infosys", "Wipro", "Sun Pharma")):
+        add_deal(store, i, name=name)
+    first = pipe.process_pending(max_items=2)
+    second = pipe.process_pending(max_items=2, new_run=False)  # the second batch of the same job
+    assert (first.jev_used, first.jev_skipped_budget) == (2, 0)
+    assert (second.jev_used, second.jev_skipped_budget) == (0, 2) and len(session.calls) == 2  # the job's budget is spent
+    assert count(store, "news_raw", "processed = 0") == 0 and len(events(store)) == 4  # nothing is lost: the rules covered them
+    add_deal(store, 9, name="Infosys")
+    assert pipe.process_pending().jev_used == 1  # a new run (the default) starts with a fresh budget
+
+
 def test_items_the_rules_find_irrelevant_cost_no_ai_calls(store, both_settings, fake_clock):
     pipe, session, _ = jev_pipe(store, both_settings, fake_clock, jev_response(), llm=[ok(llm_reply())])
     add_article(store, 0, "Weekend weather outlook for the coast", "Light showers are expected over the coast.", source="Mint",

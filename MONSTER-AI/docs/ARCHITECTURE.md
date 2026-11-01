@@ -321,7 +321,7 @@ sequenceDiagram
 | Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
 | Never | invents evidence | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
 | Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
-| Caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), a 14-day cache by text | `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, a 14-day cache by text, company and source class |
+| Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, company and source class |
 
 Where both answer, the direction of the company in focus is the mean of the two readings when they agree and *unknown* (0) when they
 point opposite ways; a direction offered for a rumour or a denial is halved, as the rules do. The company asked about is the one

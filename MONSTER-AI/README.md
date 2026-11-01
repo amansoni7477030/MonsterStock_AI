@@ -288,7 +288,8 @@ How to think about them:
   calendar features; news is evidence shown beside it (catalysts, rumour flags, chains, "already priced in"). The AI makes that
   evidence more accurate: it recognises events the rules cannot, flags rumours and denials, and gives a calibrated second opinion
   on severity and direction. Where Groq and Jev disagree on a direction it is left unknown.
-- **They can never block or corrupt a report.** Results are cached for 14 days by text; each run has a call and a time budget; a
+- **They can never block or corrupt a report.** Results are cached for 14 days by text; each news job has a call and a time budget (a
+  backlog drained in several batches shares it); a
   provider's `Retry-After` is honoured, a rate-limited Groq model hands over to the fallback model, an exhausted quota starts a
   cooldown that survives between runs, and a rejected key stops the service for the run. Any failure falls back to the rules, the
   report's coverage note names the degraded service, and `monster-ai health` warns after repeated failures.

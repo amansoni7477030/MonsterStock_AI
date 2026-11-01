@@ -98,10 +98,11 @@ class Batches:
     """A pipeline whose ``process_pending`` reports scripted batch sizes (a backlog being drained)."""
 
     def __init__(self, sizes, errors=0):
-        self.sizes, self.calls, self.errors = list(sizes), [], errors
+        self.sizes, self.calls, self.new_runs, self.errors = list(sizes), [], [], errors
 
-    def process_pending(self, max_items=600):
+    def process_pending(self, max_items=600, *, new_run=True):
         self.calls.append(max_items)
+        self.new_runs.append(new_run)
         size = self.sizes.pop(0) if self.sizes else 0
         counts = {"articles_in": size, "filings_in": 0, "events_created": size // 2, "errors": self.errors}
         return SimpleNamespace(as_dict=lambda: dict(counts))
@@ -116,6 +117,7 @@ def test_a_backlog_is_drained_in_bounded_batches_and_the_counts_are_summed(intel
     intel.pipeline = Batches([600, 600, 250])
     totals = intel.process()
     assert intel.pipeline.calls == [intel_module.PROCESS_BATCH] * 3  # stops as soon as a batch is not full
+    assert intel.pipeline.new_runs == [True, False, False]  # the AI budgets belong to the job, not to a batch
     assert totals["articles_in"] == 1450 and totals["events_created"] == 725 and totals["batches"] == 3 and totals["reactions"] == 3
 
 
