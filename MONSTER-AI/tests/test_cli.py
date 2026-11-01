@@ -55,6 +55,45 @@ def test_doctor_offline_reports_ready_in_a_clean_environment(cli_env, capsys):
     assert run(["doctor", "--offline"]) == 0 and "READY" in capsys.readouterr().out
 
 
+def test_doctor_names_the_reason_when_the_bot_check_fails(cli_env, monkeypatch):
+    from types import SimpleNamespace
+
+    import app.doctor as doctor
+    import ingestion.http as http_mod
+    import notifications.telegram as tg
+    from app.config import load_settings
+    from app.errors import DataUnavailable
+
+    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+
+    class FakeHttp:
+        @classmethod
+        def from_settings(cls, *args, **kwargs):
+            return cls()
+
+        def get(self, url, **kwargs):
+            return SimpleNamespace(status=200, headers={})
+
+        def close(self):
+            pass
+
+    class BlockedBot:
+        def __init__(self, settings):
+            pass
+
+        def get_me(self):
+            raise DataUnavailable("telegram", f"HTTP 403: response was not Telegram JSON (bot{token})", retryable=True)
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setattr(http_mod, "HttpClient", FakeHttp)
+    monkeypatch.setattr(tg, "TelegramClient", BlockedBot)
+    report = doctor.DoctorReport()
+    doctor._network(report, load_settings())
+    bot = next(check for check in report.checks if check.name == "telegram bot")
+    assert bot.status == "fail" and "response was not Telegram JSON" in bot.detail
+    assert token not in bot.detail
+
+
 def test_doctor_fails_on_invalid_configuration(cli_env, monkeypatch, capsys):
     monkeypatch.setenv("TOP_N", "99")
     assert run(["doctor", "--offline"]) == 1

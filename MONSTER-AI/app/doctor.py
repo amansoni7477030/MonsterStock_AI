@@ -11,6 +11,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from app.config import ConfigError, Settings, load_settings, validate
+from app.logging_setup import redact
 from app.resources import check_resources, disk_info, memory_info
 
 MIN_PYTHON = (3, 10)
@@ -190,7 +191,8 @@ def _network(report: DoctorReport, s: Settings) -> None:
             me = TelegramClient(s).get_me()
             report.add("telegram bot", "ok", f"@{me.get('username', '?')}")
         except Exception as exc:  # noqa: BLE001
-            report.add("telegram bot", "fail", f"getMe failed: {type(exc).__name__}")
+            reason = " ".join(redact(str(exc)).split())[:150] or type(exc).__name__
+            report.add("telegram bot", "fail", f"getMe failed: {reason}")
 
 
 def _clock_skew(report: DoctorReport, header: str | None) -> None:
