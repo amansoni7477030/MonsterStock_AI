@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.clock import IST
+from app.clock import IST, UTC
 
 SOURCE_LABELS = {
     "exchange_filing": "exchange filing", "official": "official statement", "company": "company statement",
@@ -41,6 +41,7 @@ MAX_FACTS = 3
 MAX_FACT_CHARS = 180
 MAX_WEB_SOURCES = 5
 MAX_OUTLETS = 10
+PUBLISHED_YEARS = (1990, 2100)  # a publication time outside this is a feed's placeholder, not a date to show a model
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _LINK = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
@@ -78,6 +79,13 @@ def _count(value: Any, high: int) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return 0
     return max(0, min(high, int(value)))
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    """Instants are UTC in this project: a naive one is read as UTC, never as the zone of the machine that runs the code."""
+    if moment is None or moment.tzinfo is not None:
+        return moment
+    return moment.replace(tzinfo=UTC)
 
 
 def stamp(moment: datetime) -> str:
@@ -174,6 +182,15 @@ class NewsContext:
     mentioned: tuple[str, ...] = ()  # ``Name (SYMBOL)`` of the companies the entity matcher found in the text
     web: WebBrief | None = None
 
+    def __post_init__(self) -> None:
+        # Both instants become timezone-aware UTC (a naive one would otherwise break the age and be read in the machine's zone),
+        # and a publication time that cannot be real is dropped instead of being shown to a model.
+        published = _aware(self.published_at)
+        if published is not None and not PUBLISHED_YEARS[0] <= published.year <= PUBLISHED_YEARS[1]:
+            published = None
+        object.__setattr__(self, "published_at", published)
+        object.__setattr__(self, "now", _aware(self.now))
+
     def with_web(self, brief: WebBrief | None) -> NewsContext:
         return replace(self, web=brief)
 
@@ -185,12 +202,13 @@ class NewsContext:
         return hours if hours >= 0.0 else None
 
     def fingerprint(self) -> str:
-        """What of this context can change an answer and stays the same between runs: it goes into the cache keys. The time of the
-        check and the age are left out (they would make a cache useless); the publication day, the source and the web brief are in."""
-        day = self.published_at.astimezone(IST).date().isoformat() if self.published_at else ""
+        """What of this context can change an answer and stays the same between runs: it goes into the cache keys. Everything the
+        prompt shows is in (the publication minute, the source, the matched companies, the web brief...) except the time of the
+        check and the age, which would make a cache useless."""
+        published = self.published_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ") if self.published_at else ""
         web = self.web.digest() if self.web is not None else ""
-        parts = (self.kind, self.source_class or "", self.source_tier or "", self.domain or "", self.category or "", day,
-                 self.company or "", self.sector or "", web)
+        parts = (self.kind, self.source_class or "", self.source_tier or "", self.domain or "", one_line(self.source or "", 80),
+                 self.category or "", published, self.company or "", self.sector or "", ";".join(self.mentioned), web)
         return "|".join(parts)
 
     def _source_text(self) -> str:

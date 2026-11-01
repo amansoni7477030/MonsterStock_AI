@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from news_intelligence import pipeline as pl
+from news_intelligence.context import WebBrief, host_of
 from news_intelligence.dedup import event_confidence
 from news_intelligence.events import EventDraft, apply_refutation, classify_rules
 from news_intelligence.jev import JevJudge
@@ -743,6 +744,60 @@ def test_a_contradictory_web_answer_is_not_acted_upon(store, groq_settings, fake
     stats = pipe.process_pending()
     (event,) = events(store)
     assert stats.web_refuted == 0 and event["severity"] == classify_rules(*RUMOUR, category=None, source_kind="business_media").severity
+
+
+@pytest.mark.parametrize(("sources", "acted"), [
+    (["reuters.com"], True), (["www.livemint.com"], True), (["nseindia.com"], True), (["bseindia.com", "attacker.example"], True),
+    (["sebi.gov.in"], True),  # an official body, by suffix
+    (["attacker.example"], False),  # nobody can tell who wrote that page
+    (["news.google.com"], False), (["x.com"], False),  # an aggregator and social media are not a denial's source
+    (["reuters.com.attacker.example"], False),  # a look-alike of a reputable host
+])
+def test_a_denial_changes_the_item_only_when_it_names_a_reputable_publisher(store, groq_settings, fake_clock, sources, acted):
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[web_reply(sources=sources)])
+    add_rumour(store)
+    stats = pipe.process_pending()
+    (event,) = events(store)
+    baseline = classify_rules(*RUMOUR, category=None, source_kind="business_media")
+    refuted = classify_rules(*RUMOUR, category=None, source_kind="business_media")
+    apply_refutation(refuted)
+    assert stats.web_refuted == (1 if acted else 0) and event["severity"] == (refuted.severity if acted else baseline.severity)
+    # either way the readers saw what the search said, and the evidence keeps it for the audit trail
+    assert json.loads(event["evidence_json"])[0]["web"]["sources"] == [host_of(h) for h in sources]
+    assert "Web check" in sessions.llm.calls[0]["json"]["messages"][1]["content"]
+
+
+def test_the_reputable_hosts_are_the_registrys_exchanges_officials_wires_and_business_media():
+    def brief(*hosts):
+        return WebBrief("no", 1, True, False, (), hosts)
+
+    assert pl._reputable(brief("reuters.com")) and pl._reputable(brief("x.example", "economictimes.indiatimes.com"))
+    assert not pl._reputable(brief()) and not pl._reputable(brief("attacker.example", "news.google.com", "x.com"))
+    assert pl.REPUTABLE_TIERS == {"exchange_filing", "official", "company", "wire", "business_media"}
+
+
+def test_a_web_service_handed_to_a_replay_is_never_used(store, groq_settings, fake_clock):
+    add_instruments(store)
+    web_session = FakeSession(web_reply())
+    web = WebResearcher(groq_settings, session=web_session, clock=fake_clock)
+    llm = LLMExtractor(groq_settings, session=FakeSession(FakeResponse(500)), clock=fake_clock)
+    replay = NewsPipeline(store, groq_settings, clock=fake_clock, llm=llm, web=web, point_in_time_edges=True)
+    assert replay.web is None  # injection does not bypass the rule
+    add_rumour(store)
+    stats = replay.process_pending()
+    assert web_session.calls == [] and stats.web_used == 0 and events(store)
+    live = NewsPipeline(store, groq_settings, clock=fake_clock, llm=llm, web=web)
+    assert live.web is web
+
+
+def test_the_llms_long_horizon_is_shortened_for_a_rumour_like_the_rules_do(store, groq_settings, fake_clock):
+    reply = llm_reply(event_type="merger_acquisition", horizon="months", evidence_quote="The talks are at an early stage",
+                      entities=[{"id": "RELIANCE", "polarity": 0.3}])
+    pipe, _ = ai_pipe(store, groq_settings, fake_clock, llm=[ok(reply)])
+    add_rumour(store)
+    pipe.process_pending()
+    (event,) = events(store)
+    assert event["rumour"] == 1 and event["horizon"] == "weeks"
 
 
 def test_the_web_check_reaches_jev_as_well(store, groq_settings, fake_clock):

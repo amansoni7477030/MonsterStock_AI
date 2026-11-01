@@ -280,6 +280,8 @@ def merge_jev(draft: EventDraft, judgment: JevJudgment, *, min_confidence: float
             draft.severity = round(draft.severity * RUMOUR_SEVERITY, 3)
             draft.confidence = round(draft.confidence * 0.8, 3)
             draft.polarity_hint = round(draft.polarity_hint * 0.5, 3)
+            if draft.horizon == "months":  # the rules shorten the horizon of every rumour
+                draft.horizon = "weeks"
             effect.rumour_flagged = True
     if judgment.severity_confidence >= min_confidence:
         draft.severity = round(0.5 * draft.severity + 0.5 * judgment.severity, 3)
@@ -349,7 +351,8 @@ class JevJudge(RemoteJudge):
                 raise OutOfTime()
             try:
                 status, payload, _text, headers = self.send(
-                    "POST", self._url(), self.settings.typesafe_api_key, float(self.settings.jev_timeout_sec), body
+                    "POST", self._url(), self.settings.typesafe_api_key,
+                    self.budgeted_timeout(float(self.settings.jev_timeout_sec)), body,
                 )
             except (requests.RequestException, OSError) as exc:
                 last = f"transport error {type(exc).__name__}"
@@ -393,8 +396,13 @@ class JevJudge(RemoteJudge):
             return cached
         if not self._admit(int(self.settings.jev_max_items_per_run)):
             return None
-        body = build_request(str(self.settings.jev_model), title, text, company=company, source_kind=source_kind, context=context)
-        judgment = self._attempt(lambda: parse_response(self._request(body), company_in_focus=company is not None))
+        judgment = self._attempt(
+            lambda: parse_response(
+                self._request(build_request(str(self.settings.jev_model), title, text, company=company,
+                                            source_kind=source_kind, context=context)),
+                company_in_focus=company is not None,
+            )
+        )
         if judgment is not None:
             self._cache_write(key, judgment.to_dict())
         return judgment

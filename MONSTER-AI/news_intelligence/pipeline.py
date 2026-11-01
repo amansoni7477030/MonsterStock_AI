@@ -87,6 +87,10 @@ WEB_CHECK_TYPES = frozenset({
     "management_change",
 })
 WEB_MIN_SEVERITY = 0.4  # the rules' severity below which even such a story is not worth a web check
+# A denial the web check reports changes a draft only when it names a host the source registry knows as reputable: an exchange,
+# an official body, a wire service, a business newspaper. The search model's report of where it saw the denial is otherwise
+# unverifiable (a page can be written to look like one), and acting on it would let anyone suppress a real catalyst.
+REPUTABLE_TIERS = frozenset({"exchange_filing", "official", "company", "wire", "business_media"})
 BarsProvider = Callable[[str, str | None, str | None], pd.DataFrame]
 
 
@@ -183,6 +187,12 @@ def _wants_web(draft: EventDraft, source_class: str) -> bool:
     return draft.is_rumour or (draft.event_type in WEB_CHECK_TYPES and draft.severity >= WEB_MIN_SEVERITY)
 
 
+def _reputable(brief: WebBrief) -> bool:
+    """True when at least one host the brief relied on is a publisher the source registry knows to be reputable."""
+    registry = get_registry()
+    return any((matched := registry.domain_match(host)) is not None and matched[1] in REPUTABLE_TIERS for host in brief.sources)
+
+
 def _failing(service: RemoteJudge) -> bool:
     """True when an AI service is refusing us (cooldown) or failed often enough in this run that rules covered the items.
     Running out of the run's time budget is not a failure."""
@@ -211,8 +221,13 @@ class NewsPipeline:
         self.resolver = resolver or EntityResolver(store)
         self.llm = llm if llm is not None else (LLMExtractor(settings, clock=self.clock) if settings.llm_configured else None)
         self.jev = jev if jev is not None else (JevJudge(settings, clock=self.clock) if settings.jev_configured else None)
-        live_web = settings.llm_web_configured and not point_in_time_edges
-        self.web = web if web is not None else (WebResearcher(settings, clock=self.clock) if live_web else None)
+        self.web: WebResearcher | None
+        if point_in_time_edges:  # a replay never searches the web, however it was assembled: the web of today is not the web then
+            self.web = None
+        elif web is not None:
+            self.web = web
+        else:
+            self.web = WebResearcher(settings, clock=self.clock) if settings.llm_web_configured else None
         for service in (self.llm, self.jev, self.web):
             if service is not None:
                 service.bind(store=store, resolver=self.resolver)
@@ -550,7 +565,7 @@ class NewsPipeline:
         if self.web is None or not worth_asking or not _wants_web(draft, source_class_of(source_kind)):
             return None
         brief = self.web.research(title, body, context)
-        if brief is not None and brief.refutes and apply_refutation(draft):
+        if brief is not None and brief.refutes and _reputable(brief) and apply_refutation(draft):
             stats.web_refuted += 1
         return brief
 
@@ -599,8 +614,8 @@ class NewsPipeline:
         if verified:
             if result.severity is not None:
                 draft.severity = round(0.5 * (draft.severity + result.severity), 3)
-            if result.horizon:
-                draft.horizon = result.horizon
+            if result.horizon:  # an unconfirmed report is not a long-term fact: the rules' own policy for rumours
+                draft.horizon = "weeks" if draft.is_rumour and result.horizon == "months" else result.horizon
             draft.confidence = max(draft.confidence, result.confidence)
         present = {e.id for e in entities}
         lowered = scan.lower()

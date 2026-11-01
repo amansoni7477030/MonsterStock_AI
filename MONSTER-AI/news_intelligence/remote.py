@@ -32,6 +32,7 @@ T = TypeVar("T")
 
 RETRY_AFTER_CAP_SEC = 30.0  # a short rate-limit wait is slept through; a longer one is a quota and opens a cooldown
 COOLDOWN_MAX_SEC = 6 * 3600.0  # never trust a "come back in 20 hours" for more than this: re-probe with one request instead
+MIN_ATTEMPT_SEC = 3.0  # a request that would get less of the run's time budget than this is not started
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
 _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
@@ -159,6 +160,17 @@ class RemoteJudge:
         if self._run_started is not None and self.max_seconds > 0 and self.elapsed() + seconds > self.max_seconds:
             raise OutOfTime()
         self.clock.sleep(seconds)
+
+    def budgeted_timeout(self, limit: float, minimum: float = MIN_ATTEMPT_SEC) -> float:
+        """The timeout for the next request: ``limit``, cut to what is left of the run's wall-clock budget so that no single
+        request can run past it. Raises :class:`OutOfTime` when less than ``minimum`` seconds are left (a request that cannot
+        finish is not started). Without a run there is no budget and ``limit`` is returned unchanged."""
+        if self._run_started is None or self.max_seconds <= 0:
+            return limit
+        remaining = self.max_seconds - self.elapsed()
+        if remaining < minimum:
+            raise OutOfTime()
+        return min(limit, remaining)
 
     # --------------------------------------------------------------------------------------- counters
     def _bump(self, key: str, amount: int = 1) -> None:

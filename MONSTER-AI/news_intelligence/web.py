@@ -13,12 +13,14 @@ the web crosses over; a page that says "ignore your instructions" can at most co
 
 Safety rails (the service is optional enrichment: any failure means the item is judged without the web check):
 
-* its own call budget (``LLM_WEB_MAX_PER_RUN``), wall-clock share (30 % of the LLM time box), circuit breaker, cooldown, result
-  cache and health row, so a slow or refused web search never uses up the extraction's budget or trips its circuit;
+* its own call budget (``LLM_WEB_MAX_PER_RUN``), wall-clock share (30 % of the LLM time box; a hard bound: each request is cut to what
+  is left of it), circuit breaker, cooldown, result cache and health row, so a slow or refused web search never uses up the
+  extraction's budget or trips its circuit (they do share Groq's per-model token quota: when it is spent the extraction hands over
+  to its fallback model and this service backs off);
 * a request the plan cannot take (HTTP 413: a web search reads far more tokens than the free tier's per-minute limit) or a model
   that rejects the tool backs the service off for six hours instead of failing on every run;
 * the reply is untrusted: :meth:`WebBrief.from_raw` bounds every field, and the only thing a brief changes in a draft on its own is a
-  refutation (a denial found elsewhere), never a confirmation.
+  refutation (a denial found elsewhere that names a reputable publisher of the source registry), never a confirmation.
 
 It never runs for a backtest or a replay: only the live pipeline is given a :class:`WebResearcher`, and a result that depends on
 the state of the web today is not reproducible.
@@ -43,6 +45,7 @@ CACHE_TTL_DAYS = 1  # the web changes: a denial can appear within hours
 CAPS_PREFIX = "llmweb.caps:"
 MAX_EXCERPT_CHARS = 1500  # what of the text the search model gets: enough to know what to look for
 WEB_TIMEOUT_SEC = 45.0  # a search runs several tool steps on Groq's side before it answers
+MIN_SEARCH_SEC = 10.0  # a search that would get less of the run's web time than this is not started
 MIN_OUTPUT_TOKENS = 2000  # reasoning + the final JSON; the pages read count as input tokens, not output
 TIME_SHARE = 0.3  # of the LLM wall-clock budget of a run: web checks never starve the extraction
 BACKOFF_SEC = 6 * 3600.0  # how long to stay away from a tool or a request size the account cannot use
@@ -82,7 +85,9 @@ class WebResearcher(LLMExtractor):
         kwargs.setdefault("max_attempts", 2)  # a web check is slow: one retry after a transient error, no more
         kwargs.setdefault("max_consecutive_failures", 3)
         super().__init__(settings, **kwargs)
-        self.max_seconds = max(20.0, TIME_SHARE * float(settings.llm_max_seconds_per_run))
+        # A share of the LLM budget, never more: with a small LLM_MAX_SECONDS_PER_RUN the share is too small for a search and
+        # every check is skipped (a search needs MIN_SEARCH_SEC), which is better than overrunning the parent budget.
+        self.max_seconds = TIME_SHARE * float(settings.llm_max_seconds_per_run)
 
     @property
     def configured(self) -> bool:
@@ -94,7 +99,8 @@ class WebResearcher(LLMExtractor):
         return list(self.settings.llm_web_models)
 
     def _timeout(self) -> float:
-        return max(float(self.settings.llm_timeout_sec), WEB_TIMEOUT_SEC)
+        """A search may take up to ``WEB_TIMEOUT_SEC``, but never past the end of this service's share of the run's time."""
+        return self.budgeted_timeout(max(float(self.settings.llm_timeout_sec), WEB_TIMEOUT_SEC), minimum=MIN_SEARCH_SEC)
 
     # ------------------------------------------------------------------------------------- request
     def _web_body(self, title: str, text: str, model: str, context: NewsContext | None) -> dict[str, Any]:

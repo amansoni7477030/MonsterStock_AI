@@ -15,7 +15,7 @@ from news_intelligence.context import NewsContext, WebBrief
 from news_intelligence.entities import EntityResolver
 from news_intelligence.llm import LLMExtractor
 from news_intelligence.web import WebResearcher, prune_web_cache
-from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, add_instruments, ok
+from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, SlowSession, add_instruments, ok
 
 GROQ_KEY = "gsk_test_groq_key_1234567890"
 TITLE = "Reliance in talks to acquire a stake in a media company, sources say"
@@ -73,7 +73,7 @@ def test_the_researcher_asks_only_models_that_offer_the_tool_and_has_a_share_of_
     assert researcher.models == [FALLBACK] and researcher.research(TITLE, TEXT, context()) is not None
     assert session.calls[0]["json"]["model"] == FALLBACK
     assert researcher.max_seconds == pytest.approx(0.3 * 240)
-    assert make(dataclasses.replace(cfg, llm_max_seconds_per_run=30), store, fake_clock)[0].max_seconds == 20.0
+    assert make(dataclasses.replace(cfg, llm_max_seconds_per_run=30), store, fake_clock)[0].max_seconds == pytest.approx(9.0)  # never more than its share
     assert LLMExtractor(cfg, clock=fake_clock).max_seconds == 240.0  # the extraction keeps the whole box
 
 
@@ -184,6 +184,43 @@ def test_the_web_check_stops_when_its_share_of_the_time_box_is_spent(cfg, store,
     researcher.start_run()
     fake_clock.advance(researcher.max_seconds + 1)
     assert researcher.research(TITLE, TEXT) is None and session.calls == [] and researcher.run_budget_skipped == 1
+
+
+def test_no_request_may_run_past_the_end_of_the_web_time_share(cfg, store, fake_clock):
+    researcher, session = make(cfg, store, fake_clock)
+    researcher.start_run()
+    fake_clock.advance(60)  # 12 s of the 72 s share are left: a search is cut to that, not given its usual 45 s
+    assert researcher.research(TITLE, TEXT) is not None
+    assert session.calls[0]["timeout"] == pytest.approx(12.0)
+    fresh, other = make(cfg, store, fake_clock)
+    fresh.start_run()
+    fresh.research(TITLE + " b", TEXT)
+    assert other.calls[0]["timeout"] == web_mod.WEB_TIMEOUT_SEC  # with the whole share left it gets its usual time
+
+
+def test_a_search_that_cannot_finish_in_the_time_left_is_never_started(cfg, store, fake_clock):
+    researcher, session = make(cfg, store, fake_clock)
+    researcher.start_run()
+    fake_clock.advance(researcher.max_seconds - web_mod.MIN_SEARCH_SEC + 1)  # just under the minimum is left
+    assert researcher.research(TITLE, TEXT) is None and session.calls == []
+    assert researcher.run_budget_skipped == 1 and researcher.run_failures == 0 and researcher.run_calls == 0  # not a failure, not a use
+    assert store.kv_get("llmweb.failures") is None
+
+
+def test_a_time_share_too_small_for_any_search_skips_the_web_check_without_a_request(cfg, store, fake_clock):
+    researcher, session = make(dataclasses.replace(cfg, llm_max_seconds_per_run=30), store, fake_clock)  # a 9 s share
+    researcher.start_run()
+    assert researcher.research(TITLE, TEXT) is None and session.calls == [] and researcher.run_failures == 0
+
+
+def test_a_slow_first_attempt_cannot_drag_the_retry_past_the_share(cfg, store, fake_clock):
+    session = SlowSession(fake_clock, 40, FakeResponse(503), FakeResponse(503))
+    researcher = WebResearcher(cfg, session=session, clock=fake_clock, store=store)
+    researcher.start_run()
+    assert researcher.research(TITLE, TEXT) is None
+    # 72 s share: the first search may take its 45 s, the retry (after a 1 s back-off) only what is left: 72 - 41 = 31 s
+    assert [call["timeout"] for call in session.calls] == [45.0, pytest.approx(31.0)]
+    assert researcher.elapsed() < researcher.max_seconds + 45  # and nothing can start once the share is gone
 
 
 def test_tokens_of_a_search_are_counted_under_the_web_counter(cfg, store, fake_clock):

@@ -315,3 +315,14 @@ def test_a_denial_is_left_alone_and_the_discount_never_goes_below_the_floor():
     assert ev.apply_refutation(denial) is False and denial.severity == 0.3 and not denial.is_rumour
     tiny = ev.EventDraft(severity=0.02, confidence=0.05)
     assert ev.apply_refutation(tiny) is True and tiny.severity == 0.02 and tiny.confidence == 0.05
+
+
+def test_a_refuted_long_term_report_gets_the_rumour_horizon_like_every_rumour():
+    long = ev.EventDraft(event_type="merger_acquisition", severity=0.7, horizon="months")
+    assert ev.apply_refutation(long) is True and long.horizon == "weeks"
+    short = ev.EventDraft(event_type="order_win", severity=0.5, horizon="days")
+    ev.apply_refutation(short)
+    assert short.horizon == "days"  # only a months-long horizon is shortened, as classify_rules does
+    rules = ev.classify_rules("Company X in talks to merge with Y, sources said", "A long term strategic partnership over many years.",
+                              category=None, source_kind="business_media")
+    assert rules.is_rumour and rules.horizon != "months"  # the policy this mirrors

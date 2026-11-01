@@ -162,3 +162,15 @@ class FakeSession:
     def get(self, url: str, headers: Any = None, timeout: Any = None) -> Any:
         self.calls.append({"url": url, "headers": headers, "json": None, "timeout": timeout, "method": "GET"})
         return self._take(self.gets)
+
+
+class SlowSession(FakeSession):
+    """A scripted session whose every POST takes ``cost`` seconds of the (fake) wall clock."""
+
+    def __init__(self, clock: Any, cost: float, *responses: Any) -> None:
+        super().__init__(*responses)
+        self.clock, self.cost = clock, cost
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        self.clock.advance(self.cost)
+        return super().post(*args, **kwargs)

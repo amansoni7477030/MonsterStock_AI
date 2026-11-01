@@ -23,7 +23,7 @@ from news_intelligence.jev import (
     parse_response,
     prune_jev_cache,
 )
-from tests.test_news_support import FakeResponse, FakeSession
+from tests.test_news_support import FakeResponse, FakeSession, SlowSession
 from tests.test_news_support import jev_answers as answers
 from tests.test_news_support import jev_response as response
 
@@ -462,12 +462,16 @@ def test_the_web_check_is_part_of_the_state_and_makes_the_question_a_different_o
 def test_the_cache_follows_what_the_context_says_but_not_when_the_check_ran(cfg, store, fake_clock):
     judge, session = make(cfg, store, fake_clock)
     judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT)
-    later = dataclasses.replace(CONTEXT, now=CONTEXT.now + timedelta(days=2), mentioned=())
+    later = dataclasses.replace(CONTEXT, now=CONTEXT.now + timedelta(days=2))
     assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=later).cached is True
     other_day = dataclasses.replace(CONTEXT, published_at=CONTEXT.published_at - timedelta(days=3))
     assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=other_day).cached is False
+    other_time = dataclasses.replace(CONTEXT, published_at=CONTEXT.published_at + timedelta(hours=6))  # the same day, 6 h later
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=other_time).cached is False
+    other_mentions = dataclasses.replace(CONTEXT, mentioned=())
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=other_mentions).cached is False
     assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited").cached is False  # without a context: another question
-    assert len(session.calls) == 3
+    assert len(session.calls) == 5
 
 
 def test_a_context_does_not_change_what_the_older_call_signature_sends(cfg, store, fake_clock):
@@ -481,3 +485,31 @@ def test_the_rule_discounts_a_web_refutation_shares_with_jev_are_the_events_cons
 
     assert jev_mod.RUMOUR_SEVERITY is events_mod.RUMOUR_SEVERITY and jev_mod.DENIAL_SEVERITY is events_mod.DENIAL_SEVERITY
     assert jev_mod.EVENT_DESCRIPTIONS is events_mod.EVENT_DESCRIPTIONS
+
+
+def test_a_rumour_flagged_by_jev_gets_the_rules_shorter_horizon():
+    draft = EventDraft(event_type="merger_acquisition", severity=0.7, confidence=0.8, horizon="months")
+    effect = merge_jev(draft, JevJudgment("merger_acquisition", 0.8, 0.8, 0.95, 0.02, 0.5, 0.3), min_confidence=0.5, official=False)
+    assert effect.rumour_flagged and draft.is_rumour and draft.horizon == "weeks"
+    assert EventDraft(horizon="days").horizon == "days"  # shorter horizons are left alone
+
+
+def test_no_request_may_run_past_the_end_of_the_runs_time_budget(cfg, store, fake_clock):
+    session = SlowSession(fake_clock, 85, FakeResponse(503), response())
+    judge = JevJudge(cfg, session=session, clock=fake_clock, store=store)
+    judge.max_seconds = 100.0
+    judge.start_run()
+    assert judge.judge(TITLE, TEXT) is not None
+    # the first attempt gets its usual 20 s; after it took 85 s (and a 1 s back-off) the retry gets the 14 s that are left
+    assert [call["timeout"] for call in session.calls] == [20.0, pytest.approx(14.0)]
+
+
+def test_a_failure_while_building_the_request_falls_back_to_the_rules_instead_of_losing_the_item(cfg, store, fake_clock, monkeypatch):
+    judge, session = make(cfg, store, fake_clock)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("cannot render the context")
+
+    monkeypatch.setattr(jev_mod, "build_request", explode)
+    assert judge.judge(TITLE, TEXT, company="Reliance Industries Limited", context=CONTEXT) is None
+    assert session.calls == [] and judge.run_failures == 1 and "cannot render the context" in judge.last_error

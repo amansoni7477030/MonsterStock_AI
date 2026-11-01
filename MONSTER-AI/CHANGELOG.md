@@ -111,15 +111,24 @@ server with native systemd (no containers).
   the source with its class and tier, the filing category, the issuer with its sector, the companies the entity matcher found and the
   web brief; the LLM prompt also defines every event type (the definitions moved to `events.EVENT_DESCRIPTIONS`, shared with Jev).
   Prices, returns and the rules' verdict are left out on purpose (an independent second reader). Free text is single-line, capped,
-  stripped of control characters and of the prompt's block tags. Cache keys follow the context but not the time of the check.
+  stripped of control characters and of the prompt's block tags. Cache keys follow everything the prompt shows (the publication minute,
+  the source, the matched companies, the web brief) but not the time of the check.
   Prompt versions `v3` / `j2` retire older cached answers.
 - **Optional web check** (`news_intelligence/web.py`): Groq's server-side `browser_search` tool on the gpt-oss models, used before the
   extraction for company news that is not first-hand and is a rumour or could matter. A request of its own, because Groq documents that
   browser search cannot be combined with structured outputs; it returns a small brief validated field by field, which joins both
-  readers' context. By itself it changes one thing: a *sourced denial* found elsewhere turns the item into a refuted rumour (half the
-  severity); a confirmation changes nothing. Own budget (`LLM_WEB_MAX_PER_RUN`, 8), 30 % of the LLM time box, 1-day cache, circuit
-  breaker, cooldown and `source_health` row (`llm_web`); HTTP 413 (Groq's free tier of 8 000 tokens per minute) or a rejected tool backs
-  it off for 6 h; never used by a replay; shown by `ai-test`, `doctor`, the test message and the news job's AI note.
+  readers' context. By itself it changes one thing: a *sourced denial* found elsewhere (the brief names a host the source registry
+  knows as reputable: an exchange, an official body, a wire, a business newspaper) turns the item into a refuted rumour (half the
+  severity, the rumour horizon); a confirmation changes nothing. Own budget (`LLM_WEB_MAX_PER_RUN`, 8), 30 % of the LLM time box
+  (a hard bound: every request of the three services is cut to the time left in the run and not started when almost none is
+  left), 1-day cache, circuit breaker, cooldown and `source_health` row (`llm_web`); HTTP 413 (Groq's free tier of 8 000 tokens per
+  minute) or a rejected tool backs it off for 6 h; never used by a replay, even when a researcher is injected; shown by `ai-test`,
+  `doctor`, the test message and the news job's AI note. It shares Groq's per-model quota with the extraction, whose fallback model
+  absorbs the contention.
+- **Credential hygiene for the LLM endpoint** (`app/config.py`): `GROQ_API_KEY` is sent only to a URL that is exactly
+  `https://api.groq.com...` (a look-alike such as `https://api.groq.com.evil.example` or a URL with credentials or a backslash is
+  not Groq's: it is refused at load or treated as another provider that never gets the key), and plain `http` is accepted for
+  loopback hosts only (`localhost`, `127.0.0.1`, `::1`), not for anything that merely starts with them.
 - **Notifications** (`notifications/`): Telegram client, 4096-character-safe renderers (pre-open, final, evening, alerts,
   failure notices, failed-service alerts), idempotent delivery ledger, deadline guard, queued alerts flushed when Telegram returns; catalysts show their
   provenance (rumour flag, source class, independent sources, conflicts) and the regime line shows GIFT Nifty while its quote is fresh.

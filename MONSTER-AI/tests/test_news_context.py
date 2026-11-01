@@ -199,18 +199,46 @@ def test_jev_gets_the_same_facts_as_typed_state_fields():
 def test_the_fingerprint_ignores_the_moment_of_the_check_but_not_what_changes_an_answer():
     base = full_context()
     assert base.fingerprint() == full_context(now=NOW + timedelta(days=3)).fingerprint()  # a cache must survive the clock
-    assert base.fingerprint() == full_context(mentioned=()).fingerprint()
     for change in (dict(published_at=PUBLISHED + timedelta(days=1)), dict(source_class="social"), dict(company="TCS"),
                    dict(domain="other.com"), dict(category="x"), dict(sector="IT"), dict(source_tier="wire"),
+                   dict(source="Another Outlet"), dict(mentioned=()), dict(mentioned=("Infosys Limited (INFY)",)),
                    dict(web=WebBrief.from_raw(GOOD))):
         assert base.fingerprint() != full_context(**change).fingerprint(), change
     assert NewsContext().fingerprint() == NewsContext().fingerprint()
 
 
-def test_the_publication_day_in_the_fingerprint_is_the_indian_day():
-    late = full_context(published_at=datetime(2026, 11, 1, 20, 0, tzinfo=UTC))  # 01:30 IST on the 2nd
-    early = full_context(published_at=datetime(2026, 11, 2, 1, 0, tzinfo=UTC))  # 06:30 IST on the 2nd
-    assert late.fingerprint() == early.fingerprint()
+def test_the_fingerprint_covers_the_publication_minute_not_just_the_day():
+    base = full_context()
+    assert base.fingerprint() != full_context(published_at=PUBLISHED + timedelta(minutes=1)).fingerprint()  # the prompt shows it
+    assert base.fingerprint() != full_context(published_at=PUBLISHED + timedelta(hours=6)).fingerprint()  # same Indian day
+    assert base.fingerprint() == full_context(published_at=PUBLISHED + timedelta(seconds=20)).fingerprint()  # seconds are never shown
+    ist = timezone(timedelta(hours=5, minutes=30))
+    assert base.fingerprint() == full_context(published_at=PUBLISHED.astimezone(ist)).fingerprint()  # the same instant in any zone
+
+
+# ------------------------------------------------------------------------------------- instants and zones
+def test_a_naive_instant_is_read_as_utc_never_as_the_zone_of_the_machine():
+    naive = full_context(published_at=PUBLISHED.replace(tzinfo=None), now=NOW.replace(tzinfo=None))
+    assert naive.published_at == PUBLISHED and naive.now == NOW and naive.published_at.tzinfo is not None
+    assert naive.lines() == full_context().lines() and naive.fingerprint() == full_context().fingerprint()
+    assert naive.age_hours() == pytest.approx(3.1)
+
+
+def test_naive_and_aware_instants_can_be_mixed_without_an_error():
+    mixed = full_context(published_at=PUBLISHED.replace(tzinfo=None))  # an aware 'now' against a naive publication time
+    assert mixed.age_hours() == pytest.approx(3.1) and "3.1 hours before this check" in " ".join(mixed.lines())
+    replaced = mixed.with_web(WebBrief())  # dataclasses.replace builds the object again: still consistent
+    assert replaced.published_at == PUBLISHED and replaced.web == WebBrief()
+
+
+@pytest.mark.parametrize("placeholder", [datetime(1, 1, 1), datetime(1970, 1, 1, tzinfo=UTC) - timedelta(days=365 * 25),
+                                         datetime(9999, 12, 31, tzinfo=UTC), datetime(2101, 1, 1, tzinfo=UTC)])
+def test_a_publication_time_that_cannot_be_real_is_dropped_instead_of_shown_to_a_model(placeholder):
+    context = full_context(published_at=placeholder)
+    assert context.published_at is None and context.age_hours() is None
+    assert not any(line.startswith("Published") for line in context.lines()) and "published" not in context.state()
+    assert context.fingerprint() == full_context(published_at=None).fingerprint()
+    assert full_context(published_at=datetime(1990, 1, 1, tzinfo=UTC)).published_at is not None  # the boundary is inclusive
 
 
 def test_with_web_returns_a_new_context_and_leaves_the_original_alone():

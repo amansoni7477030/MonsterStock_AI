@@ -132,6 +132,8 @@ def apply_refutation(draft: EventDraft) -> bool:
         draft.severity = round(max(0.02, draft.severity * DENIAL_SEVERITY), 3)
         draft.polarity_hint = round(draft.polarity_hint * 0.5, 3)
         draft.is_rumour = True
+    if draft.horizon == "months":  # classify_rules shortens the horizon of every rumour: an unconfirmed report is no long-term fact
+        draft.horizon = "weeks"
     draft.confidence = round(max(0.05, draft.confidence * 0.7), 3)
     draft.rules = (*draft.rules, REFUTED_RULE)
     return True

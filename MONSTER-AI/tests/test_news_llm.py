@@ -13,7 +13,7 @@ from news_intelligence.context import NewsContext, WebBrief
 from news_intelligence.entities import EntityResolver
 from news_intelligence.events import EVENT_DESCRIPTIONS
 from news_intelligence.llm import LLMExtractor, LLMResult, parse_reply_json, prune_llm_cache
-from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, add_instruments, ok
+from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, SlowSession, add_instruments, ok
 
 SECRET = "sk-test-secret-123"
 TITLE = "Reliance bags Rs 5,000 crore NTPC order"
@@ -475,13 +475,17 @@ def test_the_whole_stored_text_reaches_the_model_up_to_the_cap(cfg, store, resol
 def test_the_cache_follows_what_the_context_says_but_not_when_the_check_ran(cfg, store, resolver, fake_clock):
     extractor, session = make(dataclasses.replace(cfg, llm_max_articles_per_run=10), store, resolver, fake_clock)
     assert extractor.extract(TITLE, TEXT, CONTEXT).cached is False
-    later = dataclasses.replace(CONTEXT, now=CONTEXT.now + timedelta(days=2), mentioned=())
+    later = dataclasses.replace(CONTEXT, now=CONTEXT.now + timedelta(days=2))
     assert extractor.extract(TITLE, TEXT, later).cached is True and len(session.calls) == 1
     other_day = dataclasses.replace(CONTEXT, published_at=CONTEXT.published_at - timedelta(days=3))
     assert extractor.extract(TITLE, TEXT, other_day).cached is False
+    other_time = dataclasses.replace(CONTEXT, published_at=CONTEXT.published_at + timedelta(hours=6))  # the same day, 6 h later
+    assert extractor.extract(TITLE, TEXT, other_time).cached is False
+    other_mentions = dataclasses.replace(CONTEXT, mentioned=("Infosys Limited (INFY)",))  # the prompt lists other companies
+    assert extractor.extract(TITLE, TEXT, other_mentions).cached is False
     assert extractor.extract(TITLE, TEXT, CONTEXT.with_web(WebBrief("no", 0, True, False, (), ("reuters.com",)))).cached is False
     assert extractor.extract(TITLE, TEXT).cached is False  # no context at all is a different question
-    assert len(session.calls) == 4
+    assert len(session.calls) == 6
 
 
 def test_an_answer_cached_under_an_older_prompt_is_never_reused(cfg, store, resolver, fake_clock, monkeypatch):
@@ -500,3 +504,29 @@ def test_a_web_check_in_the_context_is_marked_untrusted_for_the_model(cfg, store
     line = next(item for item in user_message(session).splitlines() if item.startswith("Web check"))
     assert "automated search" in line and "may be wrong" in line and "denial or correction found: yes" in line
     assert "Facts found: The company denied the report" in line and "Sources: reuters.com" in line
+
+
+# ------------------------------------------------------------------------------------- the run's time budget
+def test_no_request_may_run_past_the_end_of_the_runs_time_budget(cfg, store, resolver, fake_clock):
+    config = dataclasses.replace(cfg, llm_timeout_sec=40.0, llm_max_seconds_per_run=100)
+    session = SlowSession(fake_clock, 70, FakeResponse(503), ok(reply()))
+    extractor = LLMExtractor(config, session=session, clock=fake_clock, store=store, resolver=resolver)
+    extractor.start_run()
+    assert extractor.extract(TITLE, TEXT) is not None
+    # the first attempt gets its usual 40 s; after it took 70 s (and a 1 s back-off) the retry gets only the 29 s that are left
+    assert [call["timeout"] for call in session.calls] == [40.0, pytest.approx(29.0)]
+
+
+def test_a_retry_with_less_than_a_few_seconds_left_is_not_started(cfg, store, resolver, fake_clock):
+    config = dataclasses.replace(cfg, llm_timeout_sec=40.0, llm_max_seconds_per_run=100)
+    session = SlowSession(fake_clock, 97, FakeResponse(503), ok(reply()))
+    extractor = LLMExtractor(config, session=session, clock=fake_clock, store=store, resolver=resolver)
+    extractor.start_run()
+    assert extractor.extract(TITLE, TEXT) is None and len(session.calls) == 1
+    assert extractor.run_failures == 0 and extractor.run_budget_skipped == 1  # out of time is not a failure
+
+
+def test_without_a_run_there_is_no_budget_and_the_configured_timeout_is_used(cfg, store, resolver, fake_clock):
+    extractor, session = make(cfg, store, resolver, fake_clock)
+    extractor.extract(TITLE, TEXT)
+    assert session.calls[0]["timeout"] == 7.5

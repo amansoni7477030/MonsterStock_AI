@@ -327,7 +327,7 @@ sequenceDiagram
 | Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (Groq's production open-weight models: the larger for accuracy, the smaller as headroom because Groq's rate limits are per model) | the same models, when they offer the `browser_search` tool (the gpt-oss family only) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
 | What it is | a text model: reads the article and returns structured JSON | Groq's built-in, server-side web search (powered by Exa) driven by a gpt-oss model. A request of its own, because Groq documents that browser search cannot be combined with structured outputs | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
 | Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | do independent outlets report the same facts, did anyone deny or correct them, was the event already public; up to three facts and the hosts relied on | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
-| Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
+| Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** (it names a reputable publisher of the source registry: an exchange, an official body, a wire or a business newspaper) whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
 | Never | invents evidence | raises a severity or a confidence, clears a flag, runs for an exchange filing, an official statement or a company's own release, for macro or sector news, or in a replay or backtest | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
 | Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | the one thing the text cannot tell: is the rumour or the unverified deal true, denied or old | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
 | Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text and context | per news job: `LLM_WEB_MAX_PER_RUN` (8), 30 % of the LLM time box, a 1-day cache; HTTP 413 (the free tier's 8,000 tokens per minute) or a rejected tool backs it off for 6 h | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, context, company and source class |
@@ -345,7 +345,10 @@ carries), so the rules, the LLM and Jev classify against one vocabulary. Never a
 the rules' own verdict**: the AI is meant to be an independent second reader whose answer is then compared with the rules', and a
 price or a hindsight fact would let it explain a move instead of reading the news. Free text in the context (feed names, search
 results) is single-line, length-capped and stripped of control characters and of the tags that structure the prompt.
-The web check searches the public web; nothing of yours is sent with the request.
+The web check searches the public web; nothing of yours is sent with the request. Its time share is a hard bound: every request of
+every service is given at most what is left of the run's wall-clock budget (and is not started when almost nothing is left), so a
+slow provider cannot overrun it. The web check and the extraction share Groq's per-model token quota; when it is spent the
+extraction hands over to its fallback model and the web check backs off.
 
 How it is observed: `monster-ai ai-test` sends one made-up item through the real code (and makes one real web search) and prints
 what came back or why not; `monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` /
@@ -866,8 +869,9 @@ flowchart TB
 - All inbound data is validated (schema, ranges, dates, size limits); SQL is parameterised; HTTP clients are HTTPS-only with
   timeouts, size limits, bounded retries and secret-free error messages.
 - Outbound connections: the data providers, Telegram, and - only if configured - the object store, Groq (or another LLM endpoint) and
-  Jev. Only public news text leaves the server for the AI services; their keys are secrets like the others (`GROQ_API_KEY` is never
-  sent to an endpoint other than Groq's). The web check's searches are made by Groq from its own servers: the server only sends the
+  Jev. Only public news text leaves the server for the AI services; their keys are secrets like the others (`GROQ_API_KEY` is only
+  ever sent to a URL that is exactly `https://api.groq.com...`: look-alike hosts and URLs with credentials or backslashes are
+  refused or treated as another provider, and a plain-http endpoint is accepted for loopback hosts only). The web check's searches are made by Groq from its own servers: the server only sends the
   request to Groq. Text that comes back from the web is untrusted: it is reduced to a bounded, validated brief before it is used.
 
 ## Resource budget

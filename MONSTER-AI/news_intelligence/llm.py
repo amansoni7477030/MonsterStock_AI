@@ -399,7 +399,7 @@ class LLMExtractor(RemoteJudge):
         raise RuntimeError(f"gave up after {self.max_attempts} attempts ({last})")
 
     def _timeout(self) -> float:
-        return float(self.settings.llm_timeout_sec)
+        return self.budgeted_timeout(float(self.settings.llm_timeout_sec))
 
     @staticmethod
     def _content_of(payload: Any) -> str | None:

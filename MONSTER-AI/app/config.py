@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.errors import ConfigError
@@ -27,6 +28,28 @@ GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
 # Groq's built-in browser_search tool (a server-side web search) is offered by the gpt-oss models only, and Groq documents it as
 # incompatible with structured outputs (console.groq.com/docs/tool-use/built-in-tools and /browser-search, read 2026-11-02).
 GROQ_WEB_MODEL_PREFIX = "openai/gpt-oss"
+_GROQ_URL = re.compile(r"https://api\.groq\.com(?::443)?(?:/[A-Za-z0-9._~/-]*)?", re.IGNORECASE)
+_URL_UNSAFE = re.compile(r"[\\@\s]")  # credentials, backslashes and spaces: what different URL parsers read differently
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_groq_url(url: str | None) -> bool:
+    """True only for a plain https URL on exactly ``api.groq.com``. ``GROQ_API_KEY`` is sent to a URL only when this holds, so
+    a look-alike host (``https://api.groq.com.evil.example``), credentials in the URL (``https://api.groq.com@evil.example``) and
+    anything else a URL parser could read differently from the HTTP client never receive it."""
+    return bool(url) and _GROQ_URL.fullmatch(str(url).strip()) is not None
+
+
+def is_loopback_http(url: str) -> bool:
+    """True for a plain ``http://`` URL whose host is exactly localhost, 127.0.0.1 or ::1 (a prefix test would accept
+    ``http://localhost.evil.example``)."""
+    if _URL_UNSAFE.search(url):
+        return False
+    try:
+        parts = urlsplit(url)
+        return parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS
+    except ValueError:
+        return False
 
 # --------------------------------------------------------------------------------------------- parsers
 
@@ -406,11 +429,10 @@ class Settings:
 
     @property
     def llm_provider(self) -> str | None:
-        """``groq`` (Groq's endpoint, reached through GROQ_API_KEY or an LLM_API_BASE on api.groq.com), ``custom`` (any other
-        OpenAI-compatible endpoint) or ``None`` (rules only)."""
-        base = (self.llm_api_base or "").lower()
-        if base:
-            return "groq" if "://api.groq.com" in base else "custom"
+        """``groq`` (Groq's endpoint, reached through GROQ_API_KEY or an LLM_API_BASE that is exactly https://api.groq.com...),
+        ``custom`` (any other OpenAI-compatible endpoint) or ``None`` (rules only)."""
+        if self.llm_api_base:
+            return "groq" if is_groq_url(self.llm_api_base) else "custom"
         return "groq" if self.groq_api_key else None
 
     @property
@@ -600,10 +622,11 @@ def validate(s: Settings) -> list[str]:
         problems.append("LLM_API_BASE and LLM_MODEL must be set together (only Groq's endpoint has a default model)")
     if s.llm_model and not s.llm_base_url:
         problems.append("LLM_API_BASE and LLM_MODEL must be set together (or set GROQ_API_KEY to use Groq's endpoint)")
-    if s.llm_base_url and not s.llm_base_url.lower().startswith("https://") and not s.llm_base_url.lower().startswith(
-        ("http://localhost", "http://127.0.0.1")
-    ):
-        problems.append("LLM_API_BASE must use https (or a loopback http endpoint)")
+    if s.llm_base_url:
+        if _URL_UNSAFE.search(s.llm_base_url):
+            problems.append("LLM_API_BASE must be a plain URL (no credentials, backslashes or spaces)")
+        elif not (s.llm_base_url.lower().startswith("https://") or is_loopback_http(s.llm_base_url)):
+            problems.append("LLM_API_BASE must use https (or a loopback http endpoint)")
     if s.llm_provider == "groq" and not s.llm_key:
         problems.append("LLM_API_BASE points at Groq but neither GROQ_API_KEY nor LLM_API_KEY is set")
     if s.llm_max_seconds_per_run < 10:

@@ -175,6 +175,58 @@ def test_the_groq_key_is_never_used_for_another_providers_endpoint(tmp_path):
     assert on_groq.llm_provider == "groq" and on_groq.llm_key == GROQ
 
 
+@pytest.mark.parametrize("base", [
+    "https://api.groq.com.evil.example/openai/v1",  # a look-alike host that merely starts with Groq's
+    "https://evil.example/https://api.groq.com/openai/v1",  # Groq's host appears in the path
+    "https://evil-api.groq.com.example/v1", "https://api.groq.co/openai/v1", "https://groq.com/openai/v1",
+    "https://api.groq.com:8443/openai/v1", "https://api.groq.com#.evil.example/v1", "https://api.groq.com?host=evil.example",
+])
+def test_a_look_alike_of_groqs_host_never_receives_the_groq_key(tmp_path, base):
+    s = _load(tmp_path, GROQ_API_KEY=GROQ, LLM_API_BASE=base, LLM_MODEL="m")
+    assert s.llm_provider == "custom" and s.llm_key is None
+
+
+def test_plain_http_to_groqs_host_is_refused_and_never_gets_the_key(tmp_path):
+    with pytest.raises(ConfigError, match="https"):
+        _load(tmp_path, GROQ_API_KEY=GROQ, LLM_API_BASE="http://api.groq.com/openai/v1", LLM_MODEL="m")
+
+
+@pytest.mark.parametrize("base", [
+    "https://api.groq.com@evil.example/openai/v1", "https://evil.example\\@api.groq.com/openai/v1",
+    "https://api.groq.com\\.evil.example/v1", "https://api.groq.com /openai/v1", "https://user:pass@api.groq.com/openai/v1",
+])
+def test_a_url_a_parser_could_read_two_ways_is_refused_at_load(tmp_path, base):
+    with pytest.raises(ConfigError, match="plain URL"):
+        _load(tmp_path, GROQ_API_KEY=GROQ, LLM_API_BASE=base, LLM_MODEL="m")
+
+
+@pytest.mark.parametrize("base", ["https://api.groq.com/openai/v1", "https://API.GROQ.COM/openai/v1/", "https://api.groq.com",
+                                  "https://api.groq.com:443/openai/v1", "  https://api.groq.com/openai/v1  "])
+def test_every_spelling_of_groqs_own_endpoint_is_recognised(base):
+    from app.config import is_groq_url
+
+    assert is_groq_url(base) is True
+
+
+@pytest.mark.parametrize(("url", "loopback"), [
+    ("http://localhost:11434/v1", True), ("http://127.0.0.1:8000/v1", True), ("http://[::1]:8000/v1", True),
+    ("http://localhost.evil.example/v1", False), ("http://127.0.0.1.evil.example/v1", False),
+    ("http://localhost@evil.example/v1", False), ("http://evil.example\\@localhost/v1", False), ("https://localhost/v1", False),
+    ("http://evil.example/v1", False), ("not a url", False), ("http://[::1/v1", False),
+])
+def test_plain_http_is_allowed_for_loopback_hosts_only(url, loopback):
+    from app.config import is_loopback_http
+
+    assert is_loopback_http(url) is loopback
+
+
+def test_a_local_model_server_over_http_is_accepted_and_a_remote_one_is_not(tmp_path):
+    local = _load(tmp_path, LLM_API_BASE="http://localhost:11434/v1", LLM_MODEL="llama")
+    assert local.llm_provider == "custom" and local.llm_configured
+    with pytest.raises(ConfigError, match="https"):
+        _load(tmp_path, LLM_API_BASE="http://localhost.evil.example/v1", LLM_MODEL="llama")
+
+
 def test_an_explicit_llm_key_wins_over_the_groq_key(tmp_path):
     s = _load(tmp_path, GROQ_API_KEY=GROQ, LLM_API_KEY="gsk_other_groq_key_0987654321")
     assert s.llm_key == "gsk_other_groq_key_0987654321" and s.llm_provider == "groq"

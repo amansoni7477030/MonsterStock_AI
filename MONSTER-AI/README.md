@@ -304,7 +304,9 @@ How to think about them:
   cooldown that survives between runs, and a rejected key stops the service for the run. Any failure falls back to the rules, the
   report's coverage note names the degraded service, and `monster-ai health` warns after repeated failures.
 - **Only public news text leaves the server** (headline, the article text, the context facts above and a company name): never keys,
-  positions or predictions. `GROQ_API_KEY` is never sent to any other endpoint.
+  positions or predictions. `GROQ_API_KEY` is never sent to any other endpoint: an endpoint counts as Groq's only when its URL is
+  exactly `https://api.groq.com...` (a look-alike host such as `api.groq.com.evil.example`, a URL with credentials or a backslash
+  is refused or treated as another provider that never gets the Groq key).
 - **Everything is traceable:** `monster-ai ai-test`, the `llm.*` / `llmweb.*` / `jev.*` counters in `monster-ai diag`, per-run counts in
   `news.last_run`, one row per service in `source_health`, what the web check found in the event's evidence, and WARNING lines in
   the logs with the reason (never the key).
@@ -322,14 +324,18 @@ purpose: to settle whether an unconfirmed-looking company story is true, denied 
   the host names relied on. A page that says "ignore your instructions" can at most colour those fields.
 - **What it changes.** Both readers get the brief as context. By itself it changes one thing only: a **sourced denial** found
   elsewhere, with the facts not confirmed, turns the item into a rumour with a denial's discounts (half the severity, a halved
-  direction). A confirmation never raises anything, and it is kept in the event's evidence so you can see why a flag was set.
+  direction, the rumour horizon). "Sourced" means it names a host the source registry knows as reputable (an exchange, an official
+  body, a wire service, a business newspaper): a page the search model cannot vouch for never discounts an item. A confirmation
+  never raises anything, and what was found is kept in the event's evidence so you can see why a flag was set.
 - **Why a separate request.** Groq documents that browser search cannot be combined with structured outputs, so a search request
   cannot also force the strict JSON schema the extraction relies on. Kept apart, the extraction stays schema-constrained.
 - **What it costs.** A search reads far more tokens than an extraction and Groq bills the tool separately. It has its own cap
-  (`LLM_WEB_MAX_PER_RUN`, 8 per news job), its own share of the time box (30 %), cache (1 day), circuit breaker and cooldown, so a
-  failing search never affects the extraction. **Groq's free tier (8,000 tokens per minute) is too small for a search** (HTTP 413):
-  the check then backs off for 6 hours and every item is judged without it. The Developer plan works. Set `LLM_WEB_SEARCH=false`
-  to switch it off.
+  (`LLM_WEB_MAX_PER_RUN`, 8 per news job), its own share of the time box (30 %, a hard bound: no request may run past it, so it
+  needs `LLM_MAX_SECONDS_PER_RUN` of at least 34), cache (1 day), circuit breaker and cooldown, so a failing search never affects
+  the extraction. It does share Groq's per-model token quota with the extraction: when that quota runs out the extraction hands
+  over to its fallback model and the search backs off. **Groq's free tier (8,000 tokens per minute) is too small for a search**
+  (HTTP 413): the check then backs off for 6 hours and every item is judged without it. The Developer plan works. Set
+  `LLM_WEB_SEARCH=false` to switch it off.
 - **Point in time.** The web of today is not the web of last year: the check runs only in the live pipeline, never in a replay or a
   backtest, and its result is cached for one day only.
 
