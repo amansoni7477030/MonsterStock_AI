@@ -910,16 +910,15 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
     bare = "\n".join(lines([render_test_message(settings)]))
     assert "Report chat: ❌ NOT configured" in bare and "Alerts go to: the same chat" in bare
     assert "LLM ⚪ off · web check ⚪ off · Jev ⚪ off · off-box backup ⚪ off" in bare
-    groq = "\n".join(lines([render_test_message(dataclasses.replace(settings, groq_api_key="gsk_fake_groq_key_1234567890"))]))
-    assert "LLM ✅ configured · web check ✅ configured · Jev ⚪ off" in groq  # Groq's gpt-oss models can search the web
-    assert "gsk_fake" not in groq
 
 
 def test_test_message_shows_each_ai_service_by_its_own_key(settings):
     groq_only = render_test_message(dataclasses.replace(settings, groq_api_key="gsk_fake_groq_key_1234567890"))
-    assert "LLM ✅ configured · Jev ⚪ off" in groq_only and "gsk_fake" not in groq_only
+    assert "LLM ✅ configured · web check ✅ configured · Jev ⚪ off" in groq_only and "gsk_fake" not in groq_only
+    no_web = render_test_message(dataclasses.replace(settings, groq_api_key="gsk_fake_groq_key_1234567890", llm_web_search=False))
+    assert "LLM ✅ configured · web check ⚪ off · Jev ⚪ off" in no_web
     jev_only = render_test_message(dataclasses.replace(settings, typesafe_api_key="ts-fake-typesafe-key-12345"))
-    assert "LLM ⚪ off · Jev ✅ configured" in jev_only
+    assert "LLM ⚪ off · web check ⚪ off · Jev ✅ configured" in jev_only
 
 
 def test_test_message_tolerates_partial_settings_objects():

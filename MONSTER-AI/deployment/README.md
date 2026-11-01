@@ -65,7 +65,7 @@ journalctl -u monster-ai -f                 # follow the daemon
 sudo monster-ai health                      # exit 0 ok / 1 warning / 2 critical
 sudo monster-ai doctor                      # full preflight incl. feed reachability
 sudo monster-ai telegram-preview            # one sample of every Telegram message type (made-up data)
-sudo monster-ai ai-test                     # only when GROQ_API_KEY / TYPESAFE_API_KEY are set: is each AI key accepted and answering?
+sudo monster-ai ai-test                     # only when GROQ_API_KEY / TYPESAFE_API_KEY are set: is each AI key accepted and answering? (also makes one web search)
 ```
 
 The default mode is **SHADOW**: research output only, the system never places orders.
@@ -178,7 +178,7 @@ sudo monster-ai logs                    # the newest day's warnings and errors o
 sudo monster-ai logs --role daemon -f   # follow the scheduler
 sudo monster-ai storage                 # disk, WAL, backups, logs, row counts and retention windows
 sudo monster-ai diag                    # redacted bundle (/var/lib/monster-ai/diag/) to attach to a bug report
-sudo monster-ai ai-test                 # the optional Groq / Jev keys: one made-up news item through the real code
+sudo monster-ai ai-test                 # the optional Groq / Jev keys: one made-up news item (and one web search) through the real code
 sudo monster-ai version                 # release and code fingerprint
 journalctl -u monster-ai -f             # the daemon through journald
 ```
@@ -209,6 +209,7 @@ touch them, because `copytruncate` would empty a file that several processes app
 | Chat id was not discovered | you did not message the bot within 180 s, a webhook is set on the bot, or another program consumes its updates | Send `/start` to the bot and run the installer again, or set `TELEGRAM_CHAT_ID=<number>` in `/etc/monster-ai/monster.env` |
 | No Telegram token | `TELEGRAM_BOT_TOKEN` empty | Create a bot with @BotFather, `sudo nano /etc/monster-ai/monster.env`, set `TELEGRAM_BOT_TOKEN=...`, then `sudo bash /opt/monster-ai/deployment/install.sh --yes` |
 | `ai-test` says `FAIL` for Groq or Jev | a rejected key, a model the account cannot use, an exhausted quota, or no outbound HTTPS to `api.groq.com` / `api.typesafe.ai` | The line names the reason and the fix; the table in [docs/OPERATIONS.md](../docs/OPERATIONS.md#the-ai-services-groq-and-jev) lists every case. Edit the key in `/etc/monster-ai/monster.env`, `sudo systemctl restart monster-ai`, run `ai-test` again. The system runs on its rules meanwhile |
+| `ai-test` says `WARN` for the Groq web check | the plan's per-minute token limit is smaller than one web search (Groq's free tier), or the models do not offer the tool | Nothing is broken: items are judged without the web check. Use Groq's Developer plan, or set `LLM_WEB_SEARCH=false` in `monster.env` and restart |
 | `the clock is not NTP-synchronised` | blocked UDP 123 or a slow first sync; the 09:12 IST cut-off is time critical | `timedatectl`, `chronyc tracking`, allow outbound UDP 123; exactly one NTP service must be active |
 | `another MONSTER AI install is already running` (exit 75) | a second installer holds `/var/lock/monster-ai-install.lock` | wait for it |
 | Exit 3: `rolled back` | the new release did not stay active | `/var/log/monster-ai-install.log`, `journalctl -u monster-ai -n 100`, `/opt/monster-ai.failed`; fix and run again |

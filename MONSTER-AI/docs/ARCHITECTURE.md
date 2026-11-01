@@ -253,7 +253,7 @@ pre-open wait is bounded by the same deadline, so a slow provider cannot push th
 News is **evidence shown in the report, not a model input**: the LightGBM forecast of P(range > 3 %) is computed from prices,
 F&O, global and calendar features only. The news layer decides which catalysts are listed for a name, how they are labelled
 (event type, severity, rumour or denial, direction, source class) and which other stocks an event propagates to through the
-event graph. Two optional AI services sharpen that labelling; with no key set the deterministic rules do all of it and no request
+event graph. Optional AI services sharpen that labelling; with no key set the deterministic rules do all of it and no request
 is ever made.
 
 ```mermaid
@@ -261,29 +261,34 @@ flowchart TB
     RAW[("news_raw + filings<br/>unprocessed rows")] --> RULES["Rules, always<br/>language, routine filter, entities, event type,<br/>rumour / denial, severity, direction"]
     RULES --> WORTH{"an event type<br/>or a known company?"}
     WORTH -- "no: nothing is spent" --> DROP["skipped as irrelevant"]
-    WORTH -- yes --> GROQ["Groq LLM, optional<br/>structured extraction + verbatim quote"]
+    WORTH -- yes --> CTX["Context for the readers, always<br/>when, by whom, which company and sector<br/>(never prices or the rules' verdict)"]
+    CTX --> GATE{"company news, not first-hand,<br/>a rumour or a deal that matters?"}
+    GATE -- no --> GROQ["Groq LLM, optional<br/>structured extraction + verbatim quote"]
+    GATE -- yes --> WEB["Groq web check, optional<br/>browser_search, validated brief"]
+    WEB -->|"the brief joins the context; a sourced denial<br/>makes a refuted rumour, half the severity"| GROQ
     GROQ --> M1["merge: only what the quote proves<br/>(type, severity, horizon, time, directions)"]
     M1 --> JEV["Jev, optional<br/>five typed questions in one request"]
     JEV --> M2["merge, conservative: retype only when Jev is sure<br/>and the rules are not, add rumour / denial flags,<br/>blend severity, direction only when readings agree"]
-    M2 --> EV[("events + evidence<br/>method: rules, rules+llm, rules+llm+jev")]
+    M2 --> EV[("events + evidence<br/>method: rules, rules+web, rules+llm, rules+llm+jev")]
     RULES -.->|"the fallback when an AI step has no answer"| EV
     EV --> USE["catalysts in the report, event-graph propagation,<br/>'already priced in' check"]
 ```
 
-Both services run behind the same safety rails (`news_intelligence/remote.py`), so a slow, rate-limited or broken provider can only
-make the rules do the work, never delay the morning schedule or lose an item:
+All three services (the extraction, the web check and Jev) run behind the same safety rails (`news_intelligence/remote.py`), each with
+its own budget, circuit breaker, cooldown, cache and health row, so a slow, rate-limited or broken provider can only make the rules
+do the work, never delay the morning schedule or lose an item, and a failing web check never touches the extraction:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant P as news pipeline
-    participant S as AI service (Groq or Jev)
+    participant S as AI service (Groq LLM, web check or Jev)
     participant K as kv: cache, counters, cooldown
     participant H as source_health
     participant API as provider API
 
-    P->>S: judge this headline and text
-    S->>K: answered for this exact text in the last 14 days?
+    P->>S: judge this headline and text, with its context
+    S->>K: answered for this exact text and context recently? (14 days, the web check 1 day)
     alt cache hit
         K-->>P: result: no request, no budget used
     else miss
@@ -297,7 +302,7 @@ sequenceDiagram
             end
             alt valid answer
                 API-->>S: JSON
-                S->>S: strict validation (schema, verbatim quote, known entities)
+                S->>S: strict validation (schema, verbatim quote, known entities, bounded brief)
                 S->>K: cache the result, count calls and tokens
                 S->>H: success and latency
                 S-->>P: validated result
@@ -308,33 +313,46 @@ sequenceDiagram
                 S->>K: cooldown until then (at most 6 h, survives between runs)
                 S->>H: failure
                 S-->>P: nothing
+            else web check: tool rejected or request above the plan's token limit
+                S->>K: back off 6 h (survives between runs)
+                S->>H: failure
+                S-->>P: nothing, the item is judged without the web check
             end
         end
     end
 ```
 
-| | Groq LLM (`llm_extraction`) | Jev (`jev_judgment`) |
-|---|---|---|
-| Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (Groq's production open-weight models: the larger for accuracy, the smaller as headroom because Groq's rate limits are per model) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
-| What it is | a text model: reads the article and returns structured JSON | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
-| Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
-| Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
-| Never | invents evidence | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
-| Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
-| Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, company and source class |
+| | Groq LLM (`llm_extraction`) | Web check (`llm_web`) | Jev (`jev_judgment`) |
+|---|---|---|---|
+| Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (Groq's production open-weight models: the larger for accuracy, the smaller as headroom because Groq's rate limits are per model) | the same models, when they offer the `browser_search` tool (the gpt-oss family only) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
+| What it is | a text model: reads the article and returns structured JSON | Groq's built-in, server-side web search (powered by Exa) driven by a gpt-oss model. A request of its own, because Groq documents that browser search cannot be combined with structured outputs | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
+| Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | do independent outlets report the same facts, did anyone deny or correct them, was the event already public; up to three facts and the hosts relied on | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
+| Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
+| Never | invents evidence | raises a severity or a confidence, clears a flag, runs for an exchange filing, an official statement or a company's own release, for macro or sector news, or in a replay or backtest | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
+| Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | the one thing the text cannot tell: is the rumour or the unverified deal true, denied or old | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
+| Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text and context | per news job: `LLM_WEB_MAX_PER_RUN` (8), 30 % of the LLM time box, a 1-day cache; HTTP 413 (the free tier's 8,000 tokens per minute) or a rejected tool backs it off for 6 h | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, context, company and source class |
 
 Where both answer, the direction of the company in focus is the mean of the two readings when they agree and *unknown* (0) when they
 point opposite ways; a direction offered for a rumour or a denial is halved, as the rules do. The company asked about is the one
 the rules or the LLM already signed the event for (for an order, the winner and not the customer), else the most prominent one.
 
-What the services see: the headline, the first 3 500 (LLM) or 2 500 (Jev) characters of the article, the company name and the
-source class. Never a key, a position, a prediction or any file of yours.
+**What the services see** (`news_intelligence/context.py`): the headline, the whole stored text (up to 6 000 characters), and a
+context block of the facts a human reader would use: when the item was published and when it is being checked (always in IST), the
+source with its class (exchange filing, official statement, company, news media, social) and tier (wire, business media,
+aggregator), the filing category, the issuer of a filing with its sector, the companies the entity matcher found in the text and,
+when the web check ran, its brief. The LLM also gets the definition of every event type (the same definitions Jev's choice question
+carries), so the rules, the LLM and Jev classify against one vocabulary. Never a key, a position, a prediction, a **price, a return or
+the rules' own verdict**: the AI is meant to be an independent second reader whose answer is then compared with the rules', and a
+price or a hindsight fact would let it explain a move instead of reading the news. Free text in the context (feed names, search
+results) is single-line, length-capped and stripped of control characters and of the tags that structure the prompt.
+The web check searches the public web; nothing of yours is sent with the request.
 
-How it is observed: `monster-ai ai-test` sends one made-up item through the real code and prints what came back or why not;
-`monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` / `jev.*` (calls, failures, tokens,
-cooldown) are in `kv` and in `monster-ai diag`; both services have a row in `source_health`, so the health check warns after
-repeated failures; the report's coverage note names a degraded service; every run's counts (used, cached, failed, skipped by
-budget, retyped, rumours, denials) are in `news.last_run`.
+How it is observed: `monster-ai ai-test` sends one made-up item through the real code (and makes one real web search) and prints
+what came back or why not; `monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` /
+`llmweb.*` / `jev.*` (calls, failures, tokens, cooldown) are in `kv` and in `monster-ai diag`; every service has a row in
+`source_health`, so the health check warns after repeated failures; the report's coverage note names a degraded extraction or Jev;
+every run's counts (used, cached, failed, skipped by budget, retyped, rumours, denials, web checks and refutations) are in
+`news.last_run`, and what the web check found is kept in the event's evidence.
 
 ## Packages
 
@@ -344,7 +362,7 @@ budget, retyped, rumours, denials) are in `news.last_run`.
 | [ingestion/](../ingestion) | the curl_cffi HTTP transport (`http.py`: browser impersonation, adaptive per-source rate limit, retries, circuit breaker, deadlines), Yahoo (chart + bulk `spark` probe), NSE archive and API clients, validation, universe building, freshness / data-quality gate, split-adjusted reads (`adjust.py`) and basis-break repair (`basis.py`), news collectors (RSS conditional GET), source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
 | [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups with a size budget (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
 | [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader |
-| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, then the optional Groq LLM `llm.py` and Jev `jev.py` behind the shared safety rails of `remote.py`; `ai_check.py` is the live self-check behind `ai-test`), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
+| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, then the optional Groq LLM `llm.py`, its web check `web.py` and Jev `jev.py` behind the shared safety rails of `remote.py`; `context.py` holds the facts both readers receive; `ai_check.py` is the live self-check behind `ai-test`), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
 | [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates, abstention, baselines |
 | [notifications/](../notifications) | Telegram client, report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`), idempotent delivery with a ledger and deadline guard |
@@ -459,8 +477,9 @@ flowchart TB
   they can be trusted (rumour, source class, independent sources, conflicts).
 - The AI services are advisers, never authorities: the rules always run, an AI answer only adds information (an LLM claim
   needs a quote that appears word for word in the text; Jev must be confident and may not clear a rumour flag or flag an
-  official filing), a failure falls back to the rules, and the report says when a service was degraded. They change which
-  catalysts are shown and how they are labelled, **not** the calibrated forecast.
+  official filing; the web check can only discount a story it found denied, never raise anything), a failure falls back to the
+  rules, and the report says when a service was degraded. They change which catalysts are shown and how they are labelled,
+  **not** the calibrated forecast.
 
 ## Scheduling and self-healing
 
@@ -794,6 +813,7 @@ flowchart TB
 | Holiday list of a new year not published | rule-based holidays plus the live pre-open confirmation; `holiday_inferred` alert and no report on a closed day |
 | RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
 | Groq LLM or Jev unavailable, unconfigured, rate-limited or rejected | the rules alone; the circuit opens for the run (at once on a rejected key), a quota starts a cooldown that survives between runs, the report's coverage note names the service, `source_health` warns after repeated failures |
+| Web check unavailable (free-tier token limit, rejected tool, slow or failing search) | the item is extracted and judged without it; the web check has its own circuit and a 6 h back-off, so the extraction is untouched; `source_health` (`llm_web`) warns after repeated failures |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
@@ -847,7 +867,8 @@ flowchart TB
   timeouts, size limits, bounded retries and secret-free error messages.
 - Outbound connections: the data providers, Telegram, and - only if configured - the object store, Groq (or another LLM endpoint) and
   Jev. Only public news text leaves the server for the AI services; their keys are secrets like the others (`GROQ_API_KEY` is never
-  sent to an endpoint other than Groq's).
+  sent to an endpoint other than Groq's). The web check's searches are made by Groq from its own servers: the server only sends the
+  request to Groq. Text that comes back from the web is untrusted: it is reduced to a bounded, validated brief before it is used.
 
 ## Resource budget
 

@@ -26,9 +26,11 @@ server with native systemd (no containers).
   `LOG_FORMAT`, `LOG_RETENTION_DAYS`, `LOG_MAX_MB`. `MONSTER_TIMEZONE` now selects the zone of **log stamps only** (market logic is
   always IST).
 - **Optional AI settings** (everything stays off until a key is set): `GROQ_API_KEY`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT`,
-  `LLM_MAX_SECONDS_PER_RUN`, `LLM_MAX_OUTPUT_TOKENS`, `TYPESAFE_API_KEY`, `JEV_MODEL`, `JEV_TIMEOUT_SEC`, `JEV_MAX_ITEMS_PER_RUN`,
-  `JEV_MIN_CONFIDENCE`. `LLM_API_BASE` + `LLM_MODEL` still select another OpenAI-compatible provider; `GROQ_API_KEY` is never sent to
-  any endpoint but Groq's. After adding a key: `sudo systemctl restart monster-ai` and `sudo monster-ai ai-test`.
+  `LLM_MAX_SECONDS_PER_RUN`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`, `TYPESAFE_API_KEY`, `JEV_MODEL`,
+  `JEV_TIMEOUT_SEC`, `JEV_MAX_ITEMS_PER_RUN`, `JEV_MIN_CONFIDENCE`. `LLM_API_BASE` + `LLM_MODEL` still select another
+  OpenAI-compatible provider; `GROQ_API_KEY` is never sent to any endpoint but Groq's. The web check is **on by default as soon as
+  a Groq key is set** (it bills a search fee and needs more than Groq's free per-minute token limit; `LLM_WEB_SEARCH=false` turns it
+  off). After adding a key: `sudo systemctl restart monster-ai` and `sudo monster-ai ai-test`.
 - **New dependency** `curl_cffi` (binary wheels for linux x86-64 and aarch64, Python 3.10-3.13; the installer and the CI wheel guard
   cover it).
 - **logrotate** no longer touches the application's own log files (they are daily files pruned by the application); the installer
@@ -104,6 +106,20 @@ server with native systemd (no containers).
   news text leaves the server. Where both answer, a direction on which they disagree is left unknown. They improve the news evidence
   (catalysts, rumour flags, chains), **not** the calibrated forecast. `monster-ai ai-test` checks the keys with one made-up item
   (`--list-only` spends no tokens) and `doctor` probes them for free.
+- **Complete context for both AI readers** (`news_intelligence/context.py`): besides the whole stored text (up to 6 000 characters; it was
+  3 500 for the LLM and 2 500 for Jev), the LLM prompt and Jev's state carry when the item was published and when it is checked (IST),
+  the source with its class and tier, the filing category, the issuer with its sector, the companies the entity matcher found and the
+  web brief; the LLM prompt also defines every event type (the definitions moved to `events.EVENT_DESCRIPTIONS`, shared with Jev).
+  Prices, returns and the rules' verdict are left out on purpose (an independent second reader). Free text is single-line, capped,
+  stripped of control characters and of the prompt's block tags. Cache keys follow the context but not the time of the check.
+  Prompt versions `v3` / `j2` retire older cached answers.
+- **Optional web check** (`news_intelligence/web.py`): Groq's server-side `browser_search` tool on the gpt-oss models, used before the
+  extraction for company news that is not first-hand and is a rumour or could matter. A request of its own, because Groq documents that
+  browser search cannot be combined with structured outputs; it returns a small brief validated field by field, which joins both
+  readers' context. By itself it changes one thing: a *sourced denial* found elsewhere turns the item into a refuted rumour (half the
+  severity); a confirmation changes nothing. Own budget (`LLM_WEB_MAX_PER_RUN`, 8), 30 % of the LLM time box, 1-day cache, circuit
+  breaker, cooldown and `source_health` row (`llm_web`); HTTP 413 (Groq's free tier of 8 000 tokens per minute) or a rejected tool backs
+  it off for 6 h; never used by a replay; shown by `ai-test`, `doctor`, the test message and the news job's AI note.
 - **Notifications** (`notifications/`): Telegram client, 4096-character-safe renderers (pre-open, final, evening, alerts,
   failure notices, failed-service alerts), idempotent delivery ledger, deadline guard, queued alerts flushed when Telegram returns; catalysts show their
   provenance (rumour flag, source class, independent sources, conflicts) and the regime line shows GIFT Nifty while its quote is fresh.
@@ -232,6 +248,9 @@ small in every case except the first; the gain is less to run, maintain and expl
   limits table in [docs/BLUEPRINT_TRACEABILITY.md](docs/BLUEPRINT_TRACEABILITY.md).
 - Lunar-calendar exchange holidays of a year whose official list is not yet published are confirmed live on the day (no report is sent,
   the operator is told), not predicted.
-- The Groq and Jev integrations were built and tested against scripted responses, never against the live services (no keys existed at
-  build time); `sudo monster-ai ai-test` is the first live test. Groq retires models from time to time, so a model name may need
-  updating (the fallback model and `ai-test` surface it). Jev judges news; it was not evaluated as a price forecaster.
+- The Groq and Jev integrations, the web check included, were built and tested against scripted responses, never against the live
+  services (no keys existed at build time); `sudo monster-ai ai-test` is the first live test. Groq's model names and the web tool's
+  contract were read from Groq's documentation on 2026-11-02; Groq retires models from time to time, so a model name may need
+  updating (the fallback model and `ai-test` surface it). The shape of a browser-search reply is only read defensively (the
+  final message text), never relied on. Jev judges news; it was not evaluated as a price forecaster. The web check cannot be
+  evaluated historically (the web of the past is not available), so its value is judged by reading its evidence, not by a backtest.

@@ -99,7 +99,7 @@ calibrated"* and caps every name at WATCH.
 | `run-job NAME [--force] [--dry-run] [--opt K=V]` | run one scheduled job by hand (for example `refresh_calendar`) |
 | `telegram-test`, `telegram-setup` | test message; discover the chat id |
 | `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message (made-up data, each marked *SAMPLE PREVIEW*) |
-| `ai-test [--service llm\|jev] [--list-only] [--json]` | check the optional Groq / Jev keys: one made-up news item through the real code, `OK` or exactly why not (`--list-only` spends no tokens), see [the AI services](#the-ai-services-groq-and-jev) |
+| `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the optional Groq / Jev keys: one made-up news item through the real code (and one real web search when the web check is on), `OK` or exactly why not (`--list-only` spends no tokens and makes no search), see [the AI services](#the-ai-services-groq-and-jev) |
 | `bootstrap --resume` | continue a first-run setup that stopped |
 | `version` | the version and the **code fingerprint** (`1.0.0+3fa9c1d2`) that is stamped on every frozen report and model |
 | `dashboard` | optional read-only web view (loopback; use an SSH tunnel) |
@@ -133,6 +133,7 @@ Optional capabilities, all off by default:
 | Capability | Variables |
 |------------|-----------|
 | Groq LLM: event extraction from news | `GROQ_API_KEY` (default model `openai/gpt-oss-120b`, fallback `openai/gpt-oss-20b`); tune with `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT` (low), `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_MAX_OUTPUT_TOKENS` (1200), `LLM_TIMEOUT_SEC` (40). Another OpenAI-compatible provider: `LLM_API_BASE` + `LLM_MODEL` (+ `LLM_API_KEY`). Rules-only without a key; every LLM claim needs a verifiable quote. See [the AI services](#the-ai-services-groq-and-jev) |
+| Groq web check: is an unconfirmed company story true, denied or old | on by default once `GROQ_API_KEY` is set (Groq with a gpt-oss model only); `LLM_WEB_SEARCH` (true), `LLM_WEB_MAX_PER_RUN` (8 per news job, 0 = off). Needs a plan with a per-minute token limit above one search (not Groq's free tier); billed on top of the tokens |
 | Jev (TypeSafe AI): news judgments | `TYPESAFE_API_KEY`; `JEV_MODEL` (`jev-1.14.0`, pinned), `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5), `JEV_TIMEOUT_SEC` (20) |
 | Off-box storage (backups, external models) | `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX` |
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
@@ -173,7 +174,7 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `health_storage_budget` / `health_storage_over_budget` | the data directory uses 80 % of / more than `DATA_MAX_MB` | `monster-ai storage`; `monster-ai storage --prune`; see [storage](#storage-and-retention) |
 | `health_wal_large` | the database WAL file is above 256 MB: a long-running reader (dashboard, a stuck job) blocks checkpoints | restart the dashboard or the daemon; then `monster-ai storage --prune --vacuum` |
 | `health_retention_never_ran` / `health_retention_stale` / `health_retention_errors` / `retention` | the nightly retention (inside `housekeeping`) has not completed for days, or some of its rules failed | `monster-ai logs --job housekeeping`; `monster-ai storage --prune --dry-run` shows what it would do |
-| `health_source_<id>` | a data source - or an AI service (`llm_extraction`, `jev_judgment`) - failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability; for the AI services see [the AI services](#the-ai-services-groq-and-jev) |
+| `health_source_<id>` | a data source - or an AI service (`llm_extraction`, `llm_web`, `jev_judgment`) - failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability; for the AI services see [the AI services](#the-ai-services-groq-and-jev) |
 | `health_telegram_not_configured` / `health_report_not_delivered` | no token/chat id, or the last final report could not be sent | `telegram-setup`; check the token |
 | `telegram_delivery_failed` / `report_deadline_missed` | a message could not be delivered (queued, retried) / a final report would have arrived after 09:14:30 and was withheld | check Telegram connectivity; nothing to do for the latter |
 | `health_calibration_drift` / `health_skill_negative` | live calibration worse than 0.10 ECE / live Brier skill below the base rate over the last 90 days | see [models](#models); consider `models rollback` |
@@ -265,12 +266,14 @@ real test):
 ```bash
 sudo nano /etc/monster-ai/monster.env     # GROQ_API_KEY=...   and / or   TYPESAFE_API_KEY=...
 sudo systemctl restart monster-ai
-sudo monster-ai ai-test                   # lists the models each key can use, then sends one made-up item through the real code
-sudo monster-ai ai-test --list-only       # only the key and the model names: spends no tokens
+sudo monster-ai ai-test                   # lists the models each key can use, then one made-up item (and one web search) through the real code
+sudo monster-ai ai-test --list-only       # only the key and the model names: spends no tokens and makes no web search
+sudo monster-ai ai-test --service web     # only the web check: one real search (tens of seconds, billed)
 ```
 
-`ai-test` prints one line per service: `OK`, `WARN` (it works, with a remark), `FAIL` (with the reason and the usual remedy) or
-`OFF`. `sudo monster-ai doctor` shows the same key check without spending tokens. It exits 0 when every configured service answers.
+`ai-test` prints one line per service (the LLM, its web check and Jev): `OK`, `WARN` (it works, with a remark), `FAIL` (with the reason
+and the usual remedy) or `OFF` (with why). `sudo monster-ai doctor` shows the same key check without spending tokens. It exits 0 when
+every configured service answers; a web check that cannot run is only a `WARN`, because every item is then judged without it.
 
 | What you see | Meaning | What to do |
 |--------------|---------|------------|
@@ -281,22 +284,28 @@ sudo monster-ai ai-test --list-only       # only the key and the model names: sp
 | `FAIL ... cannot reach the service` | no outbound HTTPS to `api.groq.com` / `api.typesafe.ai` from this machine | allow it (firewall, proxy) |
 | `WARN ... expected order_win` | the service answered, but not what any sound model answers for the sample | check `LLM_MODEL` / `JEV_MODEL`; the answer is still used only after its own validation |
 | `WARN ... evidence quote was not found` | the LLM answered but did not quote the text word for word; the pipeline ignores such answers | try again; if it persists use a larger model |
+| `Groq web check WARN ... tokens-per-minute limit (HTTP 413)` | a web search reads far more tokens than the plan allows per minute (Groq's free tier: 8,000) | upgrade to Groq's Developer plan, or set `LLM_WEB_SEARCH=false`; until then every item is judged without the web check, and the check retries every 6 h |
+| `Groq web check WARN ... rejected the browser_search tool` | the configured models do not offer the tool (it exists on the gpt-oss models only) | keep a gpt-oss model as `LLM_MODEL` or `LLM_FALLBACK_MODEL`, or set `LLM_WEB_SEARCH=false` |
+| `Groq web check OFF ... disabled` / `needs Groq with a gpt-oss model` | `LLM_WEB_SEARCH=false`, `LLM_WEB_MAX_PER_RUN=0`, or another provider / model | nothing to fix unless you want the web check |
 | report says "LLM extraction degraded" / "Jev judgment degraded (rule-based extraction used)" | that service failed in its latest run; the news was labelled by the rules | `sudo monster-ai logs --grep "llm failed"` or `--grep "jev failed"` for the reason; `ai-test` |
-| alert `health_source_llm_extraction` / `health_source_jev_judgment` | the service failed 5 times in a row | same as above; the daily news runs keep trying |
+| alert `health_source_llm_extraction` / `health_source_llm_web` / `health_source_jev_judgment` | the service failed 5 times in a row (within one run the web check's circuit opens after 3) | same as above; the daily news runs keep trying. A failing web check never affects the extraction |
 
-**Where to look.** `monster-ai logs --grep "jev failed"` (WARNING lines carry the reason, never the key); `monster-ai diag` lists the
-counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.cooldown_until` and the same with `jev.`; the
-`news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`, `llm_skipped_budget` and the `jev_*`
-equivalents, plus `jev_retyped`, `jev_rumours`, `jev_denials`).
+**Where to look.** `monster-ai logs --grep "jev failed"` (also `"llm failed"`, `"llmweb failed"`; WARNING lines carry the reason, never the
+key); `monster-ai diag` lists the counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.cooldown_until` and the
+same with `llmweb.` and `jev.`; the `news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`,
+`llm_skipped_budget` and the `web_*` and `jev_*` equivalents, plus `web_refuted`, `jev_retyped`, `jev_rumours`, `jev_denials`); an
+event's evidence shows what the web check found (`web`), and its `extraction_method` says which services contributed (`rules+web+llm+jev`).
 
-**Cost and limits.** Each distinct article is sent at most once in 14 days (results are cached by text); items the rules already
-call irrelevant are never sent; each news job is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`) and time-boxed (240 s / 180 s; a backlog
-drained in several batches shares the cap). Groq has a
-free tier with per-model limits (tokens per minute bind first, which is why the fallback model adds headroom); paid use and Jev are
-priced per token by the providers (at the time of writing Jev was a few cents per million input tokens, which at these caps is well
-under a dollar a month): check their price lists.
+**Cost and limits.** Each distinct article is sent at most once in 14 days (results are cached by text and context); items the rules
+already call irrelevant are never sent; each news job is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`,
+`LLM_WEB_MAX_PER_RUN`) and time-boxed (240 s, of which the web checks may use 30 %, / 180 s; a backlog drained in several batches shares
+the caps). Groq has a free tier with per-model limits (tokens per minute bind first, which is why the fallback model adds headroom;
+**the free tier is too small for the web check**); paid use and Jev are priced per token by the providers (at the time of writing Jev
+was a few cents per million input tokens, which at these caps is well under a dollar a month), and Groq bills the web search tool
+on top of the tokens: check their price lists. At most 8 searches per news job and 30 % of the time box bound the web check's share.
 
-**Turn off:** delete the key from `monster.env` and restart. Nothing else depends on them; cached answers expire after 14 days.
+**Turn off:** delete the key from `monster.env` and restart. Nothing else depends on them; cached answers expire after 14 days. To keep
+Groq but stop only the web searches: `LLM_WEB_SEARCH=false`.
 
 ### Disk or memory pressure
 

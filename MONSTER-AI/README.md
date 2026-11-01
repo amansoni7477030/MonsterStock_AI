@@ -40,7 +40,7 @@ retrains weekly under fixed validation gates.
 | **Traceability** | daily log files per process role plus a shared errors file, millisecond stamps with offset, per-job tags, crash hooks, secret redaction, `monster-ai logs` / `diag`, and every frozen report stamped with the exact code that made it |
 | **Self-healing** | resumable bootstrap, ledger-based scheduler (nothing runs twice, missed work is visible), RSS watchdog, systemd restart + watchdog + independent health timer, heartbeat file, queued alerts, automatic model rollback to a labelled baseline, verified backups |
 | **Honesty** | calibrated probabilities, fixed gates, tier caps, sample sizes and 95 % intervals on every live statistic, explicit "no setup" |
-| **Optional AI** | **Groq** (open-weight `openai/gpt-oss-120b`, fallback `gpt-oss-20b`) reads news for structure and **Jev** (TypeSafe AI) judges event type, rumour, denial, severity and direction with calibrated confidence. Both are off until you add a key, are cached, budgeted and rate-limit aware, fall back to the rules on any failure and never change the calibrated forecast ([details](#optional-ai-groq-and-jev)) |
+| **Optional AI** | **Groq** (open-weight `openai/gpt-oss-120b`, fallback `gpt-oss-20b`) reads news for structure and can **check unconfirmed company news on the web** (its built-in browser search); **Jev** (TypeSafe AI) judges event type, rumour, denial, severity and direction with calibrated confidence. Both are given the facts a human reader would use (when, by whom, which company and sector), are off until you add a key, are cached, budgeted and rate-limit aware, fall back to the rules on any failure and never change the calibrated forecast ([details](#optional-ai-groq-and-jev)) |
 
 ## What you have to do
 
@@ -239,7 +239,7 @@ every job restart-safe: missed windows are recorded and alerted, catch-up jobs r
 | `logs [--role R] [--date D] [-n N] [--level L] [--job J] [--grep T] [--since 90m] [--follow] [--list]` | read, filter and follow the daily logs (default: today's warnings and errors of every process) |
 | `diag` | write a redacted diagnostics bundle (`diag-<UTC>.tar.gz`) for a bug report |
 | `telegram-setup`, `telegram-test`, `telegram-preview` | discover the chat id; send a test message; send one sample of every message type (made-up data, marked *SAMPLE PREVIEW*) |
-| `ai-test [--service llm\|jev] [--list-only] [--json]` | check the Groq / Jev keys: lists the models the key can use, then sends one made-up news item through the real code and prints the answer or why not (`--list-only` spends no tokens) |
+| `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the Groq / Jev keys: lists the models the key can use, then sends one made-up news item through the real code (and makes one real web search when the web check is on) and prints the answer or why not (`--list-only` spends no tokens and makes no search) |
 | `dashboard` | optional read-only web view |
 | `env-example`, `version` | print the documented `.env` template; print the version and the running code fingerprint |
 | `alert-unit UNIT` | internal: the systemd `OnFailure=` hook |
@@ -260,7 +260,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
 | Resources | `MIN_FREE_DISK_MB_WARN` / `_CRIT`, `JOB_MAX_RSS_MB` (720) |
 | Training | `TRAINING_MODE` (`local-light`, `external` signed models, or `disabled`), `MODEL_SIGNING_KEY`, S3 storage for off-box backups and model bundles |
-| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it or to use another provider), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
+| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
 
 ### Optional AI: Groq and Jev
 
@@ -271,15 +271,17 @@ Both are **off until you add a key**; with no key the deterministic rules do eve
 | Key | `GROQ_API_KEY` ([console.groq.com](https://console.groq.com)) | `TYPESAFE_API_KEY` ([typesafe.ai](https://typesafe.ai)) |
 | Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (`LLM_MODEL`, `LLM_FALLBACK_MODEL` override) | `jev-1.14.0`, pinned (`JEV_MODEL`) |
 | What it does | reads an article and returns event type, companies with a direction, severity, horizon, event time and a **verbatim evidence quote** | answers five typed questions about an article in one request: event type, rumour, denial, severity and direction for the company in focus, each with calibrated probabilities |
+| What it is given | the whole stored text (up to 6,000 characters), the definition of every event type and a **context block** (see below) | the same text and the same facts as typed fields of its state |
+| Web access | Groq's built-in `browser_search` for non-first-hand company news that matters (`LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`), see [the web check](#the-web-check) | none: it judges what it is shown, including the web check's result |
 | What it is not | a source of facts: a claim without a quote that appears word for word in the text is ignored | a price forecaster or a chat model: it judges news, it does not predict prices |
-| Cost caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240) | `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5) |
+| Cost caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_WEB_MAX_PER_RUN` (8) | `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5) |
 
 Turn them on (the file edit is the only manual step; no code or container changes):
 
 ```bash
 sudo nano /etc/monster-ai/monster.env     # set GROQ_API_KEY=... and / or TYPESAFE_API_KEY=...
 sudo systemctl restart monster-ai
-sudo monster-ai ai-test                   # one made-up item through the real code: OK, or exactly why not
+sudo monster-ai ai-test                   # one made-up item (and one web search) through the real code: OK, or exactly why not
 ```
 
 How to think about them:
@@ -288,15 +290,48 @@ How to think about them:
   calendar features; news is evidence shown beside it (catalysts, rumour flags, chains, "already priced in"). The AI makes that
   evidence more accurate: it recognises events the rules cannot, flags rumours and denials, and gives a calibrated second opinion
   on severity and direction. Where Groq and Jev disagree on a direction it is left unknown.
-- **They can never block or corrupt a report.** Results are cached for 14 days by text; each news job has a call and a time budget (a
+- **They are given the facts a human reader would use.** Besides the text, both get when the item was published and when it is being
+  checked (in IST), the source and how far it can be trusted (exchange filing, official statement, company, wire, media, social),
+  the filing category and issuer with its sector, and the companies the entity matcher found; the LLM also gets the definition of
+  every event type. That is what lets them resolve "yesterday", tell a first-hand filing from an anonymous-source story and judge
+  a direction for the right company. They are **never** given prices, returns or the rules' own verdict: the AI is meant to be an
+  independent second reader, and a price would let it explain a move instead of reading the news. More context makes wrong
+  readings rarer, it cannot make them impossible, which is why every answer is still validated (the quote must appear word for
+  word, a choice must be an allowed option, a confidence must pass its threshold) and the rules remain the fallback.
+- **They can never block or corrupt a report.** Results are cached for 14 days by text and context; each news job has a call and a time budget (a
   backlog drained in several batches shares it); a
   provider's `Retry-After` is honoured, a rate-limited Groq model hands over to the fallback model, an exhausted quota starts a
   cooldown that survives between runs, and a rejected key stops the service for the run. Any failure falls back to the rules, the
   report's coverage note names the degraded service, and `monster-ai health` warns after repeated failures.
-- **Only public news text leaves the server** (headline, the first few thousand characters of the article, a company name and the
-  source class): never keys, positions or predictions. `GROQ_API_KEY` is never sent to any other endpoint.
-- **Everything is traceable:** `monster-ai ai-test`, the `llm.*` / `jev.*` counters in `monster-ai diag`, per-run counts in
-  `news.last_run`, one row per service in `source_health`, and WARNING lines in the logs with the reason (never the key).
+- **Only public news text leaves the server** (headline, the article text, the context facts above and a company name): never keys,
+  positions or predictions. `GROQ_API_KEY` is never sent to any other endpoint.
+- **Everything is traceable:** `monster-ai ai-test`, the `llm.*` / `llmweb.*` / `jev.*` counters in `monster-ai diag`, per-run counts in
+  `news.last_run`, one row per service in `source_health`, what the web check found in the event's evidence, and WARNING lines in
+  the logs with the reason (never the key).
+
+#### The web check
+
+Groq's `gpt-oss` models can search the web through a built-in, server-side tool (`browser_search`). MONSTER AI uses it for one
+purpose: to settle whether an unconfirmed-looking company story is true, denied or old, before the extraction and Jev judge it.
+
+- **Which items.** Company news that is not first-hand (never an exchange filing, an official statement or the company's own release)
+  and that is either a rumour the rules already flagged or a deal, order, fund-raising, court / regulator or management story with
+  enough severity to matter. Macro and sector news, results and dividends are reported everywhere and are never searched for.
+- **What it returns.** A small JSON brief, validated field by field before it is used: do independent outlets report the same
+  facts (yes / no / unclear), how many, was a denial or correction found, was the event already public, up to three short facts and
+  the host names relied on. A page that says "ignore your instructions" can at most colour those fields.
+- **What it changes.** Both readers get the brief as context. By itself it changes one thing only: a **sourced denial** found
+  elsewhere, with the facts not confirmed, turns the item into a rumour with a denial's discounts (half the severity, a halved
+  direction). A confirmation never raises anything, and it is kept in the event's evidence so you can see why a flag was set.
+- **Why a separate request.** Groq documents that browser search cannot be combined with structured outputs, so a search request
+  cannot also force the strict JSON schema the extraction relies on. Kept apart, the extraction stays schema-constrained.
+- **What it costs.** A search reads far more tokens than an extraction and Groq bills the tool separately. It has its own cap
+  (`LLM_WEB_MAX_PER_RUN`, 8 per news job), its own share of the time box (30 %), cache (1 day), circuit breaker and cooldown, so a
+  failing search never affects the extraction. **Groq's free tier (8,000 tokens per minute) is too small for a search** (HTTP 413):
+  the check then backs off for 6 hours and every item is judged without it. The Developer plan works. Set `LLM_WEB_SEARCH=false`
+  to switch it off.
+- **Point in time.** The web of today is not the web of last year: the check runs only in the live pipeline, never in a replay or a
+  backtest, and its result is cached for one day only.
 
 ## Reliability guarantees
 
