@@ -21,7 +21,7 @@ import logging
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -46,10 +46,12 @@ from news_intelligence.dedup import (
     Signature,
     event_confidence,
 )
+from news_intelligence.context import MAX_MENTIONED, NewsContext, WebBrief
 from news_intelligence.entities import Entity, EntityResolver
 from news_intelligence.events import (
     EVENT_TYPES,
     EventDraft,
+    apply_refutation,
     assign_polarity,
     classify_rules,
     extract_moves,
@@ -61,6 +63,7 @@ from news_intelligence.priced_in import assess_reaction
 from news_intelligence.remote import RemoteJudge
 from news_intelligence.source_quality import get_registry, source_class_of, split_publisher_suffix
 from news_intelligence.text import clean_text, domain_of, is_probably_english, lead, url_hash
+from news_intelligence.web import WebResearcher, prune_web_cache
 from ranking.types import Catalyst
 
 log = logging.getLogger(__name__)
@@ -76,6 +79,13 @@ MAX_ENTITIES = 24
 MAX_CONTRADICTIONS = 8
 ENGLISH_CODES = frozenset({"", "en", "eng", "english"})
 OFFICIAL_CLASSES = frozenset({"exchange_filing", "official"})  # first-hand reports: never a rumour, whatever an AI says
+# Company news whose facts a web check can settle and that moves prices when it is true (or false): deals, orders, money raised,
+# court and regulator action, who runs the company.
+WEB_CHECK_TYPES = frozenset({
+    "merger_acquisition", "order_win", "order_loss", "government_contract", "fundraising", "litigation_regulatory",
+    "management_change",
+})
+WEB_MIN_SEVERITY = 0.4  # the rules' severity below which even such a story is not worth a web check
 BarsProvider = Callable[[str, str | None, str | None], pd.DataFrame]
 
 
@@ -97,6 +107,11 @@ class ProcessStats:
     jev_retyped: int = 0  # items whose event type Jev changed
     jev_rumours: int = 0  # items Jev flagged as an unconfirmed rumour that the rules had missed
     jev_denials: int = 0
+    web_used: int = 0  # web checks that came back (a cached one is counted in ``web_cached``)
+    web_cached: int = 0
+    web_failed: int = 0
+    web_skipped_budget: int = 0
+    web_refuted: int = 0  # items whose report a web check found denied elsewhere (the rumour discount was applied)
     skipped_non_english: int = 0
     skipped_empty: int = 0
     skipped_routine: int = 0
@@ -157,6 +172,16 @@ def _consensus(direction: float, other: float) -> float:
     return round((direction + other) / 2.0, 3) if direction * other > 0 else 0.0
 
 
+def _wants_web(draft: EventDraft, source_class: str) -> bool:
+    """Which items deserve a web check: company news of a kind a search can settle (``WEB_CHECK_TYPES``) that could matter
+    (``WEB_MIN_SEVERITY``), and any company story the rules already read as an unconfirmed rumour. Exchange filings and official
+    statements are the primary source, an item that is itself a denial needs no confirmation, and macro or sector news is
+    reported everywhere: a check there would only spend the budget."""
+    if source_class in OFFICIAL_CLASSES or draft.is_denial or draft.scope != "company" or draft.event_type == "other":
+        return False
+    return draft.is_rumour or (draft.event_type in WEB_CHECK_TYPES and draft.severity >= WEB_MIN_SEVERITY)
+
+
 def _failing(service: RemoteJudge) -> bool:
     """True when an AI service is refusing us (cooldown) or failed often enough in this run that rules covered the items.
     Running out of the run's time budget is not a failure."""
@@ -173,18 +198,21 @@ class NewsPipeline:
         clock: Clock | None = None,
         llm: LLMExtractor | None = None,
         jev: JevJudge | None = None,
+        web: WebResearcher | None = None,
         resolver: EntityResolver | None = None,
         point_in_time_edges: bool = False,
     ) -> None:
         """``point_in_time_edges``: for replays, propagate events over the graph edges valid at each ``as_of`` (the edge
-        history) instead of today's edges."""
+        history) instead of today's edges. A replay never makes web checks: what the web says today is not what it said then."""
         self.store = store
         self.settings = settings
         self.clock = clock or get_clock()
         self.resolver = resolver or EntityResolver(store)
         self.llm = llm if llm is not None else (LLMExtractor(settings, clock=self.clock) if settings.llm_configured else None)
         self.jev = jev if jev is not None else (JevJudge(settings, clock=self.clock) if settings.jev_configured else None)
-        for service in (self.llm, self.jev):
+        live_web = settings.llm_web_configured and not point_in_time_edges
+        self.web = web if web is not None else (WebResearcher(settings, clock=self.clock) if live_web else None)
+        for service in (self.llm, self.jev, self.web):
             if service is not None:
                 service.bind(store=store, resolver=self.resolver)
         self.point_in_time_edges = point_in_time_edges
@@ -202,7 +230,7 @@ class NewsPipeline:
         call budget, time box and circuit breaker for the whole job (the counts returned are still those of this call)."""
         started = self.clock.monotonic()
         stats = ProcessStats()
-        services = {"llm": self.llm, "jev": self.jev}
+        services = {"llm": self.llm, "jev": self.jev, "web": self.web}
         if new_run:
             for service in services.values():
                 if service is not None:
@@ -449,9 +477,9 @@ class NewsPipeline:
     # ----------------------------------------------------------------------------------- analysis
     def _analyse(
         self, title: str, body: str, *, category: str | None, source_kind: str, symbol: str | None, company: str | None,
-        stats: ProcessStats,
-    ) -> tuple[EventDraft, list[Entity], str, str, str | None, str | None] | None:
-        """(draft, entities, scanned text, method, quote, event_time) or ``None`` when the item is not an event."""
+        stats: ProcessStats, context: NewsContext | None = None,
+    ) -> tuple[EventDraft, list[Entity], str, str, str | None, str | None, WebBrief | None] | None:
+        """(draft, entities, scanned text, method, quote, event_time, web brief) or ``None`` when the item is not an event."""
         scan = f"{title}. {body}" if title else body
         draft = classify_rules(title, body, category=category, source_kind=source_kind)
         if draft.routine:
@@ -470,13 +498,17 @@ class NewsPipeline:
         method, quote, event_time = "rules", None, None
         ai_polarity: dict[str, float] = {}  # directions an AI service gave a company: they override the rules' reading
         worth_asking = draft.event_type != "other" or bool(entities)  # the rules already said the item is irrelevant: spend nothing
-        result = self.llm.extract(title, body) if self.llm is not None and worth_asking else None
+        context = self._complete_context(context or NewsContext(), entities, symbol, company)
+        brief = self._web_check(title, body, draft, context, source_kind, worth_asking, stats)
+        if brief is not None:
+            method, context = "rules+web", context.with_web(brief)
+        result = self.llm.extract(title, body, context) if self.llm is not None and worth_asking else None
         if result is not None:
-            method = "rules+llm"
+            method += "+llm"
             quote, event_time = self._merge_llm(draft, entities, result, scan, ai_polarity)
         pol = assign_polarity(draft, entities, scan)
         if self.jev is not None and worth_asking:
-            judged = self._judge_with_jev(title, body, draft, entities, scan, source_kind, ai_polarity, pol, stats)
+            judged = self._judge_with_jev(title, body, draft, entities, scan, source_kind, ai_polarity, pol, stats, context)
             if judged is not None:
                 method, pol = f"{method}+jev", judged
         for entity in entities:
@@ -486,11 +518,44 @@ class NewsPipeline:
         if draft.event_type == "other" and not entities:
             stats.skipped_irrelevant += 1
             return None
-        return draft, entities[:MAX_ENTITIES], scan, method, quote, event_time
+        return draft, entities[:MAX_ENTITIES], scan, method, quote, event_time, brief
+
+    def _complete_context(
+        self, context: NewsContext, entities: Sequence[Entity], symbol: str | None, company: str | None
+    ) -> NewsContext:
+        """Add what the entity step found to the context the caller built: the companies mentioned in the text and, for a filing,
+        the issuer with its sector, and the moment of this check."""
+        mentioned = tuple(
+            entity.name if entity.id.startswith("global:") else f"{entity.name} ({entity.id})"
+            for entity in entities if entity.type == "company"
+        )[:MAX_MENTIONED]
+        changes: dict[str, Any] = {"mentioned": mentioned, "now": context.now or self.clock.now()}
+        if symbol:
+            name = company or self.resolver.company_name(symbol) or symbol
+            changes.update(company=f"{name} ({symbol})", symbol=symbol, sector=self._sector_name(symbol))
+        return replace(context, **changes)
+
+    def _sector_name(self, symbol: str | None) -> str | None:
+        node = self.resolver.industry_node(symbol) if symbol else None
+        sector = self.resolver.resolve(node) if node else None
+        return sector.name if sector is not None else None
+
+    def _web_check(
+        self, title: str, body: str, draft: EventDraft, context: NewsContext, source_kind: str, worth_asking: bool,
+        stats: ProcessStats,
+    ) -> WebBrief | None:
+        """The web brief for an item that deserves one (see :func:`_wants_web`), else ``None``. A brief that finds the report denied
+        elsewhere turns the draft into a refuted rumour (a confirmation changes nothing by itself: it only informs the readers)."""
+        if self.web is None or not worth_asking or not _wants_web(draft, source_class_of(source_kind)):
+            return None
+        brief = self.web.research(title, body, context)
+        if brief is not None and brief.refutes and apply_refutation(draft):
+            stats.web_refuted += 1
+        return brief
 
     def _judge_with_jev(
         self, title: str, body: str, draft: EventDraft, entities: list[Entity], scan: str, source_kind: str,
-        ai_polarity: dict[str, float], pol: dict[str, float], stats: ProcessStats,
+        ai_polarity: dict[str, float], pol: dict[str, float], stats: ProcessStats, context: NewsContext | None = None,
     ) -> dict[str, float] | None:
         """Ask Jev about the item and fold its judgment into the draft (see :func:`merge_jev`). The direction question is about
         the company the rules or the LLM already signed the event for, else the most prominent one, and the answer is blended
@@ -500,7 +565,11 @@ class NewsPipeline:
         signed = [e for e in entities if known.get(e.id)]
         focus = max(signed, key=lambda e: abs(known[e.id])) if signed else primary_company(entities)
         kind = source_class_of(source_kind)
-        judgment = self.jev.judge(title, body, company=focus.name if focus is not None else None, source_kind=kind)
+        if context is not None and focus is not None:  # the sector that matters is the focus company's, not the filer's
+            context = replace(context, sector=self._sector_name(focus.id) or context.sector)
+        judgment = self.jev.judge(
+            title, body, company=focus.name if focus is not None else None, source_kind=kind, context=context
+        )
         if judgment is None:
             return None
         effect = merge_jev(draft, judgment, min_confidence=self.jev.min_confidence, official=kind in OFFICIAL_CLASSES)
@@ -583,13 +652,17 @@ class NewsPipeline:
             source_name = publisher or source_name
         quality, source_kind = registry.resolve(source_name, row["feed"], url, row["category"])
         owner = registry.publisher_key(source_name, row["feed"], url)
+        seen = parse_ts(row["first_seen_at"])
+        context = NewsContext(
+            kind="article", source=source_name, domain=host, source_class=source_class_of(source_kind), source_tier=source_kind,
+            category=row["category"], published_at=parse_ts(self._sane_published(row["published_at"], iso(seen) or "")),
+        )
         analysed = self._analyse(
-            title, body, category=None, source_kind=source_kind, symbol=None, company=None, stats=stats
+            title, body, category=None, source_kind=source_kind, symbol=None, company=None, stats=stats, context=context
         )
         if analysed is None:
             return None
-        draft, entities, _scan, method, quote, event_time = analysed
-        seen = parse_ts(row["first_seen_at"])
+        draft, entities, _scan, method, quote, event_time, brief = analysed
         if seen is None:
             raise ValueError("first_seen_at is not a timestamp")
         sig = Signature.build(title, body)
@@ -605,6 +678,7 @@ class NewsPipeline:
             published_iso=self._sane_published(row["published_at"], iso(seen) or ""), event_time_iso=event_time,
             region=row["region"], draft=draft, entities=entities, scope=self._scope_for(draft, entities), method=method,
             quote=quote, quality=quality, source_kind=source_kind, cluster_base="news:" + sig.chash[:24],
+            extra={"web": brief.to_dict()} if brief is not None else {},
         )
 
     def _prepare_filing(self, row: sqlite3.Row, stats: ProcessStats) -> _Prepared | None:
@@ -615,17 +689,19 @@ class NewsPipeline:
             return None
         symbol = (row["symbol"] or "").strip() or None
         quality, source_kind = get_registry().resolve(row["exchange"], None, row["attachment_url"], "filing")
+        seen = parse_ts(row["first_seen_at"])
+        disseminated = parse_ts(row["disseminated_at"])
+        context = NewsContext(
+            kind="filing", source=row["exchange"], source_class=source_class_of(source_kind), source_tier=source_kind,
+            category=row["category"], published_at=disseminated or seen,
+        )
         analysed = self._analyse(
-            title, body, category=row["category"], source_kind=source_kind, symbol=symbol, company=row["company"], stats=stats
+            title, body, category=row["category"], source_kind=source_kind, symbol=symbol, company=row["company"], stats=stats,
+            context=context,
         )
         if analysed is None:
             return None
-        draft, entities, _scan, method, quote, event_time = analysed
-        seen = parse_ts(row["first_seen_at"])
-        disseminated = parse_ts(row["disseminated_at"])
-        if seen is None:
-            raise ValueError("first_seen_at is not a timestamp")
-        day = (disseminated or seen).astimezone(IST).date().isoformat()
+        draft, entities, _scan, method, quote, event_time, _brief = analysed  # a filing is first-hand: it never gets a web check (disseminated or seen).astimezone(IST).date().isoformat()
         filing_key = f"{symbol or row['company'] or 'NA'}:{draft.event_type}:{day}"
         sig = Signature.build(title, body)
         primary = symbol or _primary_id(entities)

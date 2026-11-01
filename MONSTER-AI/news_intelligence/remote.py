@@ -84,6 +84,15 @@ class Quota(Exception):
         self.seconds = seconds
 
 
+class Backoff(Exception):
+    """The service cannot do what was asked on this account or model (a tool it does not offer, a request larger than the plan's
+    per-minute token limit): asking again will fail the same way, so the caller stays away for ``seconds``."""
+
+    def __init__(self, seconds: float, reason: str) -> None:
+        super().__init__(reason)
+        self.seconds = seconds
+
+
 class Fatal(Exception):
     """Configuration-level failure (bad key / endpoint): no point retrying during this run."""
 
@@ -230,6 +239,10 @@ class RemoteJudge:
             return None
         except Quota as exc:
             self._failed(f"rate limit: {exc}", trip=True)
+            self.start_cooldown(exc.seconds)
+            return None
+        except Backoff as exc:
+            self._failed(f"unavailable: {exc}", trip=True)
             self.start_cooldown(exc.seconds)
             return None
         except OutOfTime:

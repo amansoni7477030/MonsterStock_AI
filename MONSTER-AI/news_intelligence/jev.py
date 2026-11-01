@@ -12,6 +12,11 @@ free-text headline, and judging how much a piece of news matters. Five atomic qu
 ``severity``    Score on a 5-level rubric (how strongly the news could move the share price)
 ``polarity``    Choice good / bad / neutral for the company in focus (only asked when there is one)
 
+The *state* is the headline and the whole stored text plus the facts that help to read them (:mod:`news_intelligence.context`):
+when and by whom it was published, the filing category, the company's sector, the companies the entity matcher found and, when
+the optional web check ran, what it found. Prices and the rule classifier's verdict are left out on purpose: Jev is an
+independent second reader of the text.
+
 The judgments are *merged into* the rule draft by :func:`merge_jev` under conservative rules (a rumour or denial flag set by
 the rules is never cleared, a type is replaced only when Jev is confident and the rules are not), and a result below
 ``JEV_MIN_CONFIDENCE`` is ignored. Any failure returns ``None`` and the rules decide. Nothing here touches the price model:
@@ -36,7 +41,14 @@ import requests
 from app.clock import Clock
 from app.config import Settings
 from app.logging_setup import register_secret
-from news_intelligence.events import EVENT_TYPES, EventDraft
+from news_intelligence.context import SOURCE_LABELS, NewsContext, defang, one_line
+from news_intelligence.events import (
+    DENIAL_SEVERITY,
+    EVENT_DESCRIPTIONS,
+    EVENT_TYPES,
+    RUMOUR_SEVERITY,
+    EventDraft,
+)
 from news_intelligence.remote import (
     RETRY_AFTER_CAP_SEC,
     Fatal,
@@ -52,10 +64,10 @@ log = logging.getLogger(__name__)
 
 JEV_BASE_URL = "https://api.typesafe.ai"
 JEV_PATH = "/v1/systemone"
-PROMPT_VERSION = "j1"
+PROMPT_VERSION = "j2"
 CACHE_PREFIX = "jev:"
 CACHE_TTL_DAYS = 14
-MAX_ARTICLE_CHARS = 2500
+MAX_ARTICLE_CHARS = 6000  # the whole text the pipeline stores: Jev reads 64k tokens per request and bills about $42 per billion
 MAX_HEADLINE_CHARS = 300
 MAX_SECONDS_PER_RUN = 180.0  # Jev answers in about a tenth of a second: a run that needs minutes is a provider problem
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
@@ -64,37 +76,7 @@ FATAL_STATUS = frozenset({401, 403, 404})
 MIN_EVENT_PROB = 0.6  # the chosen event type must carry at least this probability...
 RULES_KEEP_CONFIDENCE = 0.75  # ...and the rules keep their own type when they are at least this sure of it
 MIN_POLARITY = 0.2  # a direction weaker than this is "unclear", not a signal
-RUMOUR_SEVERITY, DENIAL_SEVERITY = 0.85, 0.5  # severity factors of an unconfirmed report / a denial (as in events._severity)
 
-EVENT_DESCRIPTIONS: dict[str, str] = {
-    "earnings_result": "Quarterly or annual financial results were announced or reported (profit, revenue, margins).",
-    "earnings_guidance": "Management gave or changed a forecast, guidance or outlook for future earnings, volumes or margins.",
-    "order_win": "The company won or was awarded a contract, order or tender.",
-    "order_loss": "The company lost a contract, order or tender, or one was cancelled, terminated or reduced.",
-    "merger_acquisition": "A merger, acquisition, stake purchase or sale, demerger, joint venture or takeover bid.",
-    "fundraising": "Capital is being raised: equity issue, QIP, rights issue, preferential allotment, bonds, debt or a loan.",
-    "buyback_dividend": "A dividend, bonus issue, buyback or other payout to shareholders.",
-    "promoter_transaction": "Promoters, insiders or large holders bought or sold shares or changed their holding.",
-    "pledge": "Promoter or insider shares were pledged, invoked or released.",
-    "management_change": "A senior management, board or auditor change: someone was appointed, resigned or removed.",
-    "rating_action": "A credit rating or an analyst rating or target price was assigned, upgraded or downgraded.",
-    "litigation_regulatory": "A court case, regulator action, investigation, penalty, notice, raid or fraud allegation.",
-    "government_contract": "A contract, licence, subsidy or incentive from a government body.",
-    "board_meeting": "A board meeting date or agenda was announced, with no outcome yet.",
-    "corporate_action": "A routine corporate action: record date, stock split, name change, listing, delisting or AGM.",
-    "bulk_block_deal": "A bulk deal, block deal or other large trade in the shares.",
-    "macro_release": "A scheduled economic data release such as inflation, GDP, PMI, trade, jobs or industrial output.",
-    "central_bank": "A central bank decision or statement: policy rate, liquidity or guidance (RBI, Fed, ECB, ...).",
-    "geopolitical_conflict": "War, military conflict, a terror attack or a serious diplomatic crisis.",
-    "sanctions_tariffs": "Sanctions, tariffs, export bans or import duties were imposed, changed or lifted.",
-    "commodity_supply": "A supply or price shock in a commodity: crude oil, gas, metals, farm goods, power or coal.",
-    "trade_policy": "Trade agreements or trade policy, import-export rules or supply-chain policy.",
-    "elections_politics": "Elections, government formation or other political events.",
-    "sector_regulation": "A new law, regulation, tax or policy that affects a whole sector.",
-    "global_company": "News about a large foreign company (results, outlook, an event) that may affect Indian peers or suppliers.",
-    "market_stress": "Broad market stress: a sharp index fall, volatility spike, liquidity or banking scare, or a crash.",
-    "other": "None of the above, or the text reports no market-relevant event.",
-}
 SEVERITY_LEVELS = (
     "No price relevance: routine, repeated, old or purely promotional information.",
     "Minor: small, expected or already known information.",
@@ -106,10 +88,6 @@ POLARITY_CRITERIA = {
     "positive": "Good for the company's share price: the economic consequence is favourable.",
     "negative": "Bad for the company's share price: the economic consequence is unfavourable.",
     "neutral": "Neutral or unclear: no clear consequence for the share price, or mixed.",
-}
-SOURCE_LABELS = {
-    "exchange_filing": "exchange filing", "official": "official statement", "company": "company statement",
-    "media": "news media", "social": "social media",
 }
 RUMOUR_QUESTION = (
     "The text reports something unconfirmed: a rumour, speculation, an anonymous-source claim or a mere possibility "
@@ -194,14 +172,22 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip().lower()
 
 
-def build_request(model: str, title: str, text: str, *, company: str | None = None, source_kind: str | None = None) -> dict[str, Any]:
+def build_request(
+    model: str, title: str, text: str, *, company: str | None = None, source_kind: str | None = None,
+    context: NewsContext | None = None,
+) -> dict[str, Any]:
     """The ``/v1/systemone`` body: the article as a named-field state and the atomic questions (the content never mixes with
-    the questions, so a sentence inside an article cannot act as an instruction)."""
-    state: dict[str, Any] = {"headline": (title or "")[:MAX_HEADLINE_CHARS], "article": (text or "")[:MAX_ARTICLE_CHARS]}
+    the questions, so a sentence inside an article cannot act as an instruction). ``context`` adds the facts a reader needs to
+    interpret the item: when and where it was published, the company's sector, the web check."""
+    state: dict[str, Any] = {
+        "headline": defang(title or "")[:MAX_HEADLINE_CHARS], "article": defang(text or "")[:MAX_ARTICLE_CHARS],
+    }
     if source_kind in SOURCE_LABELS:
         state["source_type"] = SOURCE_LABELS[str(source_kind)]
     if company:
-        state["company_in_focus"] = company[:120]
+        state["company_in_focus"] = one_line(company, 120)
+    if context is not None:
+        state.update({key: value for key, value in context.state().items() if key not in state})
     questions: dict[str, Any] = {
         "event_type": {"type": "choice", "instructions": EVENT_QUESTION, "criteria": dict(EVENT_DESCRIPTIONS)},
         "rumour": {"type": "noul", "instructions": RUMOUR_QUESTION},
@@ -342,8 +328,12 @@ class JevJudge(RemoteJudge):
     def min_confidence(self) -> float:
         return float(self.settings.jev_min_confidence)
 
-    def _cache_key(self, title: str, text: str, company: str | None, source_kind: str | None) -> str:
-        raw = f"{PROMPT_VERSION}|{self.settings.jev_model}|{_norm(title)}|{_norm(text)[:MAX_ARTICLE_CHARS]}|{company or ''}|{source_kind or ''}"
+    def _cache_key(
+        self, title: str, text: str, company: str | None, source_kind: str | None, context: NewsContext | None = None
+    ) -> str:
+        fingerprint = context.fingerprint() if context is not None else ""
+        raw = (f"{PROMPT_VERSION}|{self.settings.jev_model}|{_norm(title)}|{_norm(text)[:MAX_ARTICLE_CHARS]}|{company or ''}"
+               f"|{source_kind or ''}|{fingerprint}")
         return CACHE_PREFIX + hashlib.sha256(raw.encode()).hexdigest()[:40]
 
     def _url(self) -> str:
@@ -385,7 +375,10 @@ class JevJudge(RemoteJudge):
                 self.sleep_within_budget(max(delay, min(retry_after_seconds(headers) or 0.0, RETRY_AFTER_CAP_SEC)))
         raise RuntimeError(f"gave up after {self.max_attempts} attempts ({last})")
 
-    def judge(self, title: str, text: str = "", *, company: str | None = None, source_kind: str | None = None) -> JevJudgment | None:
+    def judge(
+        self, title: str, text: str = "", *, company: str | None = None, source_kind: str | None = None,
+        context: NewsContext | None = None,
+    ) -> JevJudgment | None:
         """The judgment for one item, or ``None`` (not configured, budget spent, circuit open, any failure)."""
         if not self.configured:
             return None
@@ -393,19 +386,15 @@ class JevJudge(RemoteJudge):
         if not (title or text):
             return None
         company = (company or "").strip() or None
-        key = self._cache_key(title, text, company, source_kind)
+        key = self._cache_key(title, text, company, source_kind, context)
         cached = JevJudgment.from_dict(self._cache_read(key), cached=True)
         if cached is not None:
             self.run_cache_hits += 1
             return cached
         if not self._admit(int(self.settings.jev_max_items_per_run)):
             return None
-        judgment = self._attempt(
-            lambda: parse_response(
-                self._request(build_request(str(self.settings.jev_model), title, text, company=company, source_kind=source_kind)),
-                company_in_focus=company is not None,
-            )
-        )
+        body = build_request(str(self.settings.jev_model), title, text, company=company, source_kind=source_kind, context=context)
+        judgment = self._attempt(lambda: parse_response(self._request(body), company_in_focus=company is not None))
         if judgment is not None:
             self._cache_write(key, judgment.to_dict())
         return judgment

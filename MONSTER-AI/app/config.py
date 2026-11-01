@@ -24,6 +24,9 @@ HOME_DEFAULT = Path(__file__).resolve().parent.parent
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
+# Groq's built-in browser_search tool (a server-side web search) is offered by the gpt-oss models only, and Groq documents it as
+# incompatible with structured outputs (console.groq.com/docs/tool-use/built-in-tools and /browser-search, read 2026-11-02).
+GROQ_WEB_MODEL_PREFIX = "openai/gpt-oss"
 
 # --------------------------------------------------------------------------------------------- parsers
 
@@ -207,6 +210,14 @@ VARS: tuple[Var, ...] = (
         "the morning schedule.", "LLM"),
     Var("llm_max_output_tokens", "LLM_MAX_OUTPUT_TOKENS", "1200", _int,
         "Max tokens per extraction response (reasoning models spend part of it on thinking).", "LLM"),
+    Var("llm_web_search", "LLM_WEB_SEARCH", "true", _bool,
+        "Let the Groq gpt-oss model check a news item on the web (Groq's built-in browser_search tool) before it is judged: do "
+        "independent outlets report the same facts, did anyone deny it, is it old news. Only for company news that matters and "
+        "is not first-hand (never exchange filings), only on Groq with a gpt-oss model, never part of a backtest. It bills extra "
+        "tokens and a search fee, and needs a plan with a large per-minute token limit (the free tier's 8K TPM is too small): when "
+        "it fails the item is judged without it. false = off.", "LLM"),
+    Var("llm_web_max_per_run", "LLM_WEB_MAX_PER_RUN", "8", _int,
+        "Cost cap: web checks per news job (a job drains a backlog in up to four batches that share it). 0 = off.", "LLM"),
     # -- jev -----------------------------------------------------------------------------------------------
     Var("typesafe_api_key", "TYPESAFE_API_KEY", "", _opt_str,
         "TypeSafe API key (https://console.typesafe.ai/keys). Enables Jev judgments on news (event type, rumour, denial, "
@@ -334,6 +345,8 @@ class Settings:
     llm_max_articles_per_run: int = 60
     llm_max_seconds_per_run: int = 240
     llm_max_output_tokens: int = 1200
+    llm_web_search: bool = True
+    llm_web_max_per_run: int = 8
     typesafe_api_key: str | None = None
     jev_model: str | None = "jev-1.14.0"
     jev_timeout_sec: float = 20.0
@@ -423,6 +436,18 @@ class Settings:
     @property
     def llm_configured(self) -> bool:
         return bool(self.llm_base_url and self.llm_model_name and (self.llm_provider != "groq" or self.llm_key))
+
+    @property
+    def llm_web_models(self) -> list[str]:
+        """The configured Groq models that offer built-in web search (the primary first); empty for any other provider."""
+        if self.llm_provider != "groq":
+            return []
+        names = (self.llm_model_name, self.llm_fallback_name)
+        return [name for name in names if name and name.startswith(GROQ_WEB_MODEL_PREFIX)]
+
+    @property
+    def llm_web_configured(self) -> bool:
+        return bool(self.llm_web_search and self.llm_web_max_per_run > 0 and self.llm_configured and self.llm_web_models)
 
     @property
     def jev_configured(self) -> bool:
@@ -583,6 +608,8 @@ def validate(s: Settings) -> list[str]:
         problems.append("LLM_API_BASE points at Groq but neither GROQ_API_KEY nor LLM_API_KEY is set")
     if s.llm_max_seconds_per_run < 10:
         problems.append("LLM_MAX_SECONDS_PER_RUN must be at least 10")
+    if s.llm_web_max_per_run < 0:
+        problems.append("LLM_WEB_MAX_PER_RUN must not be negative (0 = web checks off)")
     if not 0.0 <= s.jev_min_confidence <= 1.0:
         problems.append("JEV_MIN_CONFIDENCE must be between 0 and 1")
     if s.typesafe_api_key and not s.jev_model:

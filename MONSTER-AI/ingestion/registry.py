@@ -120,6 +120,18 @@ SOURCES: tuple[dict[str, Any], ...] = (
         backup_source="rules", criticality="optional",
     ),
     dict(
+        source_id="llm_web", provider="Groq built-in browser_search tool (web search run on Groq's servers) on a gpt-oss model",
+        endpoint="https://api.groq.com/openai/v1/chat/completions with tools=[{\"type\": \"browser_search\"}] (GROQ_API_KEY)",
+        coverage="Web check of one unconfirmed-looking company news item: do independent outlets report the same facts, did anyone deny or correct it, is it old news",
+        timestamp_meaning="n/a",
+        update_frequency="On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job, 30% of the LLM time box, 1-day result cache)",
+        history_depth="Live web only: never used for backtests or replays",
+        rate_limits="Needs a plan whose per-minute token limit exceeds one web search (the free tier's 8k does not): HTTP 413 or a rejected tool backs the check off for 6 h",
+        license_notes="Governed by Groq's terms (built-in tools are not HIPAA covered and are not available on regional endpoints); only public news text is sent - never keys, positions or other data.",
+        failure_behavior="The item is extracted and judged without the web check; repeated failures appear in source health",
+        backup_source="llm_extraction", criticality="optional",
+    ),
+    dict(
         source_id="jev_judgment", provider="TypeSafe AI - Jev (System One decision model)",
         endpoint="https://api.typesafe.ai/v1/systemone",
         coverage="Calibrated judgments on one news item: event type, rumour, denial, severity and the direction for the company in focus",
@@ -188,6 +200,12 @@ def _fetch_strategy() -> dict[str, str]:
             f"and time budgets, a 14-day result cache keyed by the article text, bounded retries that honour `Retry-After` (up to "
             f"{int(RETRY_AFTER_CAP_SEC)} s; a longer wait is a quota and starts a cooldown of at most {int(COOLDOWN_MAX_SEC // 3600)} h "
             "that survives between runs)."),
+        "llm_web": (
+            "not scraped: the same Groq chat endpoint, with `tools=[{\"type\": \"browser_search\"}]` and `tool_choice=required` on a "
+            "gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is "
+            "nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, "
+            "circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is "
+            "validated field by field before it reaches the extraction or Jev."),
         "jev_judgment": (
             f"not scraped: `POST {JEV_BASE_URL}{JEV_PATH}` with the pinned model `JEV_MODEL` (Bearer key `TYPESAFE_API_KEY`). The "
             "article is the typed `state` and the atomic questions (event type, rumour, denial, severity, direction) are answered "

@@ -59,6 +59,42 @@ _TYPES = (
 EVENT_TYPES: dict[str, EventType] = {t.name: t for t in _TYPES}
 EVENT_TYPE_NAMES = tuple(EVENT_TYPES)
 
+# What each type means, in words: both AI readers (the LLM prompt and Jev's choice question) classify against the same
+# definitions as the rules do, so their labels mean the same thing.
+EVENT_DESCRIPTIONS: dict[str, str] = {
+    "earnings_result": "Quarterly or annual financial results were announced or reported (profit, revenue, margins).",
+    "earnings_guidance": "Management gave or changed a forecast, guidance or outlook for future earnings, volumes or margins.",
+    "order_win": "The company won or was awarded a contract, order or tender.",
+    "order_loss": "The company lost a contract, order or tender, or one was cancelled, terminated or reduced.",
+    "merger_acquisition": "A merger, acquisition, stake purchase or sale, demerger, joint venture or takeover bid.",
+    "fundraising": "Capital is being raised: equity issue, QIP, rights issue, preferential allotment, bonds, debt or a loan.",
+    "buyback_dividend": "A dividend, bonus issue, buyback or other payout to shareholders.",
+    "promoter_transaction": "Promoters, insiders or large holders bought or sold shares or changed their holding.",
+    "pledge": "Promoter or insider shares were pledged, invoked or released.",
+    "management_change": "A senior management, board or auditor change: someone was appointed, resigned or removed.",
+    "rating_action": "A credit rating or an analyst rating or target price was assigned, upgraded or downgraded.",
+    "litigation_regulatory": "A court case, regulator action, investigation, penalty, notice, raid or fraud allegation.",
+    "government_contract": "A contract, licence, subsidy or incentive from a government body.",
+    "board_meeting": "A board meeting date or agenda was announced, with no outcome yet.",
+    "corporate_action": "A routine corporate action: record date, stock split, name change, listing, delisting or AGM.",
+    "bulk_block_deal": "A bulk deal, block deal or other large trade in the shares.",
+    "macro_release": "A scheduled economic data release such as inflation, GDP, PMI, trade, jobs or industrial output.",
+    "central_bank": "A central bank decision or statement: policy rate, liquidity or guidance (RBI, Fed, ECB, ...).",
+    "geopolitical_conflict": "War, military conflict, a terror attack or a serious diplomatic crisis.",
+    "sanctions_tariffs": "Sanctions, tariffs, export bans or import duties were imposed, changed or lifted.",
+    "commodity_supply": "A supply or price shock in a commodity: crude oil, gas, metals, farm goods, power or coal.",
+    "trade_policy": "Trade agreements or trade policy, import-export rules or supply-chain policy.",
+    "elections_politics": "Elections, government formation or other political events.",
+    "sector_regulation": "A new law, regulation, tax or policy that affects a whole sector.",
+    "global_company": "News about a large foreign company (results, outlook, an event) that may affect Indian peers or suppliers.",
+    "market_stress": "Broad market stress: a sharp index fall, volatility spike, liquidity or banking scare, or a crash.",
+    "other": "None of the above, or the text reports no market-relevant event.",
+}
+
+RUMOUR_SEVERITY = 0.85  # an unconfirmed report is worth this share of the severity of a confirmed one
+DENIAL_SEVERITY = 0.5  # a denial or a refuted report, this share
+REFUTED_RULE = "web_refuted"  # recorded in ``EventDraft.rules`` when a web check found the report denied elsewhere
+
 # Tie-break order when two types score equally (more specific / more consequential first).
 _PRIORITY = (
     "litigation_regulatory", "pledge", "government_contract", "merger_acquisition", "promoter_transaction",
@@ -82,6 +118,23 @@ class EventDraft:
     is_denial: bool = False
     routine: bool = False
     rules: tuple[str, ...] = ()
+
+
+def apply_refutation(draft: EventDraft) -> bool:
+    """A reliable source has denied or corrected the report this draft was made from: the draft becomes an unconfirmed rumour
+    with a denial's discounts (half the severity, a halved direction, a trimmed confidence). A draft that is itself a denial is
+    left alone, and so is one that was refuted already. Returns whether the draft changed."""
+    if draft.is_denial or REFUTED_RULE in draft.rules:
+        return False
+    if draft.is_rumour:  # its direction was halved when it was flagged: only the severity still has to go down
+        draft.severity = round(max(0.02, draft.severity * DENIAL_SEVERITY / RUMOUR_SEVERITY), 3)
+    else:
+        draft.severity = round(max(0.02, draft.severity * DENIAL_SEVERITY), 3)
+        draft.polarity_hint = round(draft.polarity_hint * 0.5, 3)
+        draft.is_rumour = True
+    draft.confidence = round(max(0.05, draft.confidence * 0.7), 3)
+    draft.rules = (*draft.rules, REFUTED_RULE)
+    return True
 
 
 # ------------------------------------------------------------------------------------------- fragments
@@ -492,9 +545,9 @@ def _severity(base: float, event_type: str, full: str, rule_sev: float, rumour: 
     if _DAMPENERS.search(full):
         sev -= 0.1
     if rumour:
-        sev *= 0.85
+        sev *= RUMOUR_SEVERITY
     if denial:
-        sev *= 0.5
+        sev *= DENIAL_SEVERITY
     return round(min(1.0, max(0.02, sev)), 3)
 
 
