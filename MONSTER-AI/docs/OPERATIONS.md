@@ -215,8 +215,25 @@ the attempts and accept the reduced data.
 
 ### Telegram problems
 
-`monster-ai telegram-test`. Wrong chat id: `monster-ai telegram-setup` (send any message to the bot while it waits). While
-Telegram is down, reports and alerts queue in the database and are delivered when it returns (late final reports are withheld).
+`sudo monster-ai telegram-test` sends a "MONSTER AI online" message to the report chat and prints `telegram test: sent`, or
+`failed (<reason>)` / `withheld (<reason>)`. `sudo monster-ai doctor` also checks that `api.telegram.org` is reachable and that the
+token is accepted (`telegram bot`). How to read the reason:
+
+| Reason | Meaning | What to do |
+|--------|---------|------------|
+| `withheld (telegram_not_configured)` | the token or the chat id is empty | set `TELEGRAM_BOT_TOKEN`, then find the chat id (below) |
+| `HTTP 401: Unauthorized (check TELEGRAM_BOT_TOKEN)` | wrong, mistyped or revoked token | copy it again from @BotFather (`/mybots`, the bot, *API Token*) |
+| `HTTP 400: Bad Request: chat not found` | wrong chat id, or you never pressed **Start** in the bot's chat | message the bot, then find the chat id again |
+| `HTTP 403: Forbidden: bot was blocked by the user` | you blocked or stopped the bot | unblock it and press **Start** |
+| `HTTP 409: Conflict ... webhook is active` (`telegram-setup`) | a webhook is set on the bot, so its messages cannot be read | create a new bot with @BotFather, or remove the webhook |
+| `HTTP <code>: response was not Telegram JSON`, `request timed out`, `network error (...)` | something between this machine and `api.telegram.org` answers instead of Telegram (firewall, proxy or web filter), or the network is down | allow outbound HTTPS to `api.telegram.org` from this machine |
+
+**Finding the chat id on a server.** Send any message to the bot first (Telegram keeps it for 24 hours), then run
+`sudo bash /opt/monster-ai/deployment/install.sh --yes`: it is idempotent, reads the chat id, stores it in
+`/etc/monster-ai/monster.env` and restarts the services. `monster-ai telegram-setup` only *prints* the id there; it cannot store it, because the
+service user cannot write the root-owned environment file.
+
+While Telegram is down, reports and alerts queue in the database and are delivered when it returns (late final reports are withheld).
 
 ### Disk or memory pressure
 

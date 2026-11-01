@@ -150,7 +150,9 @@ server with native systemd (no containers).
   unencrypted backup that would have been uploaded off-box (it now stays local, `backup_encryption_failed` and a health warning are raised);
   the evening summary's data-quality notes were never filled (now: preliminary-only scoring, provisional outcomes, degraded or late snapshots);
   the report and the dashboard said "range >=" where labels and evaluation use "range >"; the source catalogue claimed event-day flags from
-  the economic calendar although nothing reads it (FRED and the economic calendar are collected for research only, and now say so).
+  the economic calendar although nothing reads it (FRED and the economic calendar are collected for research only, and now say so);
+  `telegram-setup` and `doctor` reported only the exception type ("rejected the token: DataUnavailable") for every Telegram failure, which
+  hid whether the cause was a wrong token, a wrong chat or a blocked network (they now print Telegram's own reason, with secrets redacted).
 
 ### Verified on real data
 
