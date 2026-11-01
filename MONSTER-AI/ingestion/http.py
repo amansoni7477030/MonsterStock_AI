@@ -471,10 +471,14 @@ class HttpClient:
         return b"".join(chunks)
 
     def _send(self, method: str, url: str, *, params: Mapping[str, Any] | None, headers: Mapping[str, str] | None,
-              data: Any, json_body: Any, timeout: tuple[float, float] | None) -> Any:
+              data: Any, json_body: Any, timeout: tuple[float, float] | None, deadline: float | None = None) -> Any:
+        wait = timeout or self.timeout
+        if deadline is not None:  # never let one attempt outlive the caller's deadline (connect + read are summed by libcurl)
+            left = max(deadline - self._clock().monotonic(), 0.2)
+            wait = (min(wait[0], left / 2.0), min(wait[1], left / 2.0))
         kwargs: dict[str, Any] = {
             "params": params, "headers": self._without_fingerprint(headers) or None, "data": data, "json": json_body,
-            "timeout": timeout or self.timeout, "stream": True, "allow_redirects": True,
+            "timeout": wait, "stream": True, "allow_redirects": True,
         }
         if self._transport == TRANSPORT_CURL:
             kwargs["max_redirects"] = MAX_REDIRECTS
@@ -492,9 +496,14 @@ class HttpClient:
         json_body: Any = None,
         soft_statuses: Iterable[int] = (),
         timeout: tuple[float, float] | None = None,
+        deadline: float | None = None,
     ) -> HttpResponse:
         """Perform a request. Statuses in ``soft_statuses`` (e.g. 404 for "file not published yet", 304 for a conditional
-        GET) are returned to the caller; other non-2xx statuses raise ``DataUnavailable``."""
+        GET) are returned to the caller; other non-2xx statuses raise ``DataUnavailable``.
+
+        ``deadline`` is a ``clock.monotonic()`` instant: no attempt starts after it, each attempt's timeout is capped to what
+        is left, and a back-off that would cross it ends the call. Time-critical callers (the 09:00-09:12 pre-open polls) use
+        it so a slow provider can never push a report past its cutoff."""
         parsed = urlparse(url)
         host = parsed.hostname or "?"
         if parsed.scheme != "https" and host not in self.allow_http_hosts:
@@ -512,12 +521,18 @@ class HttpClient:
         while attempt < self.max_attempts:
             attempt += 1
             self._limiter.wait()
+            if deadline is not None and self._clock().monotonic() >= deadline:
+                stats.failures += 1
+                stats.last_error = "deadline reached"
+                log.warning("http %s %s %s: deadline reached before attempt %d/%d", self.source, method, where, attempt,
+                            self.max_attempts)
+                raise DataUnavailable(self.source, "deadline reached", retryable=True)
             started = self._clock().monotonic()
             retry_after: float | None = None
             stats.requests += 1
             try:
                 response = self._send(method, url, params=params, headers=headers, data=data, json_body=json_body,
-                                      timeout=timeout)
+                                      timeout=timeout, deadline=deadline)
             except Exception as exc:  # noqa: BLE001 - classified below; anything that is not an HTTP-library error propagates
                 kind = classify_error(exc)
                 if kind is None:
@@ -589,8 +604,11 @@ class HttpClient:
                     with contextlib.suppress(Exception):
                         response.close()
             if attempt < self.max_attempts:
-                stats.retries += 1
                 delay = self._delay(attempt, retry_after)
+                if deadline is not None and self._clock().monotonic() + delay >= deadline:
+                    last_error = f"{last_error}; deadline reached"
+                    break  # the next attempt could not finish in time: fail now so the caller can fall back
+                stats.retries += 1
                 log.warning("http %s %s %s: %s (attempt %d/%d), retrying in %.1fs", self.source, method, where,
                             redact(last_error), attempt, self.max_attempts, delay)
                 self._clock().sleep(delay)
@@ -598,9 +616,9 @@ class HttpClient:
         self.breaker.record_failure()
         stats.failures += 1
         stats.last_error = last_error
-        log.warning("http %s %s %s: giving up after %d attempts (%s)", self.source, method, where, self.max_attempts,
+        log.warning("http %s %s %s: giving up after %d attempts (%s)", self.source, method, where, attempt,
                     redact(last_error))
-        raise DataUnavailable(self.source, f"{last_error} after {self.max_attempts} attempts", retryable=retryable)
+        raise DataUnavailable(self.source, f"{last_error} after {attempt} attempts", retryable=retryable)
 
     def get(self, url: str, **kwargs: Any) -> HttpResponse:
         return self.request("GET", url, **kwargs)

@@ -246,6 +246,7 @@ class NseApi:
             max_attempts=min(settings.http_max_attempts, 3), clock=clock,
         )
         self.http.on_auth_failure = self._rewarm
+        self._deadline: float | None = None
         self._expiry_cache: dict[str, list[str]] = {}
 
     def _now_mono(self) -> float:
@@ -253,36 +254,44 @@ class NseApi:
 
         return (self.clock or get_clock()).monotonic()
 
-    def _warm(self) -> None:
+    def _warm(self, deadline: float | None = None) -> None:
         self.http.reset_session()
         try:
-            self.http.get(HOME, headers={"Accept": "text/html,application/xhtml+xml,*/*"}, soft_statuses=(401, 403, 404, 429))
+            self.http.get(HOME, headers={"Accept": "text/html,application/xhtml+xml,*/*"}, soft_statuses=(401, 403, 404, 429),
+                          deadline=deadline)
         except DataUnavailable:
             log.debug("NSE warm-up failed", exc_info=True)
         self._warm_mark = self._now_mono()
 
     def _rewarm(self) -> None:
-        self._warm()
+        self._warm(self._deadline)
 
-    def _get(self, path: str, params: Mapping[str, str] | None = None, *, timeout: tuple[float, float] | None = None) -> Any:
-        if self._warm_mark is None or self._now_mono() - self._warm_mark > 20 * 60:
-            self._warm()
-        response = self.http.get(API + path, params=params, headers=API_HEADERS, timeout=timeout)
+    def _get(self, path: str, params: Mapping[str, str] | None = None, *, timeout: tuple[float, float] | None = None,
+             deadline: float | None = None) -> Any:
+        self._deadline = deadline  # also bounds the re-handshake the HTTP client triggers on a 401 / 403
+        try:
+            if self._warm_mark is None or self._now_mono() - self._warm_mark > 20 * 60:
+                self._warm(deadline)
+            response = self.http.get(API + path, params=params, headers=API_HEADERS, timeout=timeout, deadline=deadline)
+        finally:
+            self._deadline = None
         return response.json()
 
     # --------------------------------------------------------------------------------------- endpoints
-    def market_status(self) -> Mapping[str, Any]:
-        data = self._get("marketStatus")
+    def market_status(self, *, deadline: float | None = None) -> Mapping[str, Any]:
+        data = self._get("marketStatus", deadline=deadline)
         if not isinstance(data, dict):
             raise DataUnavailable("nse_api", "unexpected marketStatus shape")
         return data
 
-    def gift_nifty(self) -> dict[str, Any] | None:
+    def gift_nifty(self, *, deadline: float | None = None) -> dict[str, Any] | None:
         """GIFT Nifty last price, change and exchange timestamp (``None`` if the block is absent)."""
-        return parse_gift_nifty(self.market_status())
+        return parse_gift_nifty(self.market_status(deadline=deadline))
 
-    def preopen(self, key: str = "ALL", symbols: Iterable[str] | None = None) -> PreopenSnapshot:
-        data = self._get("market-data-pre-open", {"key": key}, timeout=(10.0, 60.0))
+    def preopen(self, key: str = "ALL", symbols: Iterable[str] | None = None, *, deadline: float | None = None) -> PreopenSnapshot:
+        """The pre-open book. ``deadline`` (``clock.monotonic()`` instant) bounds every attempt, so a slow NSE can never push
+        the final scan past its cutoff."""
+        data = self._get("market-data-pre-open", {"key": key}, timeout=(10.0, 60.0), deadline=deadline)
         return parse_preopen(data, set(symbols) if symbols is not None else None)
 
     def option_expiries(self, symbol: str) -> list[str]:

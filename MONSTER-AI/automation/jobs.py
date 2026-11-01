@@ -227,13 +227,13 @@ def refresh_preopen(ctx: JobContext) -> JobResult:
     snapshots = 0
     final = 0.0
     while ctx.clock.now() < end:
-        snap = collect_preopen(ctx.store, ctx.nse_api(), day.isoformat(), symbols)
+        snap = collect_preopen(ctx.store, ctx.nse_api(), day.isoformat(), symbols, deadline=scan.monotonic_at(ctx, end))
         snapshots += int(bool(snap and snap.rows))
         final = scan.preopen_coverage(ctx.store, day.isoformat(), symbols, ctx.clock.now())[1]
         if final >= scan.PREOPEN_TARGET_COVERAGE:
             break
         ctx.clock.sleep(min(PREOPEN_COLLECT_EVERY_SEC, max((end - ctx.clock.now()).total_seconds(), 0.0)))
-    _guarded("GIFT Nifty", collect_gift, ctx.store, ctx.nse_api())
+    _guarded("GIFT Nifty", collect_gift, ctx.store, ctx.nse_api(), deadline=scan.monotonic_at(ctx, end + timedelta(seconds=60)))
     if not snapshots:
         return JobResult("failed", "NSE pre-open book unavailable (the final scan will use the preliminary model)")
     return JobResult("success", f"{snapshots} pre-open snapshots, {final:.0%} final prices", {"snapshots": snapshots})

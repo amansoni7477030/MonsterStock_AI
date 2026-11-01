@@ -276,12 +276,12 @@ class FakeNse:
     def __init__(self, snapshot=None, gift=None, error=None):
         self.snapshot, self.gift_value, self.error = snapshot, gift, error
 
-    def preopen(self, key, symbols=None):
+    def preopen(self, key, symbols=None, *, deadline=None):
         if self.error:
             raise self.error
         return self.snapshot
 
-    def gift_nifty(self):
+    def gift_nifty(self, *, deadline=None):
         if self.error:
             raise self.error
         return self.gift_value

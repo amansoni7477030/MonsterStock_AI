@@ -75,8 +75,14 @@ def preopen_coverage(store: Store, trade_date: str, symbols: list[str], before: 
     return usable / len(wanted), final / len(wanted)
 
 
+def monotonic_at(ctx: JobContext, moment: datetime) -> float:
+    """The ``clock.monotonic()`` instant corresponding to the wall-clock ``moment`` (HTTP deadlines are monotonic)."""
+    return ctx.clock.monotonic() + max((moment - ctx.clock.now()).total_seconds(), 0.0)
+
+
 def wait_for_preopen(ctx: JobContext, symbols: list[str]) -> float:
-    """Poll the NSE pre-open book until the equilibrium prices are published or the report cutoff is reached."""
+    """Poll the NSE pre-open book until the equilibrium prices are published or the report cutoff is reached. Every request
+    carries the cutoff as its deadline, so a slow NSE can never push the final report past 09:12."""
     s, day = ctx.settings, ctx.run_date
     if not s.nse_enabled:
         return 0.0
@@ -88,7 +94,8 @@ def wait_for_preopen(ctx: JobContext, symbols: list[str]) -> float:
     failures = 0
     final = final_share()
     while final < PREOPEN_TARGET_COVERAGE and ctx.clock.now() < limit:
-        snapshot = _best_effort("pre-open collection", collect_preopen, ctx.store, ctx.nse_api(), day.isoformat(), symbols)
+        snapshot = _best_effort("pre-open collection", collect_preopen, ctx.store, ctx.nse_api(), day.isoformat(), symbols,
+                                deadline=monotonic_at(ctx, limit))
         failures = 0 if snapshot is not None and snapshot.rows else failures + 1
         if failures >= PREOPEN_MAX_CONSECUTIVE_FAILURES:
             log.warning("pre-open book unavailable after %d attempts; continuing without it", failures)
@@ -179,10 +186,10 @@ def _explainer(bundle: Bundle, frame: pd.DataFrame, position: int) -> Callable[[
     return lambda: bundle.explain(frame, position)
 
 
-def _best_effort(label: str, fn: Callable[..., Any], *args: Any) -> Any:
+def _best_effort(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Enrichment steps (GIFT quote, pre-open book) must never abort a scan."""
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001
         log.warning("%s failed: %s", label, redact(str(exc)))
         return None
@@ -285,7 +292,8 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
         return _fail(ctx, stage, "no instruments in the universe (run bootstrap)")
 
     if s.nse_enabled:
-        _best_effort("GIFT Nifty collection", collect_gift, store, ctx.nse_api())
+        gift_limit = at_ist(day, s.report_cutoff_time) if stage == "final" else at_ist(day, s.final_scan_time)
+        _best_effort("GIFT Nifty collection", collect_gift, store, ctx.nse_api(), deadline=monotonic_at(ctx, gift_limit))
     if stage == "final":
         wait_for_preopen(ctx, symbols)
     cutoff = scan_cutoff(s, day, stage, clock.now())

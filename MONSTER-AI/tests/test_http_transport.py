@@ -153,6 +153,42 @@ def test_a_client_keeps_counting_after_the_counters_are_reset(fake_clock):
     assert http_stats()["yahoo"]["requests"] == 1 and http_summary().startswith("yahoo 1 req")
 
 
+# --------------------------------------------------------------------------------------- deadlines
+def test_an_expired_deadline_means_no_request_at_all(fake_clock):
+    session = FakeSession([FakeResponse(200, b"x")])
+    client = HttpClient("nse_api", session=session, clock=fake_clock)
+    with pytest.raises(DataUnavailable, match="deadline reached") as err:
+        client.get("https://example.com/x", deadline=fake_clock.monotonic() - 1.0)
+    assert err.value.retryable is True and session.calls == []
+
+
+def test_each_attempt_is_capped_to_the_time_that_is_left(fake_clock):
+    session = FakeSession([FakeResponse(200, b"x")])
+    HttpClient("nse_api", session=session, clock=fake_clock, timeout=(10.0, 60.0)).get(
+        "https://example.com/x", deadline=fake_clock.monotonic() + 6.0)
+    assert session.calls[0][2]["timeout"] == (3.0, 3.0)  # connect + read can never exceed the 6 s that are left
+    session = FakeSession([FakeResponse(200, b"x")])
+    HttpClient("nse_api", session=session, clock=fake_clock, timeout=(10.0, 60.0)).get(
+        "https://example.com/x", deadline=fake_clock.monotonic() + 600.0)
+    assert session.calls[0][2]["timeout"] == (10.0, 60.0)  # plenty of time: the normal timeouts apply
+
+
+def test_a_backoff_that_would_cross_the_deadline_ends_the_call_instead_of_sleeping_past_it(fake_clock):
+    session = FakeSession([FakeResponse(503, headers={"Retry-After": "30"}), FakeResponse(200, b"late")])
+    client = HttpClient("nse_api", session=session, clock=fake_clock, max_attempts=4)
+    with pytest.raises(DataUnavailable) as err:
+        client.get("https://example.com/x", deadline=fake_clock.monotonic() + 10.0)
+    assert "deadline reached" in str(err.value) and "1 attempts" in str(err.value) and len(session.calls) == 1
+    assert fake_clock.sleeps == []  # it did not sleep the 30 s Retry-After
+
+
+def test_a_retry_that_fits_before_the_deadline_still_happens(fake_clock):
+    session = FakeSession([FakeResponse(503, headers={"Retry-After": "2"}), FakeResponse(200, b"ok")])
+    client = HttpClient("nse_api", session=session, clock=fake_clock, max_attempts=4)
+    assert client.get("https://example.com/x", deadline=fake_clock.monotonic() + 60.0).content == b"ok"
+    assert fake_clock.sleeps == [2.0]
+
+
 # --------------------------------------------------------------------------------------------- logs
 def test_retries_and_give_ups_are_logged_with_host_and_path_but_never_the_query(fake_clock, caplog):
     client = HttpClient("fred", session=FakeSession([FakeResponse(503), FakeResponse(503)]), clock=fake_clock, max_attempts=2)

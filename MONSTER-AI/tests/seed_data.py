@@ -156,7 +156,7 @@ class FakeNseApi:
         self._holidays = holidays
         self.book_ts = book_ts
 
-    def preopen(self, key: str = "ALL", symbols: Any = None):
+    def preopen(self, key: str = "ALL", symbols: Any = None, *, deadline: float | None = None):
         from app.errors import DataUnavailable
         from ingestion.nse import PreopenSnapshot
 
@@ -166,7 +166,7 @@ class FakeNseApi:
         rows = self.books[min(self.calls - 1, len(self.books) - 1)] if self.books else []
         return PreopenSnapshot(rows=rows, source_ts=self.book_ts)
 
-    def gift_nifty(self):
+    def gift_nifty(self, *, deadline: float | None = None):
         return self.gift
 
     def holidays(self):

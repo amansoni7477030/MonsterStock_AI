@@ -415,11 +415,13 @@ def fresh_preopen_rows(snapshot: PreopenSnapshot, trade_date: str) -> list[dict[
     return fresh
 
 
-def collect_preopen(store: Store, nse: NseApi, trade_date: str, symbols: Iterable[str]) -> PreopenSnapshot | None:
+def collect_preopen(store: Store, nse: NseApi, trade_date: str, symbols: Iterable[str], *,
+                    deadline: float | None = None) -> PreopenSnapshot | None:
     """Fetch the NSE pre-open book once and append today's rows (with source and received timestamps) to ``preopen_quotes``.
-    A book that is not from ``trade_date`` yet counts as "not published": the returned snapshot has no rows."""
+    A book that is not from ``trade_date`` yet counts as "not published": the returned snapshot has no rows. ``deadline`` is a
+    ``clock.monotonic()`` instant that bounds the HTTP attempts."""
     try:
-        snapshot = nse.preopen("ALL", set(symbols))
+        snapshot = nse.preopen("ALL", set(symbols), deadline=deadline)
     except DataUnavailable as exc:
         store.record_source_result("nse_api_market", False, error=redact(str(exc)))
         log.warning("pre-open collection failed: %s", redact(str(exc)))
@@ -434,9 +436,9 @@ def collect_preopen(store: Store, nse: NseApi, trade_date: str, symbols: Iterabl
     return PreopenSnapshot(snapshot.source_ts, rows)
 
 
-def collect_gift(store: Store, nse: NseApi) -> dict[str, Any] | None:
+def collect_gift(store: Store, nse: NseApi, *, deadline: float | None = None) -> dict[str, Any] | None:
     try:
-        gift = nse.gift_nifty()
+        gift = nse.gift_nifty(deadline=deadline)
     except DataUnavailable as exc:
         store.record_source_result("nse_api_market", False, error=redact(str(exc)))
         return None
