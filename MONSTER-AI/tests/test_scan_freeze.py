@@ -77,6 +77,15 @@ def test_a_successful_freeze_commits_the_snapshot_and_every_prediction_together(
     assert result.metrics["predictions"] == len(pre_predictions(env, all_snapshots=True)) > 5  # picks and baselines
 
 
+def test_the_frozen_snapshot_names_the_exact_code_that_made_it(env):
+    from app.release import release_id
+
+    assert run_scan(context(env), "pre").status == "success"
+    row = env.store.conn.execute("SELECT code_version FROM snapshots WHERE trade_date = ? AND stage = 'pre'", (DAY,)).fetchone()
+    assert row["code_version"] == release_id() and "+" in row["code_version"]
+    assert env.store.latest_snapshot(DAY, "pre")["payload"]["meta"]["code"] == release_id()
+
+
 # ------------------------------------------------------------------------------------- repair on retry
 def lose_predictions(env):
     """The state an old interruption between the two writes left behind: a frozen snapshot with no predictions."""

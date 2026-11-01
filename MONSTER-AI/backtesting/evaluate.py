@@ -26,9 +26,9 @@ from ranking.types import EveningRow, EveningSummary
 
 log = logging.getLogger(__name__)
 
-# "gap" ranks on the opening gap in the final stage, but on yesterday's range in the preliminary stage (the pre-open price is
-# not known yet): ranking.ranker.baseline_picks still files both under "gap".
-BASELINES = ("atr", "range20", "volume", "gap", "random")
+# "gap" ranks on the opening gap and exists only in the final stage (the pre-open price is not known earlier); "recent_range"
+# ranks on yesterday's range in both stages, like the baseline of the same name in training.
+BASELINES = ("atr", "range20", "volume", "recent_range", "gap", "random")
 SCORING_ORDER = ("final", "pre")  # a day is scored on its final snapshot, else on its preliminary one
 
 

@@ -328,6 +328,38 @@ def test_http_and_https_links_are_kept_and_escaped_inside_href():
         assert f'Main catalyst: Fake (<a href="{shown}">link</a>)' in lines(messages)
 
 
+# ---------------------------------------------------------------------------------- catalyst provenance
+@pytest.mark.parametrize(("fields", "tag"), [
+    (dict(rumour=True, source_class="social"), "[RUMOUR - unconfirmed; social media]"),
+    (dict(rumour=False, source_class="exchange_filing", n_independent=3), "[exchange filing; 3 independent sources]"),
+    (dict(source_class="media", n_independent=2, n_conflicts=1), "[media report; 2 independent sources; 1 conflicting]"),
+    (dict(source_class="unknown"), "[unverified source]"),
+    (dict(n_independent=1, n_conflicts=0), None),
+    (dict(), None),
+], ids=["rumour", "filing", "conflict", "unknown", "single-source", "no-provenance"])
+def test_a_catalyst_shows_how_far_it_can_be_trusted(fields, tag):
+    cand = make_candidate(catalysts=[Catalyst(headline="Fake headline", source="Fake Wire", **fields)])
+    messages = render_final_report(make_ctx([cand]))
+    assert_telegram_safe(messages)
+    want = "Main catalyst: Fake headline - Fake Wire" + (f" {tag}" if tag else "")
+    assert want in lines(messages)
+
+
+def test_hostile_provenance_values_never_reach_the_message():
+    cand = make_candidate(catalysts=[Catalyst(headline="Fake", source="Wire", rumour="yes", source_class="<b>x</b>",
+                                              n_independent="many", n_conflicts=float("nan"))])
+    messages = render_final_report(make_ctx([cand]))
+    assert_telegram_safe(messages)
+    assert "Main catalyst: Fake - Wire" in lines(messages)
+    assert "RUMOUR" not in "\n".join(messages)
+
+
+def test_the_provenance_survives_the_snapshot_round_trip():
+    original = Catalyst(headline="Fake", rumour=True, source_class="social", n_independent=2, n_conflicts=0)
+    assert Catalyst.from_dict(original.to_dict()) == original
+    assert Catalyst.from_dict({"headline": "Old snapshot", "unknown_future_key": 1}).rumour is None
+
+
 # ------------------------------------------------------------------------------------ missing data
 def test_missing_and_non_finite_values_render_as_n_a_never_as_numbers():
     cand = make_candidate(

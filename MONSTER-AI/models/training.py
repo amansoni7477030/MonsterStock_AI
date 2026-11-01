@@ -369,6 +369,7 @@ def train_stage(
     q10, q90 = meta_oof["q:range_q10"], meta_oof["q:range_q90"]
     quant_metrics["range_80pct_interval_coverage"] = M.interval_coverage(mlabels["y_range"][hold], q10[hold], q90[hold])
     quant_metrics["range_mae_median"] = M.mae(mlabels["y_range"][hold], meta_oof["q:range_q50"][hold])
+    quant_metrics["n"] = int(len(hold))  # sample size behind the range-forecast numbers (the walk-forward report prints it)
 
     # ---------------------------------------------------------- ranking edge vs simple baselines (holdout)
     primary = f"hit_{_tname(cfg.primary_threshold)}"

@@ -2,7 +2,7 @@
 
 Primary: intraday range % of open, maximum excursion from open, threshold exceedance (1/2/3/5 %), and a
 stock-specific volatility-adjusted "unusual" flag. Secondary: close-vs-open direction. A wide range does not imply
-a directional close or a profitable trade; those are evaluated separately (backtesting.execution).
+a directional close or a profitable trade; backtesting.evaluate measures only how far a session moved and claims no trading strategy.
 """
 
 from __future__ import annotations

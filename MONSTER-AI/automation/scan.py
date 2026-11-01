@@ -20,16 +20,17 @@ from typing import Any
 
 import pandas as pd
 
-from app import __version__
 from app.clock import at_ist, iso
 from app.config import Settings
 from app.logging_setup import redact
+from app.release import release_id
 from automation.context import JobContext, JobResult
 from backtesting.evaluate import feature_payload, features_hash, snapshot_table
 from database.store import Store
 from features import regime
 from features.live import LiveFeatures, build_live_features
 from features.schema import FEATURE_VERSION
+from ingestion import basis
 from ingestion.freshness import DataQuality, assess_data_quality, ist_label
 from ingestion.pipeline import collect_gift, collect_preopen
 from models.inference import Bundle, ModelBundle, check_columns, disagreement_limit, pick_uncertainty_ceilings
@@ -174,6 +175,15 @@ def _predict(bundle: Bundle, frame: pd.DataFrame, registry: Any, stage: str, not
     return bundle, bundle.predict(frame)
 
 
+def _rebased_today(ctx: JobContext, symbols: Any) -> list[str]:
+    """Names with an ex-date today (split or bonus) whose stored prices are still on the old basis: the exchange's previous close
+    in the pre-open book differs from the stored one. Their opening gap would compare two price bases (a 1:2 split looks like
+    a -50 % gap), so the final scan must not use it. A failed check never stops the scan."""
+    found = _best_effort("price basis check", basis.preopen_breaks, ctx.store, ctx.run_date.isoformat()) or []
+    wanted = set(symbols)
+    return sorted(item.symbol for item in found if item.symbol in wanted)
+
+
 def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
     registry = ctx.registry()
     notes: list[str] = []
@@ -183,6 +193,12 @@ def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
     n_fallback = 0
     if stage == "final" and live.X_pre is not None:
         has_gap = pd.Series([live.open_source.get(sym, "none") != "none" for sym in X.index], index=X.index)
+        rebased = _rebased_today(ctx, X.index)
+        if rebased:
+            has_gap.loc[rebased] = False
+            log.warning("final scan: %s have an ex-date today (price basis changed); scored without the opening gap", rebased)
+            notes.append(f"{', '.join(rebased[:4])}{' ...' if len(rebased) > 4 else ''}: ex-date today (split or bonus), the opening "
+                         "gap is not comparable with the stored prices; scored without it")
         if has_gap.all():
             parts.append((main, X))
         else:
@@ -420,18 +436,19 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
 
     created = clock.now()
     late = created > at_ist(day, s.report_deadline_time)
+    code_version = release_id()  # version + code fingerprint: any frozen report can be traced to the exact code that made it
     stored = feature_payload(scored.features)
     freshness = _best_effort("freshness inputs", store.source_freshness, trade_date=day.isoformat(), cutoff_ts=iso(cutoff) or "")
     payload = {
         "report": report.to_dict(), "table": snapshot_table(result.table), "features": stored,
         "baselines": result.baselines, "excluded": result.excluded, "open_source": live.open_source,
-        "meta": {"late": late, "n_fallback": scored.n_fallback, "market": live.market, "code": __version__,
+        "meta": {"late": late, "n_fallback": scored.n_fallback, "market": live.market, "code": code_version,
                  "expected_session": quality.expected_session, "freshness": freshness or {}},
     }
     with store.tx():  # frozen together or not at all: a snapshot without its predictions could never be evaluated
         snapshot_id = store.insert_snapshot(
             trade_date=day.isoformat(), stage=stage, cutoff_ts=iso(cutoff) or "", feature_version=FEATURE_VERSION,
-            model_version=scored.version, code_version=__version__, payload=payload, data_quality=quality.to_dict(),
+            model_version=scored.version, code_version=code_version, payload=payload, data_quality=quality.to_dict(),
         )
         ids = store.insert_predictions(snapshot_id, day.isoformat(), stage, _prediction_rows(result, scored, s, stored))
     log.info("%s scan frozen: snapshot=%s predictions=%d model=%s (%s) candidates=%s", stage, snapshot_id, len(ids),
@@ -456,11 +473,23 @@ def _build_report(
     return ReportContext(
         trade_date=ctx.run_date.isoformat(), stage=stage, snapshot_ist=ist_label(cutoff), model_version=scored.version,
         model_status=scored.status, mode=ctx.settings.mode, candidates=result.candidates, no_setup=result.no_setup,
-        no_setup_reason=result.no_setup_reason,
-        regime=regime.describe(m.get("m_trend"), m.get("m_volreg"), m.get("m_risk"), m.get("m_expiry_share")),
+        no_setup_reason=result.no_setup_reason, regime=_regime_labels(ctx.store, quality, cutoff, m),
         freshness=quality.freshness(), missing_feeds=quality.missing_feeds(), notes=notes[:5],
         universe_size=result.n_universe, n_eligible=result.n_eligible, uncertainty_note=_uncertainty_note(scored),
     )
+
+
+def _regime_labels(store: Store, quality: DataQuality, cutoff: datetime, market: Mapping[str, Any]) -> dict[str, str]:
+    """Regime labels plus GIFT Nifty's change versus its previous close (the market's own hint of the opening). The quote is shown
+    only while the freshness gate rates it ok, so a stale quote never reads as today's signal."""
+    labels = regime.describe(market.get("m_trend"), market.get("m_volreg"), market.get("m_risk"), market.get("m_expiry_share"))
+    state = quality.feeds.get("GIFT Nifty")
+    if state is not None and state.level == "ok":
+        quote = _best_effort("GIFT Nifty quote", store.latest_live_quote, "GIFT_NIFTY", before=iso(cutoff) or "")
+        change = (quote or {}).get("change_pct")
+        if isinstance(change, (int, float)) and math.isfinite(change):
+            labels["gift_nifty"] = f"{change:+.2f}%"
+    return labels
 
 
 def _uncertainty_note(scored: Scored) -> str:

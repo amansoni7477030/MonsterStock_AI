@@ -2,10 +2,10 @@
 
 The evaluation is the same purged, embargoed walk-forward used for training: every probability is out-of-sample, calibration is
 fitted on earlier data than the holdout, and the model's daily top-N is compared with simple baselines (ATR, 20-day range,
-volume, gap, random). The per-scorer hit-rate intervals are day-block bootstraps (the picks of a day are dependent) and the
+volume, yesterday's range, opening gap, random). The per-scorer hit-rate intervals are day-block bootstraps (the picks of a day are dependent) and the
 model-minus-baseline difference is a paired day bootstrap. The report also prints the holdout's range-forecast error (MAE,
 pinball loss, 80 % interval coverage) and direction accuracy, each with its sample size. Nothing is registered or activated;
-the report states honestly whether an edge over baselines exists. Survivorship bias (today's index membership applied to
+the report states honestly whether an edge over baselines exists. Residual survivorship bias (today's index membership applied to
 history) and vendor-data quality are documented limitations, not hidden.
 """
 
@@ -28,8 +28,11 @@ from features.labels import threshold_name
 log = logging.getLogger(__name__)
 
 LIMITATIONS = (
-    "Universe = today's F&O + Nifty 100 membership applied to history (survivorship bias: delisted/removed names are absent).",
-    "Prices are vendor-adjusted (Yahoo) before official bhavcopy history exists; corporate-action errors are possible.",
+    "Universe = today's F&O + Nifty 100 membership applied to history, plus the quarantined / suspended / delisted names this database "
+    "holds bars for. Residual survivorship bias: names it never ingested (delisted before it started) and names that merely left the "
+    "index while still trading are absent.",
+    "Prices are vendor-adjusted (Yahoo) before official bhavcopy history exists (official rows are re-based on the post-split basis "
+    "when read); corporate-action errors are still possible.",
     "Costs are modelled estimates (brokerage, statutory charges, slippage by liquidity), not realised fills.",
     "A large intraday range is not a tradable edge by itself: the report measures range prediction, not profitability.",
 )

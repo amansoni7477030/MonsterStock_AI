@@ -19,6 +19,7 @@ from app.errors import ConfigError
 from dashboard import app as dash
 from dashboard import templates as tpl
 from database.store import Store
+from features.schema import FEATURE_VERSION
 
 TOKEN = "dashboard-token-0123456789"
 BEARER = {"Authorization": f"Bearer {TOKEN}"}
@@ -56,7 +57,7 @@ def _source(store, source_id, criticality):
 
 def _predictions(store, trade_date, stage, symbols, baselines=()):
     snapshot = store.insert_snapshot(
-        trade_date=trade_date, stage=stage, cutoff_ts=f"{trade_date}T03:42:00Z", feature_version="fv1",
+        trade_date=trade_date, stage=stage, cutoff_ts=f"{trade_date}T03:42:00Z", feature_version=FEATURE_VERSION,
         model_version="m-final-1", code_version="c1", payload={"d": trade_date, "s": stage}, data_quality={})
     rows = [{"symbol": symbol, "rank": rank, "tier": "STRONG" if rank == 1 else "WATCH", "model_version": "m-final-1",
              "model_status": "shadow", "p": {"hit_3": 0.52 - 0.05 * rank, "unusual": 0.31},

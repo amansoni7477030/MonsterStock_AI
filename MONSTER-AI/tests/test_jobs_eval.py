@@ -10,6 +10,7 @@ import pytest
 from automation import jobs
 from automation.scan import run_scan
 from backtesting import evaluate as ev
+from features.schema import FEATURE_VERSION
 from tests.seed_data import make_job_context, panel_ending, populate_store
 
 UTC = timezone.utc
@@ -148,7 +149,7 @@ def test_calibration_from_frozen_tables_scores_informative_probabilities(env):
             bar = env.store.get_bars(env.store.instrument_id(symbol), day, day).iloc[0]
             realised = (bar["high"] - bar["low"]) / bar["open"] * 100
             table[symbol] = 0.8 if realised > thr else 0.1
-        env.store.insert_snapshot(trade_date=day, stage="final", cutoff_ts=f"{day}T03:38:00Z", feature_version="fv1", model_version="m",
+        env.store.insert_snapshot(trade_date=day, stage="final", cutoff_ts=f"{day}T03:38:00Z", feature_version=FEATURE_VERSION, model_version="m",
                                   code_version="t", payload={"table": table}, data_quality={})
     out = ev.calibration_from_snapshots(env.store, env.settings, days)
     assert out["brier"] is not None and out["brier_skill"] > 0.5 and 0 <= out["ece"] <= 0.25

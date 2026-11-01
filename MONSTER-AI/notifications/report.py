@@ -227,11 +227,36 @@ def _hit_items(p: Mapping[str, Any]) -> list[tuple[float, Any]]:
     return sorted(items, key=lambda item: item[0])
 
 
+_SOURCE_CLASS_LABELS = {
+    "exchange_filing": "exchange filing", "official": "official source", "company": "company statement",
+    "media": "media report", "social": "social media", "unknown": "unverified source",
+}
+
+
+def _provenance(catalyst: Any) -> str:
+    """``[RUMOUR - unconfirmed; social media; 2 independent sources]``: how far the catalyst can be trusted. Empty when the
+    snapshot carries no provenance (older snapshots), so existing lines do not change."""
+    parts = []
+    if _get(catalyst, "rumour") is True:
+        parts.append("RUMOUR - unconfirmed")
+    label = _SOURCE_CLASS_LABELS.get(_clip(_get(catalyst, "source_class"), 20))
+    if label:
+        parts.append(label)
+    independent = _num(_get(catalyst, "n_independent"))
+    if independent is not None and independent >= 2:
+        parts.append(f"{int(independent)} independent sources")
+    conflicts = _num(_get(catalyst, "n_conflicts"))
+    if conflicts is not None and conflicts >= 1:
+        parts.append(f"{int(conflicts)} conflicting")
+    return f" [{'; '.join(parts)}]" if parts else ""
+
+
 def _catalyst_line(label: str, catalyst: Any) -> str:
     line = f"{label}: {_txt(_get(catalyst, 'headline'), _HEADLINE)}"
     source = _clip(_get(catalyst, "source"), _SOURCE)
     if source:
         line += f" - {_esc(source)}"
+    line += _provenance(catalyst)
     url = _safe_url(_get(catalyst, "url"))
     if url:
         line += f' (<a href="{html.escape(url, quote=True)}">link</a>)'

@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from features.schema import FEATURE_VERSION
+
 DAY = "2026-11-02"
 UTC = timezone.utc
 
@@ -19,7 +21,7 @@ def pred(symbol: str, rank: int, **extra):
 
 
 def freeze(store, *, day: str = DAY, stage: str = "final", tag: str = "a", symbols=("AAA", "BBB"), baselines=("atr",)):
-    sid = store.insert_snapshot(trade_date=day, stage=stage, cutoff_ts=f"{day}T03:40:00Z", feature_version="fv1", model_version="m1",
+    sid = store.insert_snapshot(trade_date=day, stage=stage, cutoff_ts=f"{day}T03:40:00Z", feature_version=FEATURE_VERSION, model_version="m1",
                                 code_version="c1", payload={"tag": tag}, data_quality={})
     rows = [pred(symbol, rank) for rank, symbol in enumerate(symbols, 1)]
     rows += [pred(symbols[0], 1, tier="BASELINE", model_status="baseline", is_baseline=True, baseline_name=name) for name in baselines]

@@ -68,6 +68,29 @@ def test_prelim_scan_freezes_snapshot_and_reports_baseline(env):
     assert "PRELIMINARY" in env.telegram.sent[0][1]
 
 
+def scan_with_gift(env, source_ts):
+    """A preliminary scan whose GIFT Nifty quote carries the ISO-UTC stamp the real NSE parser produces."""
+    env.clock.set(PRELIM_TIME)
+    ctx = env.make()
+    ctx._cache["nse_api"] = FakeNseApi(gift={"price": 24100.0, "prev_close": 24000.0, "change_pct": 0.4, "source_ts": source_ts,
+                                             "expiry": "26Nov2026"})
+    result = run_scan(ctx, "pre")
+    assert result.status == "success", result.message
+    return env.store.latest_snapshot("2026-11-02", "pre")["payload"]["report"]
+
+
+def test_the_report_shows_gift_nifty_while_its_quote_is_fresh(env):
+    report = scan_with_gift(env, "2026-11-02T03:14:00Z")  # 08:44 IST, one minute before the scan
+    assert report["regime"]["gift_nifty"] == "+0.40%"
+    assert "gift_nifty=+0.40%" in "\n".join(text for _, text in env.telegram.sent)
+
+
+def test_a_stale_gift_nifty_quote_never_reads_as_todays_hint(env):
+    report = scan_with_gift(env, "2026-11-02T01:00:00Z")  # 06:30 IST: over two hours old
+    assert "gift_nifty" not in report["regime"]
+    assert any("GIFT Nifty" in feed for feed in report["missing_feeds"])
+
+
 def test_scan_is_idempotent_and_retry_resends_frozen_report(env):
     env.clock.set(PRELIM_TIME)
     env.telegram.fail = True
@@ -134,6 +157,23 @@ def test_final_scan_uses_preopen_book_with_preliminary_fallback(env):
     assert any("no pre-open price" in n for n in notes)
     assert any("FINAL" in text for _, text in env.telegram.sent)
     assert ctx.intel().calls == ["refresh_reactions"]  # pre-open quotes are known: re-check what is already priced in
+
+
+def test_a_split_ex_date_name_is_scored_without_its_misleading_opening_gap(env):
+    env.clock.set(FINAL_TIME)
+    rows = preopen_rows(env.panel, env.panel.symbols)
+    half = rows[0]["prev_close"] / 2  # a 1:2 split with an ex-date today: the exchange's previous close is already halved
+    rows[0].update(prev_close=half, iep=half * 1.004, final_price=half * 1.004)
+    name = rows[0]["symbol"]
+    env.store.add_preopen_quotes("2026-11-02", rows, "02-Nov-2026 09:08:30")
+    env.clock.advance(5)
+    ctx = env.make()
+    ctx._cache["nse_api"] = FakeNseApi(books=[rows])
+    assert run_scan(ctx, "final").status == "success"
+    payload = env.store.latest_snapshot("2026-11-02", "final")["payload"]
+    assert payload["meta"]["n_fallback"] == 1  # only the re-based name loses its gap
+    assert any(name in note and "ex-date today" in note for note in payload["report"]["notes"])
+    assert name not in payload["baselines"]["gap"]  # a -50 % "gap" would otherwise top the opening-gap baseline
 
 
 def test_the_preliminary_scan_does_not_recheck_market_reactions(env):

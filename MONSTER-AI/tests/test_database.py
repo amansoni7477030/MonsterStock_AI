@@ -14,6 +14,7 @@ from database.migrate import (
     iter_statements,
 )
 from database.store import Store
+from features.schema import FEATURE_VERSION
 
 
 # ------------------------------------------------------------------------------------------ migrations
@@ -229,7 +230,7 @@ def test_backfill_progress(store):
 
 # ---------------------------------------------------------------------- snapshots / predictions / outcomes
 def _snapshot(store, **overrides):
-    args = dict(trade_date="2026-11-02", stage="final", cutoff_ts="2026-11-02T03:42:00Z", feature_version="fv1",
+    args = dict(trade_date="2026-11-02", stage="final", cutoff_ts="2026-11-02T03:42:00Z", feature_version=FEATURE_VERSION,
                 model_version="m1", code_version="c1", payload={"AAA": {"x": 1.5, "n": float("nan")}}, data_quality={"ok": True})
     args.update(overrides)
     return store.insert_snapshot(**args)

@@ -268,8 +268,9 @@ def baseline_picks(features: pd.DataFrame, eligible: pd.Series, stage: str, trad
     """Simple benchmark selections stored next to the model's picks (shadow comparison on identical days)."""
     pool = features[eligible]
     out: dict[str, list[str]] = {}
-    scorers = {"atr": "t_atr14_pct", "range20": "t_range_mean20", "volume": "t_rvol1",
-               "gap": "p_gap_abs" if stage == "final" and "p_gap_abs" in features else "t_range_prev"}
+    scorers = {"atr": "t_atr14_pct", "range20": "t_range_mean20", "volume": "t_rvol1", "recent_range": "t_range_prev"}
+    if stage == "final" and "p_gap_abs" in features:  # the opening gap is only known once the pre-open price is
+        scorers["gap"] = "p_gap_abs"
     for name, col in scorers.items():
         if col in pool and pool[col].notna().any():
             out[name] = list(pool[col].sort_values(ascending=False, kind="mergesort").dropna().index[:top_n])

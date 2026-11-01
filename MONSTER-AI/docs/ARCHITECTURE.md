@@ -7,54 +7,227 @@ predictions, scores them after the close and retrains under fixed gates.
 **Shadow mode only.** The system never places, modifies or cancels an order and holds no broker credentials. Its
 output is research. See [honesty rules](#honesty-rules).
 
+Companion documents: [README](../README.md) (overview and quick start), [OPERATIONS](OPERATIONS.md) (runbook),
+[deployment guide](../deployment/README.md), [DATA_SOURCES](DATA_SOURCES.md) (generated source catalogue) and
+[BLUEPRINT_TRACEABILITY](BLUEPRINT_TRACEABILITY.md) (every requirement of the original design blueprint and where it lives).
+
 ## Contents
 
-1. [Data flow](#data-flow)
-2. [Daily timeline](#daily-timeline)
-3. [Packages](#packages)
-4. [Point-in-time correctness](#point-in-time-correctness)
-5. [Models and governance](#models-and-governance)
-6. [Ranking and honesty rules](#honesty-rules)
-7. [Scheduling and self-healing](#scheduling-and-self-healing)
-8. [Degradation matrix](#degradation-matrix)
-9. [Storage](#storage)
-10. [External training and off-box storage](#external-training-and-off-box-storage)
-11. [Security](#security)
-12. [Resource budget](#resource-budget)
-13. [Design decisions](#design-decisions)
+1. [System context](#system-context)
+2. [Whole-code architecture](#whole-code-architecture)
+3. [Data flow](#data-flow)
+4. [Daily timeline](#daily-timeline)
+5. [The scan, step by step](#the-scan-step-by-step)
+6. [Packages](#packages)
+7. [Point-in-time correctness](#point-in-time-correctness)
+8. [Models and governance](#models-and-governance)
+9. [Honesty rules](#honesty-rules)
+10. [Scheduling and self-healing](#scheduling-and-self-healing)
+11. [Network layer: curl_cffi, bulk fetching, rate limits](#network-layer-curl_cffi-bulk-fetching-rate-limits)
+12. [Exchange calendar for any month and year](#exchange-calendar-for-any-month-and-year)
+13. [Time zones](#time-zones)
+14. [Storage and bounded retention](#storage-and-bounded-retention)
+15. [Logging and diagnostics](#logging-and-diagnostics)
+16. [Degradation matrix](#degradation-matrix)
+17. [External training and off-box storage](#external-training-and-off-box-storage)
+18. [Deployment topology](#deployment-topology)
+19. [Security](#security)
+20. [Resource budget](#resource-budget)
+21. [Design decisions](#design-decisions)
+22. [Deviations from the blueprint](#deviations-from-the-blueprint)
+
+## System context
+
+```mermaid
+flowchart LR
+    subgraph SRC["Public data sources - no paid keys required"]
+        YF["Yahoo Finance<br/>chart + spark endpoints"]
+        NSEA["NSE archives<br/>bhavcopy, F&O, index lists"]
+        NSEJ["NSE public JSON API<br/>pre-open, GIFT Nifty, filings, holidays"]
+        RSS["Publisher RSS/Atom feeds<br/>and GDELT"]
+        MAC["FRED and economic calendar<br/>(optional)"]
+    end
+    subgraph SERVER["Your server - 1 GB RAM, native systemd, no containers"]
+        MON["MONSTER AI<br/>scheduler daemon + short-lived job processes"]
+        DB[("SQLite WAL<br/>monster.db")]
+        FILES["Logs, backups, model files,<br/>disposable cache"]
+        MON <--> DB
+        MON --> FILES
+    end
+    subgraph OPT["Optional"]
+        S3[("S3-compatible store<br/>off-box backups, signed models")]
+        GHA["GitHub Actions worker<br/>external training"]
+        LLM["OpenAI-compatible LLM<br/>event extraction"]
+    end
+    TG["Telegram bot<br/>reports and alerts"]
+    YOU(("You"))
+    SRC -->|"curl_cffi, rate limited"| MON
+    MON -->|"09:12 IST report, alerts"| TG
+    TG --> YOU
+    MON <--> S3
+    GHA <--> S3
+    MON -.-> LLM
+    YOU -.->|"sudo monster-ai ... / SSH tunnel"| MON
+```
+
+Everything the system knows lives in **one SQLite file**. There is no message bus, no container and no second process
+holding state: a crash can only lose the work of the current job, and every job is safe to run again.
+
+## Whole-code architecture
+
+The code base is a layered modular monolith. Arrows point from a layer to the layers it uses; every layer also uses the
+platform package `app/` (configuration, clock, logging).
+
+```mermaid
+flowchart TB
+    subgraph L0["Entry points"]
+        direction LR
+        UNITS["systemd units<br/>monster-ai daemon, -bootstrap,<br/>-health.timer, -alert@, -dashboard"]
+        CLI["app.cli<br/>init, doctor, scan, train, backtest, models,<br/>backup, health, logs, storage, diag ..."]
+        DASH["dashboard<br/>read-only FastAPI, loopback"]
+    end
+    subgraph L1["automation/ - control plane"]
+        direction LR
+        SCHED["scheduler + schedule<br/>ledger-based daemon"]
+        RUNNER["runner + jobspec<br/>one child process per job"]
+        JOBS["jobs<br/>all job bodies"]
+        SCAN["scan<br/>pre and final scans"]
+        BOOT["bootstrap<br/>12-step first run"]
+        HEALTHM["health<br/>checks and alerts"]
+        RETM["retention<br/>bounded storage"]
+        CALM["calendar<br/>any-year exchange calendar"]
+        CTXM["context, intel,<br/>graph_learning"]
+    end
+    subgraph L2["Domain logic"]
+        direction LR
+        FEAT["features<br/>builder, technical, fno, global, regime,<br/>sector, similar_day, labels, live, loader"]
+        MOD["models<br/>specialists, training, calibration, inference,<br/>registry, artifacts, bundle, signing, external"]
+        RANK["ranking<br/>ranker, signals, costs, types"]
+        NEWS["news_intelligence<br/>dedup, entities, events, priced_in,<br/>source_quality, pipeline, llm"]
+        GRAPH["event_graph<br/>seed, sensitivity, propagation, repository"]
+        BT["backtesting<br/>evaluate, metrics, walkforward, live_record"]
+        NOTIF["notifications<br/>telegram, report renderers, delivery ledger"]
+    end
+    subgraph L3["Data layer"]
+        direction LR
+        ING["ingestion<br/>http (curl_cffi), yahoo, nse, pipeline, universe,<br/>validation, freshness, adjust, basis, news_sources, registry"]
+        DBL["database<br/>connection, migrate, store (repository),<br/>backup, object_store, remote_backup"]
+    end
+    subgraph L4["app/ - platform"]
+        PLAT["config, clock, logging_setup, logview, diagnostics, release,<br/>resources, locks, errors, jsonutil, envfile, doctor"]
+    end
+    EXT["External: Yahoo, NSE, RSS and GDELT, FRED, Telegram, S3, LLM"]
+
+    L0 -->|"start and run"| L1
+    L1 -->|"orchestrates"| L2
+    L1 -->|"reads and writes"| L3
+    L2 -->|"reads and writes"| L3
+    L3 --> L4
+    ING -.->|"HTTPS"| EXT
+    NOTIF -.->|"HTTPS"| EXT
+```
+
+Dependency rules, checked against the import graph:
+
+- `database` and `ranking` import nothing but `app`; `event_graph` imports only `database`; `notifications` imports only
+  `ranking.types` besides `app`.
+- `features`, `ingestion` and `backtesting` use `automation.calendar` as a shared service (it is the only `automation`
+  module a lower layer imports; `models.external` imports `automation.runner` lazily to run the model-sync job).
+- Only `automation` and `app.cli` see every package; nothing below them imports upwards.
+- The scheduler daemon never imports pandas, numpy, LightGBM or `requests`: jobs run in child processes, so the
+  long-lived process stays small.
+
+The control plane in more detail:
+
+```mermaid
+flowchart LR
+    CLID["app.cli daemon"] --> RD["run_daemon"]
+    RD --> SCH["Scheduler<br/>tick every few seconds"]
+    SCH --> ENG["ScheduleEngine<br/>SCHEDULE table + job_runs ledger<br/>+ ExchangeCalendar + IST clock"]
+    ENG --> DUE["due jobs<br/>(run key, attempt, window)"]
+    DUE --> GATE{"disk and RAM ok?<br/>heavy lock free?"}
+    GATE -- yes --> LAUNCH["SubprocessLauncher<br/>python -m app.cli run-job NAME"]
+    GATE -- no --> WAIT["deferred, logged"]
+    LAUNCH --> EXE["runner.execute_job<br/>locks, job log context,<br/>RSS watchdog, timeout"]
+    EXE --> BODY["jobs.NAME(ctx)<br/>or scan.run_scan / bootstrap"]
+    BODY --> LED[("job_runs ledger<br/>kv, alerts")]
+    SCH --> HB["heartbeat: systemd watchdog,<br/>heartbeat file, DB row"]
+    SCH --> BOOTQ["_maybe_bootstrap<br/>until bootstrap.state = done"]
+```
 
 ## Data flow
 
+```mermaid
+flowchart LR
+    subgraph IN["Ingestion (curl_cffi, validated, deadline-bounded)"]
+        Y["Yahoo<br/>daily bars, quotes"]
+        A["NSE archives<br/>official bhavcopy, F&O"]
+        J["NSE API<br/>pre-open, GIFT, filings"]
+        R["RSS, GDELT,<br/>filings, calendar"]
+    end
+    Y --> V["validation<br/>schema, ranges, dates, size"]
+    A --> V
+    J --> V
+    R --> NI["news_intelligence<br/>dedup, entities, events, priced-in"]
+    V --> DB[("SQLite - single source of truth<br/>bars, F&O, quotes, news, events,<br/>snapshots, predictions, outcomes")]
+    NI --> DB
+    DB --> EG["event_graph<br/>chains, sector sensitivities"]
+    DB --> F["features<br/>one code path for training AND live"]
+    F --> Q{"data-quality gate<br/>ok, degraded or blocked"}
+    Q --> M["models.inference<br/>champion or labelled baseline"]
+    M --> K["ranking<br/>eligibility, costs, tiers, abstention"]
+    EG --> K
+    NI --> K
+    K --> S["freeze immutable snapshot<br/>+ predictions"]
+    S --> D["notifications<br/>idempotent delivery ledger"]
+    D --> T(["Telegram report 09:12 IST"])
+    S --> E["backtesting.evaluate<br/>after the close: official bhavcopy"]
+    E --> O[("outcomes, rolling metrics")]
+    O --> EV(["evening report"])
+    O --> TR["weekly walk-forward training<br/>gates, champion / challenger"]
+    TR --> M
 ```
- Yahoo Finance ─┐                                        ┌─> technical / F&O / global / regime / calendar features
- NSE archives  ─┤   ingestion/      SQLite (WAL)        │            (features/, one code path for training AND live)
- NSE API       ─┼─> validate ─────> database/store.py ───┤
- RSS / filings ─┤   freshness gate  (single source of    └─> news_intelligence/ + event_graph/ (catalysts, chains,
- macro / GIFT  ─┘                    truth, immutable                     "already priced in")
-                                      snapshots)
-                                          │
-        data-quality gate (automation/scan.py) ──> models/inference ──> ranking/ranker ──> freeze snapshot + predictions
-                                                                                │
-                              Telegram report (notifications/) <───────────────┘   (idempotent delivery ledger)
-                                                                                │
-   after the close: official bhavcopy ──> backtesting/evaluate.py ──> outcomes ──> rolling metrics ──> evening report
-                                                                                │
-   weekly: walk-forward training (models/training.py) ──> gates ──> champion/challenger registry (models/registry.py)
-```
-
-Everything between "ingestion" and "report" reads and writes one SQLite file. There is no message bus, no
-container and no second process holding state: a crash can only lose the work of the current job, and every job is
-safe to run again.
 
 ## Daily timeline
 
 All times are Asia/Kolkata. The authoritative table is `SCHEDULE` in [automation/schedule.py](../automation/schedule.py);
 the daemon derives "what is due" from the `job_runs` ledger, never from a clock tick.
 
+```mermaid
+flowchart LR
+    subgraph EARLY["Any day (night and early morning)"]
+        direction TB
+        N1["02:00 Sat: train"]
+        N2["04:00 Sun: refresh_universe"]
+        N3["05:30: refresh_calendar, model_sync"]
+    end
+    subgraph MORN["Trading morning"]
+        direction TB
+        M1["06:00 collect_global"] --> M2["06:30 collect_news"]
+        M2 --> M3["07:50 health_check"]
+        M3 --> M4["08:00 collect_india"]
+        M4 --> M5["08:10 collect_news (late)"]
+        M5 --> M6["08:30 preflight"]
+        M6 --> M7["08:45 prelim_scan"]
+        M7 --> M8["09:00:30 refresh_preopen"]
+        M8 --> M9["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
+    end
+    subgraph EVE["After the close"]
+        direction TB
+        E1["17:45 ingest_eod"] --> E2["18:15 evaluate"]
+        E2 --> E3["20:00 health_check"]
+        E3 --> E4["23:30 backup"]
+        E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
+    end
+    EARLY --> MORN --> EVE
+    classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
+    class M7,M8,M9 critical
+```
+
 | Time | Job | Purpose |
 |------|-----|---------|
 | 06:00 | `collect_global` | global closes, live context, GIFT Nifty (retried until 08:30) |
-| 06:30 / 08:10 | `collect_news` | RSS, filings, board meetings, event extraction |
+| 06:30 / 08:10 | `collect_news` | RSS (conditional GET), GDELT, filings, board meetings, event extraction |
 | 07:50 | `health_check` | operational alerts (also 20:00) |
 | 08:00 | `collect_india` | previous session completeness: official file first, Yahoo as repair |
 | 08:30 | `preflight` | readiness check, repair, dry-run of the scan |
@@ -63,29 +236,74 @@ the daemon derives "what is due" from the `job_runs` ledger, never from a clock 
 | 09:08:45 | `final_scan` | final report with pre-open gaps, delivered by 09:12 (**critical**, hard deadline 09:14:30) |
 | 17:45 | `ingest_eod` | official end-of-day files |
 | 18:15 | `evaluate` | outcomes, metrics, evening report |
-| 23:30 / 23:50 | `backup`, `housekeeping` | verified online backup (+ off-box copy), retention, disk guard |
+| 23:30 / 23:50 | `backup`, `housekeeping` | verified online backup (+ off-box copy); retention, official-bar upgrade, basis repair, DB maintenance |
 | Sat 02:00 | `train` | walk-forward retraining (skipped in external mode) |
 | Sun 04:00 | `refresh_universe` | index / F&O membership, history for new names, event-graph re-seeding and weekly re-estimation of its edge sensitivities |
 | daily 05:30 | `refresh_calendar`, `model_sync` | holiday calendar; pull signed models in external mode |
+| every 5 min | `monster-ai-health.timer` | independent health check (works even when the daemon is down) |
 
-Critical jobs preempt non-critical ones. Non-trading days run only the "any day" jobs.
+Critical jobs preempt non-critical ones. Non-trading days run only the "any day" jobs. Jobs marked `catch_up` still run
+after their window (or on a later day) when the server was down.
+
+## The scan, step by step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SCH as Scheduler daemon
+    participant RUN as Job process (run-job final_scan)
+    participant NSE as NSE API
+    participant DQ as Data-quality gate
+    participant FEA as Feature builder
+    participant MOD as Model registry
+    participant RNK as Ranker and news graph
+    participant DB as SQLite
+    participant TG as Telegram
+
+    SCH->>RUN: start at 09:08:45 (the ledger says it is due)
+    RUN->>DB: trading day? frozen snapshot already there?
+    alt a frozen snapshot exists
+        RUN->>TG: re-send the frozen report, nothing is recomputed
+    else first run of the day
+        RUN->>NSE: GIFT Nifty and the pre-open book (deadline-bounded polls)
+        NSE-->>RUN: prices, or nothing (a book stamped on an earlier day is ignored)
+        RUN->>DQ: previous session complete? global block fresh?
+        alt blocked
+            DQ-->>RUN: blocked with reasons
+            RUN->>DB: alert scan_final_failed
+        else ok or degraded
+            RUN->>FEA: point-in-time features at the cutoff
+            FEA->>MOD: champion model, or the labelled heuristic baseline
+            MOD-->>RUN: calibrated probabilities and uncertainty
+            RUN->>RNK: eligibility, costs, catalysts, chains, tiers
+            RNK-->>RUN: top N, or no setup with the reason
+            RUN->>DB: freeze snapshot and predictions in ONE transaction
+            RUN->>TG: deliver through the ledger (idempotent, deadline 09:14:30)
+        end
+    end
+```
+
+Key properties: the snapshot is frozen **before** delivery, so a Telegram outage can never lose or change a report; a
+retry re-sends the frozen report; a report that would arrive after the deadline is withheld and an alert is queued; the
+pre-open wait is bounded by the same deadline, so a slow provider cannot push the report past its cutoff.
 
 ## Packages
 
 | Package | Responsibility |
 |---------|----------------|
-| [app/](../app) | configuration (single typed catalogue in `config.py`, generates `.env.example`), injectable clock, structured logging with secret redaction, file locks, resource guards (RSS watchdog, disk, RAM), CLI, `doctor`, error hierarchy |
-| [ingestion/](../ingestion) | Yahoo, NSE archive and API clients with bounded retries, circuit breakers and rate limits; validation; universe building; freshness / data-quality gate; source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
-| [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
-| [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION` |
-| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, optional LLM), source quality, "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) |
+| [app/](../app) | configuration (single typed catalogue in `config.py`, generates `.env.example`), injectable clock (UTC instants, IST market logic, display zone), logging (daily files, secret redaction, crash hooks) with the `logs` / `diag` tools, code fingerprint (`release.py`), file locks, resource guards (RSS watchdog, disk, RAM), CLI, `doctor`, error hierarchy |
+| [ingestion/](../ingestion) | the curl_cffi HTTP transport (`http.py`: browser impersonation, adaptive per-source rate limit, retries, circuit breaker, deadlines), Yahoo (chart + bulk `spark` probe), NSE archive and API clients, validation, universe building, freshness / data-quality gate, split-adjusted reads (`adjust.py`) and basis-break repair (`basis.py`), news collectors (RSS conditional GET), source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
+| [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups with a size budget (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
+| [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader |
+| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, optional LLM), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
 | [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates, abstention, baselines |
 | [notifications/](../notifications) | Telegram client, report renderers (4096-char safe), idempotent delivery with a ledger and deadline guard |
-| [automation/](../automation) | the scan, all jobs, the schedule engine, the daemon, the job runner, bootstrap, health, calendar |
-| [backtesting/](../backtesting) | outcome evaluation (provisional -> official), metrics, walk-forward backtest |
+| [automation/](../automation) | the scan, all jobs, the schedule engine, the daemon, the job runner, bootstrap, health, the exchange calendar, bounded-storage retention |
+| [backtesting/](../backtesting) | outcome evaluation (provisional -> official), metrics with day-block bootstrap intervals, the live range-forecast record and its slices, walk-forward backtest |
 | [dashboard/](../dashboard) | optional read-only FastAPI dashboard (loopback by default) |
 | [deployment/](../deployment) | installer, systemd units, remote deploy scripts - see [deployment/README.md](../deployment/README.md) |
+| [scripts/](../scripts) | `generate_docs.py`: regenerates `.env.example` and `docs/DATA_SOURCES.md` from the code (tests fail when they drift) |
 
 ## Point-in-time correctness
 
@@ -93,11 +311,25 @@ A scan at time *T* may use only what was knowable at *T*.
 
 - Price, volume and F&O features are **shifted by one session** (a morning scan never sees today's bar).
 - Global series are used at each series' own availability: a US close is known in the morning, a live quote is
-  taken at the scan cutoff, and a stale series is flagged rather than forward-filled silently.
+  taken at the scan cutoff, and a stale series is blanked (after 4 days; 7 for European and Asian equity series) instead
+  of being forward-filled silently.
 - Calendar and results-calendar features are known in advance and are not shifted.
 - Stage `final` adds `p_*` gap features computed from the pre-open price only; names without a pre-open price fall
   back to the `pre` model (reported as such). Pre-open rows are stored only when stamped on the trade date (IST): outside
   the pre-open session NSE serves the *previous* session's book, and that must never become today's opening gap.
+- **One price basis.** Official end-of-day rows are stored raw and re-based on the post-split basis when they are read
+  (`ingestion.adjust.adjusted_bars`, used by features, graph learning and the news reaction check), so the order in which
+  rows and split events arrive never matters. A split of a stock that already has history is detected from the exchange's
+  own previous close (`ingestion.basis`): the vendor is asked for exactly that stock until it reports the split, and the
+  operator is told after six sessions. On the ex-date morning the pre-open book exposes the break before the vendor does,
+  and such a name is scored **without** its (meaningless) opening gap.
+- **Point-in-time membership and survivorship.** F&O membership is a point-in-time flag; a training panel also holds the
+  quarantined, suspended or delisted names that have bars in the window. Names the database never ingested stay unknown
+  (documented limitation).
+- Relative-volume baselines exclude the current session; similar-day features use the same fixed pool and window in
+  training and live, so a live row equals the batch row for the same day.
+- News and event features are computed from `first_seen_at` (when the system saw an item), never from later edits;
+  event-graph edges keep an append-only history so replays can use the edges as they were (opt-in).
 - Muhurat and other special sessions are removed from the training panel (market-wide volume far below the
   trailing median) and never count as a "missing" session.
 - `tests/test_features_leakage.py` guards this: future data cannot change past features, the current session's path
@@ -106,8 +338,13 @@ A scan at time *T* may use only what was knowable at *T*.
   embargo.
 
 Snapshots (features, predictions, data quality, model and code version) are **immutable**: one is written per
-(date, stage) in the normal flow, a retry re-sends the frozen report instead of recomputing it, and an operator's forced
-re-scan adds a new snapshot without ever editing an old one.
+(date, stage) in the normal flow, the snapshot and its predictions are committed in **one transaction**, a retry
+re-sends the frozen report (restoring the predictions if an old interrupted freeze lost them), and an operator's forced
+re-scan adds a new snapshot without ever editing an old one. Evaluation scores only the *effective* (latest) snapshot of
+a (date, stage), and a day is scored on its final snapshot, else its preliminary one, so a forced re-scan is never counted
+twice. The stored features carry a hash that can be re-verified, the inputs the scan saw (latest source timestamps, arrival
+times, counts) are recorded, and `code_version` is `<release>+<fingerprint of the code>`: any frozen report can be traced to
+the exact code that produced it (`monster-ai version` prints the running value).
 
 ## Models and governance
 
@@ -116,14 +353,38 @@ re-scan adds a new snapshot without ever editing an old one.
 - **Meta model** on out-of-fold specialist outputs plus context; **isotonic calibration** per head; quantile heads
   for the expected range (q10/q50/q90).
 - **Walk-forward training** with an embargo, 8 folds, a held-out final block; ranking edge is measured against
-  simple baselines (20-day range, ATR, recent range, volume, random) with a bootstrap.
+  simple baselines (20-day range, ATR, yesterday's range, volume, opening gap, random) with a day-block bootstrap.
 - **Gates** (fixed in config, not tuned per run): enough held-out days, ECE <= 0.06, positive Brier skill vs climatology
-  and a one-sided 90 % edge over the best baseline. Status is `validated`, `shadow` (gates not met, still useful for
-  research), `rejected` (never activated) or `baseline` (no trained model, heuristic only).
-- **Registry**: every version is stored with metrics, gate outcome, feature-schema hash and a manifest checksum recorded
-  at registration. A challenger replaces the champion only if it matches or beats it on the same gate metrics;
-  a corrupt or stale champion is replaced or rolled back automatically, falling back to the heuristic baseline
-  if nothing verifies. Daily outcomes never edit a model.
+  and a one-sided 90 % edge over the best baseline. Status is `validated`, `shadow` (calibrated and skilful, edge not
+  demonstrated: still useful for research), `rejected` (never activated) or `baseline` (no trained model, heuristic only).
+- **Registry**: every version is stored with metrics, gate outcome, feature-schema hash, the code fingerprint and a manifest
+  checksum recorded at registration. A challenger replaces the champion only if it matches or beats it on the same gate
+  metrics; a corrupt, stale or wrong-feature-version champion is replaced or rolled back automatically, falling back to the
+  heuristic baseline if nothing verifies. Daily outcomes never edit a model. A change of `FEATURE_VERSION` (now `fv2`)
+  retires the older models: scans use the labelled baseline until the next `train` has produced a model.
+
+```mermaid
+flowchart TB
+    T0["train job (Sat 02:00 IST, heavy lock)<br/>or: monster-ai train"] --> T1{"free disk above<br/>the critical threshold?"}
+    T1 -- no --> TX["fail early, alert, keep the champion"]
+    T1 -- yes --> T2["point-in-time training panel<br/>split-adjusted bars, survivorship-aware universe,<br/>special sessions removed"]
+    T2 --> T3["walk-forward folds with embargo<br/>8 folds + a held-out final block"]
+    T3 --> T4["specialists per target<br/>technical, F&O, global, regime, events, direction"]
+    T4 --> T5["meta model on out-of-fold outputs<br/>isotonic calibration, quantile heads"]
+    T5 --> T6{"fixed gates<br/>enough days, ECE, Brier skill,<br/>edge over the best simple baseline"}
+    T6 -- "all met" --> S1["validated"]
+    T6 -- "calibrated and skilful, no edge" --> S2["shadow"]
+    T6 -- "not calibrated or no skill" --> S3["rejected - never activated"]
+    S1 --> R1["registry: artifact, manifest checksum,<br/>metrics, code fingerprint"]
+    S2 --> R1
+    R1 --> R2{"first model, champion unhealthy,<br/>higher status, or matches / beats<br/>the champion on the gate metrics?"}
+    R2 -- yes --> A1["activate as champion"]
+    R2 -- no --> A2["kept as a challenger"]
+    A1 --> L1["every scan: verify checksum<br/>and feature version before use"]
+    L1 -- "corrupt, stale or wrong feature version" --> L2["roll back to the previous good version,<br/>else the labelled heuristic baseline"]
+    EXT["external worker (GitHub Actions)<br/>HMAC-signed bundle in S3"] --> SYNC["model_sync verifies pointer, hash,<br/>signature and every file"]
+    SYNC --> R1
+```
 
 ## Honesty rules
 
@@ -144,6 +405,9 @@ re-scan adds a new snapshot without ever editing an old one.
 - A report that would be delivered after the 09:14:30 deadline is withheld (the alert is queued and sent later).
 - Ranking uses the calibrated range probability only. The report states that a wide range does not imply a profitable
   trade or a directional close; the direction head is a diagnostic and is near chance in out-of-sample tests.
+- Every statistic in the evening report carries its sample size and a 95 % interval (day-block bootstrap, because the picks
+  of one day are dependent); below five days it prints "n/a" instead of a number it cannot support. News catalysts show how far
+  they can be trusted (rumour, source class, independent sources, conflicts).
 
 ## Scheduling and self-healing
 
@@ -154,34 +418,342 @@ re-scan adds a new snapshot without ever editing an old one.
 - **Bootstrap** is a resumable 12-step state machine (`bootstrap.state` in the `kv` table). A crash, reboot or
   out-of-memory kill resumes where it stopped; repeated crashes in an optional step skip that step instead of looping.
 - **Watchdogs**: per-job RSS ceiling (`JOB_MAX_RSS_MB`), systemd `MemoryHigh/MemoryMax`, service watchdog, a health
-  timer that alerts independently of the daemon.
+  timer that alerts independently of the daemon, a heartbeat that is written to a file as well as to the database (so a
+  locked database is distinguishable from a dead daemon), and a self-reported alert when the daemon finds that its previous
+  run ended uncleanly.
+- **Resource gates**: heavy jobs are deferred while free disk is below the critical threshold; training checks the disk
+  before it starts.
 - **Health** (`automation/health.py`): data freshness, missing sessions, model age and status, source failures,
-  backup age, disk and RAM, delivery failures, performance drift. Alerts are de-duplicated and queued until Telegram
-  works again.
+  backup age, disk and RAM, storage budget and retention, calendar coverage, delivery failures, performance drift. Alerts are
+  de-duplicated and queued until Telegram works again.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Due: window open, run key not settled, dependencies done
+    Due --> Running: the scheduler launches the child process
+    Running --> Success: the job returns success
+    Running --> Skipped: nothing to do today (closed day, external mode ...)
+    Running --> Failed: error, timeout, RSS ceiling or the process died
+    Running --> Preempted: a critical job needs the slot
+    Preempted --> Due: retried after its interval, no attempt used
+    Failed --> Due: back-off elapsed and attempts left
+    Failed --> Missed: attempts exhausted, alert job_missed
+    Due --> Missed: window closed without a run (jobs without catch-up)
+    Success --> [*]
+    Skipped --> [*]
+    Missed --> [*]
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> init
+    init --> universe
+    universe --> calendar_official
+    calendar_official --> history
+    history --> calendar_inferred
+    calendar_inferred --> official_recent
+    official_recent --> fno_history
+    fno_history --> board_meetings
+    board_meetings --> news
+    news --> train
+    train --> smoke_scan
+    smoke_scan --> telegram
+    telegram --> complete: init, universe and history are done
+    telegram --> incomplete: a required step is not done
+    incomplete --> init: the scheduler starts the bootstrap again
+    complete --> [*]
+```
+
+Each bootstrap step records its own status in `bootstrap.steps`; `init`, `universe` and `history` are required, the rest
+can fail or be skipped without blocking the timetable (they are retried by the regular jobs).
+
+```mermaid
+flowchart LR
+    S["step starts"] --> A{"already done?"}
+    A -- yes --> D["skip: already done"]
+    A -- no --> B{"crashed twice before<br/>and not required?"}
+    B -- yes --> K["mark skipped: earlier attempts died<br/>mid-step (out of memory?)"]
+    B -- no --> R["save status running"]
+    R --> X["run the step"]
+    X -- "done, skipped or failed" --> W["save status and detail"]
+    X -- "exception" --> F["status failed, logged with traceback"]
+    X -- "process killed: OOM, reboot" --> C["row stays running, counts as a crash next time"]
+```
+
+```mermaid
+flowchart TB
+    subgraph L1["Inside a job"]
+        A1["per-job timeout (JobSpec.timeout_min)"]
+        A2["RSS watchdog (JOB_MAX_RSS_MB) aborts and retries, leaner"]
+        A3["bounded retries with back-off, caller deadlines"]
+    end
+    subgraph L2["Scheduler daemon"]
+        B1["ledger decides what is due: nothing runs twice"]
+        B2["one child at a time, critical jobs preempt"]
+        B3["disk and RAM gates defer heavy jobs"]
+        B4["heartbeat: systemd watchdog, heartbeat file, DB row"]
+        B5["unclean-restart detection: daemon_restarted alert"]
+    end
+    subgraph L3["systemd"]
+        C1["Restart=always, WatchdogSec=180"]
+        C2["MemoryHigh / MemoryMax, OOMScoreAdjust"]
+        C3["health timer every 5 minutes, independent of the daemon"]
+    end
+    subgraph L4["Operator signals"]
+        D1["Telegram alerts: de-duplicated, queued while Telegram is down"]
+        D2["monster-ai health, logs, diag, storage"]
+    end
+    L1 --> L2 --> L3 --> L4
+```
+
+## Network layer: curl_cffi, bulk fetching, rate limits
+
+Every call to a scraped or public data source goes through one client, `ingestion.http.HttpClient` (built by
+`HttpClient.from_settings(source, settings)`). Its job is to be a polite, resilient, browser-like client that cannot burn the
+09:12 cutoff:
+
+- **Transport: curl_cffi.** libcurl with a real browser TLS / HTTP-2 fingerprint (`HTTP_IMPERSONATE`, default `chrome`), so the
+  CDNs and bot managers in front of NSE and Yahoo treat the server like an ordinary browser. If curl_cffi cannot be imported
+  or rejects the profile, the client degrades to `requests` (first without the impersonation profile, then without
+  curl_cffi) and logs it once. While impersonating, the browser's own `User-Agent` / `Accept-Encoding` headers are never
+  overridden (a mismatch with the TLS fingerprint is an easy bot signal). `HTTP_TRANSPORT` can force a transport.
+- **Politeness.** A per-source rate limiter spaces requests (`YAHOO_MIN_INTERVAL_SEC`, `NSE_MIN_INTERVAL_SEC`, 0.4 s per RSS
+  feed, 6 s for GDELT) with 20 % jitter; a 429 or `Retry-After` doubles that source's spacing (up to a cap) and every success
+  eases it back. A circuit breaker fails fast after 6 consecutive failures and half-opens after 5 minutes.
+- **Retries.** Statuses 408, 425, 429, 500, 502, 503 and 504 retry with exponential back-off and jitter (or `Retry-After`,
+  capped at 60 s), at most `HTTP_MAX_ATTEMPTS`; no attempt starts after the caller's **deadline**, and each attempt's timeout is
+  capped to the time left, so the pre-open polls can never push a report past its cutoff.
+- **Safety.** HTTPS only; a hard response-size cap (`HTTP_MAX_RESPONSE_MB`, a RAM guard); errors and logs carry host and path
+  only, never the query string (it may hold a key); NSE's cookie handshake is re-done automatically on 401/403.
+- **Traceability.** One DEBUG line per request, WARNING lines for retries and give-ups, and per-source counters (requests,
+  failures, 429s, bytes) that the job runner prints as an `http:` summary at the end of every job.
+
+```mermaid
+flowchart TB
+    CALL["caller: yahoo, nse, news, fred ...<br/>HttpClient.from_settings(source, settings)"] --> HTTPS{"https URL?"}
+    HTTPS -- no --> REF["refuse: DataUnavailable"]
+    HTTPS -- yes --> BRK{"circuit breaker open?"}
+    BRK -- yes --> FAST["fail fast: CircuitOpen"]
+    BRK -- no --> RL["per-source rate limiter<br/>spacing + jitter, doubles after a 429,<br/>eases back on success"]
+    RL --> DL{"caller deadline reached?"}
+    DL -- yes --> DLX["give up, retryable later"]
+    DL -- no --> TR
+    subgraph TRG["Transport"]
+        TR["curl_cffi session<br/>browser TLS and HTTP/2 fingerprint"]
+        RQ["requests session<br/>fallback"]
+        TR -. "profile rejected: drop impersonation, then curl_cffi" .-> RQ
+    end
+    TR --> RESP{"status"}
+    RQ --> RESP
+    RESP -- "2xx or a soft status (304, 404 ...)" --> BODY["stream the body under the size cap"]
+    RESP -- "408 425 429 500 502 503 504" --> BACK["Retry-After or exponential back-off with jitter"]
+    BACK --> RL
+    RESP -- "other 4xx, or attempts used up" --> ERR["DataUnavailable, secret-safe message,<br/>breaker counts the failure"]
+    BODY --> STATS["per-source counters -> HTTP summary in the job log"]
+```
+
+**Bulk fetching and batching** keep the request count (and so the rate-limit exposure) low:
+
+| Data | Strategy |
+|------|----------|
+| Equity end-of-day bars | the **official NSE file** (one request per day, every stock, official OHLC / VWAP / delivery); Yahoo is only the repair path for names the file lacks and for the first history backfill |
+| Global series (~33 indices, FX, commodities, rates, VIX) | one Yahoo `spark` probe answers **20 symbols per request**; series whose newest stored bar already equals the vendor's are skipped (two requests instead of ~33); the probe can only skip a fetch, any doubt falls through to the normal fetch, and every series is fetched in full at least every 24 h |
+| History backfill | resumable per instrument (`yahoo_history:*` progress), deadline-bounded chunks, one full download per symbol |
+| F&O | one UDiFF zip per day (all contracts), parsed once |
+| RSS feeds | **conditional GET** (`ETag` / `Last-Modified`): an unchanged feed costs one tiny 304; one unconditional fetch every 6 h; a feed that fails 6 times is parked for 24 h |
+| NSE API | one pre-open call returns the whole book; GIFT Nifty comes from the market-status call already needed for the session state |
+| GDELT, economic calendar | minimum spacing 6 s / 1 s, a few queries per run |
+
+```mermaid
+flowchart LR
+    U["universe ~250 stocks"] --> OFF["NSE archive: ONE file per day<br/>official bars for every stock"]
+    OFF --> DB[("SQLite")]
+    OFF -. "names missing from the file" .-> REPAIR["Yahoo chart request,<br/>only for those names"]
+    REPAIR --> DB
+    GS["~33 global series"] --> SP["Yahoo spark probe<br/>20 symbols per request"]
+    SP --> CH{"newest bar already stored<br/>and fetched in full within 24 h?"}
+    CH -- yes --> SK["skip: no per-series request"]
+    CH -- no --> CHART["chart request for that series"]
+    CHART --> DB
+    FEEDS["RSS feeds"] --> CG["conditional GET"]
+    CG -- "304 unchanged" --> SK2["nothing downloaded"]
+    CG -- "200 changed" --> NI["parse, dedup, store"]
+    NI --> DB
+```
+
+## Exchange calendar for any month and year
+
+The calendar (`automation/calendar.py`) never needs a code change when a year turns over, and works with or without
+network access:
+
+1. weekends are always closed;
+2. the shipped seed (`data/seeds/nse_holidays.json`) and NSE's live holiday API (refreshed daily at 05:30 IST) are the **official**
+   lists; a year counts as officially covered once it has at least 8 entries (NSE lists 14-20 trading holidays a year);
+3. for a year without an official list (NSE publishes the next year's in December) a **rule layer** applies the holidays that
+   can be derived with certainty - the fixed-date national holidays (26 Jan, 14 Apr, 1 May, 15 Aug, 2 Oct, 25 Dec) when they fall
+   on a weekday, and Good Friday from the Gregorian Easter algorithm - flagged `source='rule'`. Lunar-calendar holidays
+   (Holi, Diwali, Eid ...) cannot be derived and are deliberately **not guessed**;
+4. the **live confirmation**: before a final report goes out in such a year, NSE itself is asked. If it answers but
+   publishes no pre-open book after 09:06 IST, the day is recorded as an inferred closure, no report is sent and the
+   operator gets a `holiday_inferred` alert. An unreachable NSE proves nothing, so the scan simply goes on;
+5. days on which the Nifty index has no bar are inferred as closed retroactively, and an **operator override file**
+   (`data/seeds/special_sessions.json`, or `calendar_overrides.json` in the data directory, which survives upgrades) can
+   re-open a day (Muhurat and other special sessions) or close one at short notice.
+
+Rule rows disappear the moment the official list arrives; official rows are never overwritten by rules, and a holiday NSE
+later removes from a future date is dropped. Health warns 21 days before the official list ends (`calendar_horizon`), after it
+lapsed (`calendar_unofficial`) and when the refresh keeps failing (`calendar_stale`, `calendar_never_refreshed`); the report
+itself says "holidays are rule-based" while it relies on the rule layer.
+
+```mermaid
+flowchart TB
+    Q["is_trading_day(date)"] --> W{"Saturday or Sunday?"}
+    W -- yes --> CL["closed"]
+    W -- no --> ROW{"row in calendar_days?"}
+    ROW -- yes --> USE["use the row: holiday, or special session<br/>with its own open and close time"]
+    ROW -- no --> OPEN["open: regular session 09:15 to 15:30 IST"]
+    subgraph WRITERS["Who writes calendar_days"]
+        S1["seed: data/seeds/nse_holidays.json<br/>(official, shipped)"]
+        S2["nse_api: holiday API, refreshed daily 05:30<br/>(official, replaces seed, rule and inferred rows)"]
+        S3["rule: fixed-date holidays and Good Friday<br/>for years without an official list"]
+        S4["inferred: no index bar, or no pre-open book<br/>on the day (live confirmation)"]
+        S5["override: special_sessions.json and<br/>calendar_overrides.json (never replaced)"]
+    end
+    WRITERS --> ROW
+    H["health: horizon, unofficial, stale, never refreshed"] -.-> WRITERS
+```
+
+## Time zones
+
+A server in any time zone produces the same results. The rules, enforced by tests:
+
+- **Storage is UTC.** Every stored instant is an ISO-8601 UTC string (`...Z`); the clock hands out timezone-aware instants only.
+- **Market logic is IST, explicitly.** Session dates, schedule windows, scan cutoffs and deadlines are computed with
+  `ist_date`, `at_ist` and friends from `app/clock.py` using `Asia/Kolkata` (a fixed +05:30 offset is the fallback if the
+  tz database is missing). India has no daylight saving, so nothing shifts twice a year.
+- **The process zone is pinned to UTC** at start-up (`pin_process_timezone` in `cli.main()`), so even a stray `localtime()`
+  cannot differ between servers; no systemd timer depends on the system zone (the scheduler is ledger-based, the health timer
+  is monotonic).
+- **Display only:** `MONSTER_TIMEZONE` (default `Asia/Kolkata`) sets the zone of log stamps (`2026-11-02T08:30:05.000+0530`)
+  and nothing else.
+- **Guards:** an AST test fails the build on any API that silently reads the server's zone (naive `datetime.now()`, `utcnow()`,
+  `date.today()`, `time.localtime()`, `.astimezone()` without an argument, SQLite `'now'` / `'localtime'`; two documented
+  exceptions), and a matrix test computes exchange dates, session windows, the job timetable, holidays, retention cut-offs and log
+  stamps in fresh interpreters whose process zone is UTC, US Pacific (DST), India, New Zealand (DST) and UTC+14, requiring
+  identical results equal to values worked out by hand.
+
+```mermaid
+flowchart LR
+    OS["server clock and zone<br/>any TZ, DST, NTP steps"] --> PIN["pin_process_timezone()<br/>process zone forced to UTC"]
+    PIN --> CLK["app.clock<br/>timezone-aware instants + monotonic time"]
+    CLK -->|"stored"| DB[("SQLite<br/>UTC ISO-8601 with Z")]
+    CLK -->|"market logic"| IST["ist_date, at_ist<br/>Asia/Kolkata (+05:30 fallback)"]
+    IST --> USE["calendar, schedule windows,<br/>scan cutoffs, deadlines"]
+    CLK -->|"display only"| LOGZ["log stamps in MONSTER_TIMEZONE"]
+    GUARD["tests: AST guard against naive datetimes<br/>and a five-zone subprocess matrix"] -.-> CLK
+```
+
+## Storage and bounded retention
+
+Nothing may grow forever. The nightly `housekeeping` job (23:50 IST) applies `automation/retention.py`, in small
+foreign-key-safe transactions that never starve the scheduler's heartbeat of the single SQLite writer:
+
+| What | Rule (default) | Setting |
+|------|----------------|---------|
+| raw news and filing text | deleted after 45 days, structured events kept | `NEWS_RETENTION_DAYS` |
+| structured events | 1100 days after their last update | `EVENT_RETENTION_DAYS` |
+| pre-open and live quotes, economic calendar | 400 days; every pre-open poll is kept 14 days, then only the last one per symbol and day | `QUOTE_RETENTION_DAYS` |
+| daily bars, F&O rows, macro vintages | `HISTORY_YEARS` + 1 years (the oldest data ever read) | `HISTORY_YEARS` |
+| snapshots, predictions, outcomes, metrics, graph edge history | 1825 days (immutable: pruned explicitly, children before parents) | `RECORD_RETENTION_DAYS` |
+| job runs, deliveries, alerts | 180 days (delivered alerts: half) | `OPS_RETENTION_DAYS` |
+| backups | 7 daily + 4 weekly **and** a total size budget | `BACKUP_KEEP_*`, `BACKUP_MAX_MB` |
+| logs | 30 days within a 150 MB budget; today's files are never removed | `LOG_RETENTION_DAYS`, `LOG_MAX_MB` |
+| cache, temp, quarantined restores, diagnostic bundles | 200 MB / 14 days, 1 day, 14 days, newest 5 | constants |
+| the whole data directory | 4000 MB budget; above it the optional data is trimmed harder | `DATA_MAX_MB` |
+
+Under **disk pressure** the optional windows shrink to half (free disk below the warning threshold) or a quarter (below the
+critical threshold), never below a week; the immutable records and the price history are shortened only by their own window.
+`VACUUM` runs only when it is due (Sundays, pressure, or forced), worthwhile (at least 32 MB or 15 % free pages) and the disk has
+about three times the database size free. The result of every run is stored (`retention.last`), `monster-ai storage` shows the
+usage and `--prune [--dry-run] [--vacuum]` applies it on demand, and health warns at 80 % of the budget, when the WAL file
+exceeds 256 MB, or when the retention has not run for three days.
+
+```mermaid
+flowchart TB
+    HK["housekeeping job, 23:50 IST daily"] --> RET["run_retention"]
+    RET --> PR["disk pressure from free space<br/>ok x1, warn x0.5, critical x0.25<br/>(over the data budget: x0.5)"]
+    PR --> TB["table policies, children first<br/>outcomes, predictions, snapshots, quotes, news events,<br/>alerts, deliveries, job runs, metrics, F&O, bars,<br/>macro, graph edge history"]
+    PR --> KV["kv rules: evaluation summaries,<br/>fetch markers, a stale prune flag"]
+    PR --> FS["file sweeps: cache, tmp, backup leftovers,<br/>quarantine, diagnostic bundles, logs"]
+    PR --> BK["backups: 7 daily + 4 weekly<br/>within the total size budget"]
+    TB --> DBM["maintain_database<br/>WAL checkpoint, PRAGMA optimize,<br/>VACUUM when due, worthwhile and safe"]
+    KV --> DBM
+    DBM --> REP["retention.last in kv<br/>monster-ai storage report"]
+    FS --> REP
+    BK --> REP
+    REP --> HLT["health: storage budget, WAL size,<br/>retention stale or erroring -> Telegram alert"]
+```
+
+## Logging and diagnostics
+
+Every process (daemon, each job child, CLI commands, the dashboard) logs through `app/logging_setup.py`:
+
+- **Daily files, never renamed.** `logs/<role>-YYYY-MM-DD.log` (roles: `daemon`, `jobs`, `cli`, `health`, `train`, `bootstrap`,
+  `dashboard`), at most 25 MB x 4 files per day with a drop-count marker, mode 0640. A shared `errors-YYYY-MM-DD.log` collects
+  WARNING and above of **all** processes with their role and pid, so one file answers "what went wrong today". Concurrent
+  processes can append safely (no rotation renames), and logrotate is deliberately restricted to the `.out` and install logs.
+- **Traceable.** Stamps carry milliseconds and the offset; each job line carries its tag `<key>#<attempt> r<run_id>`; the
+  job runner logs start, duration, peak memory and the per-source HTTP summary; the daemon logs every finished job with its
+  duration; unexpected exceptions are logged with tracebacks (token-bearing paths log only the place, `exception_site`).
+- **Crashes are captured:** `sys.excepthook`, thread and unraisable hooks, and `faulthandler` (native crashes) write to the log
+  and to `fault-<role>.log`; warnings from libraries are captured too.
+- **Secrets are redacted** in the formatter, so no handler can leak them; `LOG_FORMAT=json` switches to one JSON object per line.
+- **Operator tools:** `monster-ai logs [--role R] [--date D] [-n N] [--level L] [--job J] [--grep T] [--since 90m] [--follow]
+  [--list]` reads, filters (with multi-line tracebacks kept together) and follows the files in bounded memory;
+  `monster-ai diag` writes a redacted `diag-<UTC>.tar.gz` (versions, offline doctor, settings, health, storage, database summary,
+  log tails) to attach to a bug report.
+
+```mermaid
+flowchart LR
+    subgraph PROCS["Every process"]
+        D["daemon"]
+        J["job children: run-job NAME"]
+        C["CLI commands"]
+        W["dashboard"]
+    end
+    PROCS --> LG["logging_setup<br/>redaction, job context,<br/>display-zone stamps"]
+    LG --> F1["logs/ROLE-YYYY-MM-DD.log<br/>25 MB x 4 files per day"]
+    LG --> F2["logs/errors-YYYY-MM-DD.log<br/>WARNING and above, all roles"]
+    LG --> JD["stderr -> journald"]
+    CR["crash hooks: excepthook, threads,<br/>unraisable, faulthandler"] --> F1
+    CR --> FL["logs/fault-ROLE.log"]
+    F1 --> LV["monster-ai logs<br/>level, job, text, time, follow"]
+    F2 --> LV
+    F1 --> DG["monster-ai diag<br/>redacted tar.gz bundle"]
+    F2 --> DG
+    HKJ["housekeeping: prune_logs<br/>30 days and 150 MB"] -.-> F1
+```
 
 ## Degradation matrix
 
 | Failure | Behaviour |
 |---------|-----------|
 | NSE API blocked / pre-open empty | final scan uses the `pre` model for names without a pre-open price and says so; if the book never arrives the report is still sent, marked |
-| Yahoo down or rate limited | official bhavcopy first; global block is withheld only when >= 6 critical series are stale, otherwise degraded with warnings |
+| Yahoo down or rate limited | official bhavcopy first; global block is withheld only when >= 6 critical series are stale, otherwise degraded with warnings; the client slows that source down and a circuit breaker stops hammering it |
+| curl_cffi unusable (missing wheel, rejected profile) | automatic fallback to `requests`, logged once; some providers may then block the client |
 | Previous session incomplete | repair from the official file; if coverage stays low the data-quality gate **blocks** the scan, alerts and (on the last attempt of the final scan) tells you why |
-| RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues |
+| Vendor bars still provisional | the official file replaces them in the morning job and again, for the last three sessions, in the nightly housekeeping |
+| Split / bonus with an ex-date today | the name is scored without its meaningless opening gap; the vendor is asked until the split is recorded, the operator is told after six sessions |
+| Holiday list of a new year not published | rule-based holidays plus the live pre-open confirmation; `holiday_inferred` alert and no report on a closed day |
+| RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
 | LLM unavailable / unconfigured | rule-based extraction only |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
 | Telegram down | reports and alerts are queued in the ledger and flushed when it returns; late final reports are withheld |
-| Process killed / reboot | systemd restarts the daemon; the ledger resumes; SQLite WAL recovery |
-| Disk low | emergency cleanup of caches, logs and temp files; heavy jobs blocked; critical alert |
-| Time glitch (NTP step) | windows are evaluated from the ledger and the IST clock; nothing runs twice |
-
-## Storage
-
-One SQLite database (`monster.db`, WAL) holds: `instruments`, `bars_daily`, `fno_daily`, `preopen_quotes`,
-`live_quotes`, `macro_observations`, `calendar_days`, `news_raw`, `filings`, `board_meetings`, `events`,
-`graph_nodes`/`graph_edges`, `snapshots`, `predictions`, `outcomes`, `eval_metrics`, `model_registry`, `job_runs`,
-`deliveries`, `alerts`, `source_health`, `kv`. Migrations are versioned and run on open. Disposable caches live
-under `data/runtime/cache` and are size-limited. Backups are written with SQLite's online backup API, compressed,
-checksummed, verified by a test restore and retained 7 daily / 4 weekly.
+| Process killed / reboot | systemd restarts the daemon; the ledger resumes; SQLite WAL recovery; `daemon_restarted` alert |
+| Database locked while the daemon lives | the heartbeat file proves liveness; `heartbeat_db_stale` warns instead of a false "daemon dead" |
+| Disk low | emergency cleanup of caches, logs and temp files; heavy jobs deferred and training refused; critical alert; retention windows shrink |
+| Storage creeping up | nightly retention keeps every table, folder and cache bounded; health warns at 80 % of the data budget |
+| Time glitch (NTP step) or a server in another zone | windows are evaluated from the ledger and the IST clock; the process zone is pinned to UTC; nothing runs twice |
 
 ## External training and off-box storage
 
@@ -193,15 +765,45 @@ publishes **HMAC-signed bundles** (`models/<stage>/<version>.zip` + a signed `la
 feature version, or whose metadata disagrees with its manifest, and then registers it as a normal challenger.
 Off-box backups use the same S3-compatible store and are pruned to the local retention.
 
+## Deployment topology
+
+```mermaid
+flowchart TB
+    PC["your PC<br/>deploy_remote.ps1 or deploy_remote.sh"] -->|"ssh + tar, env file shredded afterwards"| INST
+    subgraph SRV["Ubuntu 22.04/24.04 or Debian 12 server"]
+        INST["install.sh - idempotent, 14 steps<br/>atomic release swap, automatic rollback"]
+        subgraph SD["systemd units"]
+            U1["monster-ai.service<br/>scheduler daemon, Type=notify, WatchdogSec=180,<br/>Restart=always, MemoryHigh 750M"]
+            U2["monster-ai-bootstrap.service<br/>first-run setup, resumable"]
+            U3["monster-ai-health.timer and .service<br/>every 5 minutes, independent of the daemon"]
+            U4["monster-ai-alert@.service<br/>OnFailure alert"]
+            U5["monster-ai-dashboard.service<br/>optional, loopback only"]
+        end
+        subgraph FS["Filesystem"]
+            OPT["/opt/monster-ai (+ .prev for rollback)"]
+            ETC["/etc/monster-ai/monster.env<br/>root:monster 0640"]
+            VAR["/var/lib/monster-ai<br/>database, backups, models, cache"]
+            LOGD["/var/log/monster-ai<br/>daily logs"]
+        end
+        INST --> SD
+        INST --> OPT
+        U1 --> VAR
+        U1 --> LOGD
+        U1 -.->|"reads"| ETC
+        U1 -->|"spawns"| JOBS["job processes<br/>python -m app.cli run-job NAME"]
+    end
+    JOBS -->|"HTTPS only"| NET["Yahoo, NSE, RSS, GDELT, Telegram,<br/>optional S3 and LLM"]
+```
+
 ## Security
 
-- No orders, no broker keys. Secrets only in `/etc/monster-ai/monster.env` (`root:monster 0640`); logs redact them.
+- No orders, no broker keys. Secrets only in `/etc/monster-ai/monster.env` (`root:monster 0640`); logs and diagnostic bundles redact them.
 - Dedicated unprivileged `monster` user; every unit runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
   `PrivateTmp`, an empty capability set and IP/Unix sockets only; the dashboard binds to loopback (a token is
   required otherwise).
 - Model artifacts are LightGBM text + JSON; bundles are signed and extracted with zip-slip / zip-bomb protection.
-- All inbound data is validated (schema, ranges, dates, size limits); SQL is parameterised; HTTP clients have
-  timeouts, size limits and bounded retries.
+- All inbound data is validated (schema, ranges, dates, size limits); SQL is parameterised; HTTP clients are HTTPS-only with
+  timeouts, size limits, bounded retries and secret-free error messages.
 - Outbound connections: the data providers, Telegram, and - only if configured - the object store and an LLM endpoint.
 
 ## Resource budget
@@ -213,7 +815,7 @@ lighter profile on small servers (60 000 rows per booster fit, five years of his
 externally. Measured on the real data with the light profile: the feature build peaks at about 640 MB resident and the
 model training at about 565 MB. Should a run still die from memory pressure, the retry trains a leaner profile (one year
 less history and half the fit sample per failed attempt). The installer adds a small swap file as a safety net; swap is not
-a substitute for RAM.
+a substitute for RAM. Disk is bounded by the retention rules above (4 GB data budget by default, well inside 8 GB).
 
 ## Design decisions
 
@@ -223,6 +825,26 @@ a substitute for RAM.
 | Native systemd, **no containers** | 1 GB budget; fewer moving parts; journald + systemd already give restart, limits and logs |
 | Ledger instead of cron | a restart or clock step cannot skip or duplicate a job; missed work is visible |
 | One feature path for training and live | removes train/serve skew, the usual source of silent leakage |
-| Immutable snapshots | the evaluation can always be traced to what was known and sent |
+| Immutable snapshots, one effective snapshot per (date, stage) | the evaluation can always be traced to what was known and sent, and a forced re-scan cannot be counted twice |
 | Calibrated probabilities + honesty gates | a ranking is only useful if "40 %" means 40 %; unvalidated models are visibly capped |
 | Shadow-first | the edge must be demonstrated out of sample before anyone risks money |
+| curl_cffi behind one `HttpClient` | scraped endpoints sit behind bot managers; one place owns impersonation, spacing, retries and deadlines |
+| UTC storage, IST logic, pinned process zone | identical behaviour on any server, in any zone, in any season |
+| Explicit retention for everything | a 8 GB disk must last years without a human; every table, folder and cache has a bound and a test |
+| Self-reporting operations (heartbeat file, restart alert, health timer) | systemd's `OnFailure=` practically never fires for an always-restarted service, so the system reports its own failures |
+
+## Deviations from the blueprint
+
+The full requirement-by-requirement mapping, with the status of every item, is in
+[BLUEPRINT_TRACEABILITY.md](BLUEPRINT_TRACEABILITY.md). The deliberate deviations:
+
+| Blueprint says | What was built | Why and consequence |
+|----------------|----------------|---------------------|
+| "Start with LightGBM, XGBoost, CatBoost and statistical baselines" | LightGBM specialists and meta model, plus the heuristic and simple statistical baselines | one boosting library keeps the wheel set small and the artifacts text-only; the baselines are what the model must beat |
+| "FinBERT or other financial NLP models; sentence embeddings for event clustering" | rule-based event extraction (optional LLM API), lexical polarity, SimHash / TF-IDF clustering | no model download or GPU on a 1 GB server; deterministic and auditable. News is evidence in the report, not a model input |
+| "systemd + APScheduler or cron" | systemd plus an in-house ledger scheduler (`automation/scheduler.py`) | restart-safe, catch-up, nothing runs twice, no extra dependency |
+| deployment folder with "service files, Docker, backups" | native systemd, **no containers of any kind** | the operator requires it, and the RAM budget agrees |
+| VWAP features | a daily proxy from the official file's average price | no tick or long intraday history is available from free sources |
+| pre-open "indicative price and imbalance where the feed provides it" | indicative and final price are used; order quantities (imbalance) are parsed and stored but not shown or used | the free NSE API has no history to train on and a new feature would change the schema |
+| licensed market-data feeds | free public endpoints (Yahoo, NSE, RSS, GDELT) | no paid keys; they can change or block, so every source has a documented failure behaviour and a backup source |
+| trading / execution layer | none: shadow mode only | the system measures range prediction, not profitability |
