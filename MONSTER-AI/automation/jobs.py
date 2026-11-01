@@ -242,7 +242,7 @@ def prelim_scan(ctx: JobContext) -> JobResult:
     if skipped:
         return skipped
     # collect_india retries inside its own window; when the previous session is still incomplete at scan time, repair it once
-    # more (bounded; a complete session costs one query). A failed repair never stops the scan: the data-quality gate decides.
+    # more with a small budget (a complete session costs one query). A failed repair never stops the scan: the quality gate decides.
     session = ctx.calendar.last_completed_session(ctx.clock.now())
     coverage, missing = session_coverage(ctx, session)
     if coverage < MIN_OFFICIAL_COVERAGE:

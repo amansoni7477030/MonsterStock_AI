@@ -131,7 +131,8 @@ Optional capabilities, all off by default:
 
 | Capability | Variables |
 |------------|-----------|
-| LLM-assisted event extraction | `LLM_API_BASE`, `LLM_API_KEY`, `LLM_MODEL` (rules-only without them; every LLM claim needs a verifiable quote) |
+| Groq LLM: event extraction from news | `GROQ_API_KEY` (default model `openai/gpt-oss-120b`, fallback `openai/gpt-oss-20b`); tune with `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT` (low), `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_MAX_OUTPUT_TOKENS` (1200), `LLM_TIMEOUT_SEC` (40). Another OpenAI-compatible provider: `LLM_API_BASE` + `LLM_MODEL` (+ `LLM_API_KEY`). Rules-only without a key; every LLM claim needs a verifiable quote. See [the AI services](#the-ai-services-groq-and-jev) |
+| Jev (TypeSafe AI): news judgments | `TYPESAFE_API_KEY`; `JEV_MODEL` (`jev-1.14.0`, pinned), `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5), `JEV_TIMEOUT_SEC` (20) |
 | Off-box storage (backups, external models) | `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX` |
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
 | External training | `TRAINING_MODE=external`, `MODEL_SIGNING_KEY`, `MODEL_ARTIFACT_URL` or `S3_*` |
@@ -171,7 +172,7 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `health_storage_budget` / `health_storage_over_budget` | the data directory uses 80 % of / more than `DATA_MAX_MB` | `monster-ai storage`; `monster-ai storage --prune`; see [storage](#storage-and-retention) |
 | `health_wal_large` | the database WAL file is above 256 MB: a long-running reader (dashboard, a stuck job) blocks checkpoints | restart the dashboard or the daemon; then `monster-ai storage --prune --vacuum` |
 | `health_retention_never_ran` / `health_retention_stale` / `health_retention_errors` / `retention` | the nightly retention (inside `housekeeping`) has not completed for days, or some of its rules failed | `monster-ai logs --job housekeeping`; `monster-ai storage --prune --dry-run` shows what it would do |
-| `health_source_<id>` | a data source failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability |
+| `health_source_<id>` | a data source - or an AI service (`llm_extraction`, `jev_judgment`) - failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability; for the AI services see [the AI services](#the-ai-services-groq-and-jev) |
 | `health_telegram_not_configured` / `health_report_not_delivered` | no token/chat id, or the last final report could not be sent | `telegram-setup`; check the token |
 | `telegram_delivery_failed` / `report_deadline_missed` | a message could not be delivered (queued, retried) / a final report would have arrived after 09:14:30 and was withheld | check Telegram connectivity; nothing to do for the latter |
 | `health_calibration_drift` / `health_skill_negative` | live calibration worse than 0.10 ECE / live Brier skill below the base rate over the last 90 days | see [models](#models); consider `models rollback` |
@@ -251,6 +252,49 @@ token is accepted (`telegram bot`). How to read the reason:
 service user cannot write the root-owned environment file.
 
 While Telegram is down, reports and alerts queue in the database and are delivered when it returns (late final reports are withheld).
+
+### The AI services (Groq and Jev)
+
+Optional, off until a key is set; the rules do everything without them. What they are and what they never do is in the
+[README](../README.md#optional-ai-groq-and-jev) and [ARCHITECTURE](ARCHITECTURE.md#news-intelligence-and-the-optional-ai-services).
+
+**Turn on and verify** (the keys were never tested against the live services while this was built, so this check is the first
+real test):
+
+```bash
+sudo nano /etc/monster-ai/monster.env     # GROQ_API_KEY=...   and / or   TYPESAFE_API_KEY=...
+sudo systemctl restart monster-ai
+sudo monster-ai ai-test                   # lists the models each key can use, then sends one made-up item through the real code
+sudo monster-ai ai-test --list-only       # only the key and the model names: spends no tokens
+```
+
+`ai-test` prints one line per service: `OK`, `WARN` (it works, with a remark), `FAIL` (with the reason and the usual remedy) or
+`OFF`. `sudo monster-ai doctor` shows the same key check without spending tokens. It exits 0 when every configured service answers.
+
+| What you see | Meaning | What to do |
+|--------------|---------|------------|
+| `FAIL ... HTTP 401 / 403: the key was rejected` | wrong, mistyped or revoked key | copy it again from the provider's console (`GROQ_API_KEY` from console.groq.com, `TYPESAFE_API_KEY` from typesafe.ai) |
+| `WARN ... not listed for this key: <model>` | the account cannot use that model (Groq retires models; Jev versions are pinned) | set `LLM_MODEL` / `LLM_FALLBACK_MODEL` / `JEV_MODEL` to a name the account lists |
+| `FAIL ... http 404: model or endpoint not found` | a wrong model name, or a retired one with no fallback left | as above |
+| `FAIL ... rate limit: quota exhausted` | the provider's tokens-per-minute or daily quota is used up | wait: a cooldown (at most 6 h) is remembered between runs, so the service is not hammered; lower `LLM_MAX_ARTICLES_PER_RUN`, or add credit with the provider |
+| `FAIL ... cannot reach the service` | no outbound HTTPS to `api.groq.com` / `api.typesafe.ai` from this machine | allow it (firewall, proxy) |
+| `WARN ... expected order_win` | the service answered, but not what any sound model answers for the sample | check `LLM_MODEL` / `JEV_MODEL`; the answer is still used only after its own validation |
+| `WARN ... evidence quote was not found` | the LLM answered but did not quote the text word for word; the pipeline ignores such answers | try again; if it persists use a larger model |
+| report says "LLM extraction degraded" / "Jev judgment degraded (rule-based extraction used)" | that service failed in its latest run; the news was labelled by the rules | `sudo monster-ai logs --grep "llm failed"` or `--grep "jev failed"` for the reason; `ai-test` |
+| alert `health_source_llm_extraction` / `health_source_jev_judgment` | the service failed 5 times in a row | same as above; the daily news runs keep trying |
+
+**Where to look.** `monster-ai logs --grep "jev failed"` (WARNING lines carry the reason, never the key); `monster-ai diag` lists the
+counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.cooldown_until` and the same with `jev.`; the
+`news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`, `llm_skipped_budget` and the `jev_*`
+equivalents, plus `jev_retyped`, `jev_rumours`, `jev_denials`).
+
+**Cost and limits.** Each distinct article is sent at most once in 14 days (results are cached by text); items the rules already
+call irrelevant are never sent; each run is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`) and time-boxed. Groq has a
+free tier with per-model limits (tokens per minute bind first, which is why the fallback model adds headroom); paid use and Jev are
+priced per token by the providers (at the time of writing Jev was a few cents per million input tokens, which at these caps is well
+under a dollar a month): check their price lists.
+
+**Turn off:** delete the key from `monster.env` and restart. Nothing else depends on them; cached answers expire after 14 days.
 
 ### Disk or memory pressure
 

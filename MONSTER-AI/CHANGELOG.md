@@ -172,8 +172,8 @@ small in every case except the first; the gain is less to run, maintain and expl
   had already done (both retry until their windows close), then dry-ran the whole preliminary scan and threw the result away; the
   real `prelim_scan` ran the identical scan 15 minutes later. This is the only removal with a measurable saving: one dry-run scan (about
   11 seconds on the development PC) and a few provider requests every trading morning. Its one useful side effect stays: `prelim_scan` now
-  repairs the previous session once more (bounded to two minutes) when that session is below 90 % coverage, and costs one query when
-  it is complete.
+  repairs the previous session once more (a two-minute budget for the vendor fallback) when that session is below 90 % coverage, and
+  costs one query when it is complete.
 - **Economic-calendar and FRED collection** (`ingestion/macro.py`, `NewsCollector.collect_econ_calendar`, their retention rules, source
   entries and `FRED_API_KEY`). Nothing ever read the data: one small request a day (FRED did nothing without a key) and two tables.
   Migration `0005_drop_unused_macro_tables.sql` drops the `macro_observations` and `econ_calendar` tables and the registry rows of

@@ -18,23 +18,24 @@ Companion documents: [README](../README.md) (overview and quick start), [OPERATI
 3. [Data flow](#data-flow)
 4. [Daily timeline](#daily-timeline)
 5. [The scan, step by step](#the-scan-step-by-step)
-6. [Packages](#packages)
-7. [Point-in-time correctness](#point-in-time-correctness)
-8. [Models and governance](#models-and-governance)
-9. [Honesty rules](#honesty-rules)
-10. [Scheduling and self-healing](#scheduling-and-self-healing)
-11. [Network layer: curl_cffi, bulk fetching, rate limits](#network-layer-curl_cffi-bulk-fetching-rate-limits)
-12. [Exchange calendar for any month and year](#exchange-calendar-for-any-month-and-year)
-13. [Time zones](#time-zones)
-14. [Storage and bounded retention](#storage-and-bounded-retention)
-15. [Logging and diagnostics](#logging-and-diagnostics)
-16. [Degradation matrix](#degradation-matrix)
-17. [External training and off-box storage](#external-training-and-off-box-storage)
-18. [Deployment topology](#deployment-topology)
-19. [Security](#security)
-20. [Resource budget](#resource-budget)
-21. [Design decisions](#design-decisions)
-22. [Deviations from the blueprint](#deviations-from-the-blueprint)
+6. [News intelligence and the optional AI services](#news-intelligence-and-the-optional-ai-services)
+7. [Packages](#packages)
+8. [Point-in-time correctness](#point-in-time-correctness)
+9. [Models and governance](#models-and-governance)
+10. [Honesty rules](#honesty-rules)
+11. [Scheduling and self-healing](#scheduling-and-self-healing)
+12. [Network layer: curl_cffi, bulk fetching, rate limits](#network-layer-curl_cffi-bulk-fetching-rate-limits)
+13. [Exchange calendar for any month and year](#exchange-calendar-for-any-month-and-year)
+14. [Time zones](#time-zones)
+15. [Storage and bounded retention](#storage-and-bounded-retention)
+16. [Logging and diagnostics](#logging-and-diagnostics)
+17. [Degradation matrix](#degradation-matrix)
+18. [External training and off-box storage](#external-training-and-off-box-storage)
+19. [Deployment topology](#deployment-topology)
+20. [Security](#security)
+21. [Resource budget](#resource-budget)
+22. [Design decisions](#design-decisions)
+23. [Deviations from the blueprint](#deviations-from-the-blueprint)
 
 ## System context
 
@@ -48,7 +49,8 @@ flowchart LR
     MON -->|"09:12 IST report,<br/>alerts"| TG["Telegram bot"] --> YOU(("You"))
     YOU -.->|"sudo monster-ai /<br/>SSH tunnel"| MON
     MON <-.->|"optional"| S3[("S3-compatible store<br/>backups, signed models")]
-    MON -.->|"optional"| LLM["OpenAI-compatible LLM"]
+    MON -.->|"optional"| GROQ["Groq LLM<br/>news extraction"]
+    MON -.->|"optional"| JEV["Jev (TypeSafe AI)<br/>news judgments"]
     GHA["GitHub Actions worker<br/>external training"] <-.-> S3
 ```
 
@@ -91,7 +93,7 @@ flowchart TB
     subgraph L4["app/ - platform, used by every layer"]
         PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, LLM"]
+    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, Groq, Jev"]
     UNITS ~~~ SCHED
     SCHED ~~~ FEAT
     FEAT ~~~ ING
@@ -246,6 +248,94 @@ Key properties: the snapshot is frozen **before** delivery, so a Telegram outage
 retry re-sends the frozen report; a report that would arrive after the deadline is withheld and an alert is queued; the
 pre-open wait is bounded by the same deadline, so a slow provider cannot push the report past its cutoff.
 
+## News intelligence and the optional AI services
+
+News is **evidence shown in the report, not a model input**: the LightGBM forecast of P(range > 3 %) is computed from prices,
+F&O, global and calendar features only. The news layer decides which catalysts are listed for a name, how they are labelled
+(event type, severity, rumour or denial, direction, source class) and which other stocks an event propagates to through the
+event graph. Two optional AI services sharpen that labelling; with no key set the deterministic rules do all of it and no request
+is ever made.
+
+```mermaid
+flowchart TB
+    RAW[("news_raw + filings<br/>unprocessed rows")] --> RULES["Rules, always<br/>language, routine filter, entities, event type,<br/>rumour / denial, severity, direction"]
+    RULES --> WORTH{"an event type<br/>or a known company?"}
+    WORTH -- "no: nothing is spent" --> DROP["skipped as irrelevant"]
+    WORTH -- yes --> GROQ["Groq LLM, optional<br/>structured extraction + verbatim quote"]
+    GROQ --> M1["merge: only what the quote proves<br/>(type, severity, horizon, time, directions)"]
+    M1 --> JEV["Jev, optional<br/>five typed questions in one request"]
+    JEV --> M2["merge, conservative: retype only when Jev is sure<br/>and the rules are not, add rumour / denial flags,<br/>blend severity, direction only when readings agree"]
+    M2 --> EV[("events + evidence<br/>method: rules, rules+llm, rules+llm+jev")]
+    RULES -.->|"the fallback when an AI step has no answer"| EV
+    EV --> USE["catalysts in the report, event-graph propagation,<br/>'already priced in' check"]
+```
+
+Both services run behind the same safety rails (`news_intelligence/remote.py`), so a slow, rate-limited or broken provider can only
+make the rules do the work, never delay the morning schedule or lose an item:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as news pipeline
+    participant S as AI service (Groq or Jev)
+    participant K as kv: cache, counters, cooldown
+    participant H as source_health
+    participant API as provider API
+
+    P->>S: judge this headline and text
+    S->>K: answered for this exact text in the last 14 days?
+    alt cache hit
+        K-->>P: result: no request, no budget used
+    else miss
+        S->>S: circuit closed, cooldown over, call and time budget left?
+        alt refused
+            S-->>P: nothing, the rules decide
+        else admitted
+            S->>API: POST with bearer key and timeout
+            opt Groq: 429 on the first model
+                S->>API: same request to the fallback model
+            end
+            alt valid answer
+                API-->>S: JSON
+                S->>S: strict validation (schema, verbatim quote, known entities)
+                S->>K: cache the result, count calls and tokens
+                S->>H: success and latency
+                S-->>P: validated result
+            else key or endpoint rejected
+                S->>H: failure, the circuit opens for this run
+                S-->>P: nothing
+            else quota, Retry-After above 30 s
+                S->>K: cooldown until then (at most 6 h, survives between runs)
+                S->>H: failure
+                S-->>P: nothing
+            end
+        end
+    end
+```
+
+| | Groq LLM (`llm_extraction`) | Jev (`jev_judgment`) |
+|---|---|---|
+| Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (Groq's production open-weight models: the larger for accuracy, the smaller as headroom because Groq's rate limits are per model) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
+| What it is | a text model: reads the article and returns structured JSON | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
+| Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
+| Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
+| Never | invents evidence | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
+| Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
+| Caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), a 14-day cache by text | `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, a 14-day cache by text, company and source class |
+
+Where both answer, the direction of the company in focus is the mean of the two readings when they agree and *unknown* (0) when they
+point opposite ways; a direction offered for a rumour or a denial is halved, as the rules do. The company asked about is the one
+the rules or the LLM already signed the event for (for an order, the winner and not the customer), else the most prominent one.
+
+What the services see: the headline, the first 3 500 (LLM) or 2 500 (Jev) characters of the article, the company name and the
+source class. Never a key, a position, a prediction or any file of yours.
+
+How it is observed: `monster-ai ai-test` sends one made-up item through the real code and prints what came back or why not;
+`monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` / `jev.*` (calls, failures, tokens,
+cooldown) are in `kv` and in `monster-ai diag`; both services have a row in `source_health`, so the health check warns after
+repeated failures; the report's coverage note names a degraded service; every run's counts (used, cached, failed, skipped by
+budget, retyped, rumours, denials) are in `news.last_run`.
+
 ## Packages
 
 | Package | Responsibility |
@@ -254,7 +344,7 @@ pre-open wait is bounded by the same deadline, so a slow provider cannot push th
 | [ingestion/](../ingestion) | the curl_cffi HTTP transport (`http.py`: browser impersonation, adaptive per-source rate limit, retries, circuit breaker, deadlines), Yahoo (chart + bulk `spark` probe), NSE archive and API clients, validation, universe building, freshness / data-quality gate, split-adjusted reads (`adjust.py`) and basis-break repair (`basis.py`), news collectors (RSS conditional GET), source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
 | [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups with a size budget (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
 | [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader |
-| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, optional LLM), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
+| [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, then the optional Groq LLM `llm.py` and Jev `jev.py` behind the shared safety rails of `remote.py`; `ai_check.py` is the live self-check behind `ai-test`), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
 | [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates, abstention, baselines |
 | [notifications/](../notifications) | Telegram client, report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`), idempotent delivery with a ledger and deadline guard |
@@ -367,6 +457,10 @@ flowchart TB
 - Every statistic in the evening report carries its sample size and a 95 % interval (day-block bootstrap, because the picks
   of one day are dependent); below five days it prints "n/a" instead of a number it cannot support. News catalysts show how far
   they can be trusted (rumour, source class, independent sources, conflicts).
+- The AI services are advisers, never authorities: the rules always run, an AI answer only adds information (an LLM claim
+  needs a quote that appears word for word in the text; Jev must be confident and may not clear a rumour flag or flag an
+  official filing), a failure falls back to the rules, and the report says when a service was degraded. They change which
+  catalysts are shown and how they are labelled, **not** the calibrated forecast.
 
 ## Scheduling and self-healing
 
@@ -699,7 +793,7 @@ flowchart TB
 | Split / bonus with an ex-date today | the name is scored without its meaningless opening gap; the vendor is asked until the split is recorded, the operator is told after six sessions |
 | Holiday list of a new year not published | rule-based holidays plus the live pre-open confirmation; `holiday_inferred` alert and no report on a closed day |
 | RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
-| LLM unavailable / unconfigured | rule-based extraction only |
+| Groq LLM or Jev unavailable, unconfigured, rate-limited or rejected | the rules alone; the circuit opens for the run (at once on a rejected key), a quota starts a cooldown that survives between runs, the report's coverage note names the service, `source_health` warns after repeated failures |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
@@ -739,7 +833,7 @@ flowchart TB
         SD --> FS
         U1 -->|"spawns"| JOBS["job processes<br/>python -m app.cli run-job NAME"]
     end
-    JOBS -->|"HTTPS only"| NET["Yahoo, NSE, RSS, GDELT, Telegram,<br/>optional S3 and LLM"]
+    JOBS -->|"HTTPS only"| NET["Yahoo, NSE, RSS, GDELT, Telegram,<br/>optional S3, Groq and Jev"]
 ```
 
 ## Security
@@ -751,7 +845,9 @@ flowchart TB
 - Model artifacts are LightGBM text + JSON; bundles are signed and extracted with zip-slip / zip-bomb protection.
 - All inbound data is validated (schema, ranges, dates, size limits); SQL is parameterised; HTTP clients are HTTPS-only with
   timeouts, size limits, bounded retries and secret-free error messages.
-- Outbound connections: the data providers, Telegram, and - only if configured - the object store and an LLM endpoint.
+- Outbound connections: the data providers, Telegram, and - only if configured - the object store, Groq (or another LLM endpoint) and
+  Jev. Only public news text leaves the server for the AI services; their keys are secrets like the others (`GROQ_API_KEY` is never
+  sent to an endpoint other than Groq's).
 
 ## Resource budget
 
@@ -776,6 +872,7 @@ a substitute for RAM. Disk is bounded by the retention rules above (4 GB data bu
 | Calibrated probabilities + honesty gates | a ranking is only useful if "40 %" means 40 %; unvalidated models are visibly capped |
 | Shadow-first | the edge must be demonstrated out of sample before anyone risks money |
 | curl_cffi behind one `HttpClient` | scraped endpoints sit behind bot managers; one place owns impersonation, spacing, retries and deadlines |
+| Groq and Jev optional, advisory, behind one set of rails (`news_intelligence/remote.py`) | the rules stay deterministic and auditable; an AI answer can only add validated information, and a provider outage, a rate limit or a bad key costs coverage, never a delayed or corrupted report |
 | UTC storage, IST logic, pinned process zone | identical behaviour on any server, in any zone, in any season |
 | Explicit retention for everything | a 8 GB disk must last years without a human; every table, folder and cache has a bound and a test |
 | Self-reporting operations (heartbeat file, restart alert, health timer) | systemd's `OnFailure=` practically never fires for an always-restarted service, so the system reports its own failures |
@@ -788,7 +885,7 @@ The full requirement-by-requirement mapping, with the status of every item, is i
 | Blueprint says | What was built | Why and consequence |
 |----------------|----------------|---------------------|
 | "Start with LightGBM, XGBoost, CatBoost and statistical baselines" | LightGBM specialists and meta model, plus the heuristic and simple statistical baselines | one boosting library keeps the wheel set small and the artifacts text-only; the baselines are what the model must beat |
-| "FinBERT or other financial NLP models; sentence embeddings for event clustering" | rule-based event extraction (optional LLM API), lexical polarity, SimHash / TF-IDF clustering | no model download or GPU on a 1 GB server; deterministic and auditable. News is evidence in the report, not a model input |
+| "FinBERT or other financial NLP models; sentence embeddings for event clustering" | rule-based event extraction with optional hosted AI (Groq LLM, Jev), lexical polarity, SimHash / TF-IDF clustering | no model download or GPU on a 1 GB server; deterministic and auditable. News is evidence in the report, not a model input |
 | "systemd + APScheduler or cron" | systemd plus an in-house ledger scheduler (`automation/scheduler.py`) | restart-safe, catch-up, nothing runs twice, no extra dependency |
 | deployment folder with "service files, Docker, backups" | native systemd, **no containers of any kind** | the operator requires it, and the RAM budget agrees |
 | VWAP features | a daily proxy from the official file's average price | no tick or long intraday history is available from free sources |

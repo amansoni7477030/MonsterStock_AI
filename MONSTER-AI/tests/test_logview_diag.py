@@ -228,6 +228,16 @@ def test_diag_bundle_is_complete_small_and_free_of_secrets(cli_env, capsys, fake
     assert bundle.stat().st_size < 400_000
 
 
+def test_the_state_listing_shows_the_ai_counters_but_not_the_cached_answers(store):
+    from app.diagnostics import database_state
+
+    for key in ("llm:abc", "jev:abc", "news.sig:1", "llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m"):
+        store.kv_set(key, "x")
+    listing = database_state(store)
+    assert all(key in listing for key in ("llm.calls", "jev.calls", "jev.cooldown_until", "llm.caps:m"))
+    assert "llm:abc" not in listing and "jev:abc" not in listing and "news.sig:1" not in listing
+
+
 def test_diag_bundles_are_pruned_to_the_newest_few(tmp_path):
     from automation.retention import DIAG_KEEP, prune_diag_bundles
 
