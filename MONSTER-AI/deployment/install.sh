@@ -687,9 +687,16 @@ verify_venv() {
     warn "pip check failed: $out"
     return 1
   fi
-  if ! out=$("$VENV_PY" -c 'import numpy, pandas, scipy, lightgbm, requests, feedparser' 2>&1); then
+  if ! out=$("$VENV_PY" -c 'import numpy, pandas, scipy, lightgbm, requests, feedparser, tzdata' 2>&1); then
     warn "dependency smoke import failed: $out"
     return 1
+  fi
+  # curl_cffi (browser-fingerprint HTTP client for NSE / Yahoo) is preferred but optional: the application falls back to
+  # requests, so a broken native library is a warning, never a failed install.
+  if out=$("$VENV_PY" -c 'import curl_cffi; from curl_cffi import requests as c; c.Session(impersonate="chrome").close(); print(curl_cffi.__version__)' 2>&1); then
+    ok "curl_cffi $out loads (browser impersonation available)"
+  else
+    warn "curl_cffi cannot be loaded ($out): the application will fall back to requests and NSE / Yahoo may block it"
   fi
   if ((DASHBOARD_WANTED)); then
     if ! out=$("$VENV_PY" -c 'import fastapi, uvicorn, starlette, pydantic, httpx' 2>&1); then
@@ -718,7 +725,7 @@ step_venv() {
     build_venv
   fi
   verify_venv || die "the virtualenv failed its checks (messages above)"
-  ok "pip check and the smoke import (numpy pandas scipy lightgbm requests feedparser) passed"
+  ok "pip check and the smoke import (numpy pandas scipy lightgbm requests feedparser tzdata) passed"
   info "precompiling bytecode (the service cannot write __pycache__)"
   "$VENV_PY" -m compileall -q -x '/\.venv/' "$APP_DIR"
   printf '%s\n' "$REQ_KEY" >"$HASH_FILE"

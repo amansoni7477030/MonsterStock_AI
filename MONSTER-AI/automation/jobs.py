@@ -121,7 +121,8 @@ def collect_global(ctx: JobContext) -> JobResult:
     deadline = ctx.budget(20 * 60)
     report = refresh_daily_bars(store, ctx.yahoo(), now=ctx.clock.now(), years=s.history_years, include_equities=False,
                                 deadline=deadline, clock=ctx.clock)
-    metrics: dict[str, Any] = {"series_ok": report.ok, "series_failed": report.failed, "partial": report.partial}
+    metrics: dict[str, Any] = {"series_ok": report.ok, "series_failed": report.failed, "series_unchanged": report.unchanged,
+                               "partial": report.partial}
     metrics["live_context"] = _guarded("live context", collect_live_context, store, ctx.yahoo(), deadline=deadline, clock=ctx.clock)
     if s.nse_enabled:
         _guarded("GIFT Nifty", collect_gift, store, ctx.nse_api())
@@ -133,6 +134,8 @@ def collect_global(ctx: JobContext) -> JobResult:
     metrics["econ_events"] = _guarded("economic calendar", ctx.news().collect_econ_calendar)
     ok = report.success_ratio >= 0.8 and not report.partial
     message = f"{report.ok} series ok, {report.failed} failed" + ("; deadline reached" if report.partial else "")
+    if report.unchanged:
+        message += f"; {report.unchanged} confirmed unchanged by the bulk probe"
     if report.notes:
         message += " (" + "; ".join(report.notes[:3]) + ")"
     return JobResult("success" if ok else "failed", message, metrics)
@@ -152,7 +155,7 @@ def collect_news(ctx: JobContext) -> JobResult:
     except DataUnavailable as exc:
         return JobResult("failed", redact(str(exc)))
     rss = collector.collect_rss(feeds, deadline=deadline)
-    metrics.update(rss_ok=rss.ok, rss_failed=rss.failed, rss_new=rss.new_items)
+    metrics.update(rss_ok=rss.ok, rss_failed=rss.failed, rss_new=rss.new_items, rss_not_modified=rss.not_modified)
     if s.gdelt_enabled:
         gdelt = collector.collect_gdelt(queries, deadline=deadline)
         metrics.update(gdelt_ok=gdelt.ok, gdelt_new=gdelt.new_items)

@@ -5,5 +5,6 @@ pandas==2.3.3
 scipy==1.15.3
 lightgbm==4.6.0
 requests==2.32.5
+curl_cffi==0.17.0
 feedparser==6.0.12
 tzdata==2025.2

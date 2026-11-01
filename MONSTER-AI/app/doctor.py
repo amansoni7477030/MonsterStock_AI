@@ -14,7 +14,7 @@ from app.config import ConfigError, Settings, load_settings, validate
 from app.resources import check_resources, disk_info, memory_info
 
 MIN_PYTHON = (3, 10)
-PACKAGES = ("numpy", "pandas", "scipy", "lightgbm", "requests", "feedparser", "tzdata")
+PACKAGES = ("numpy", "pandas", "scipy", "lightgbm", "requests", "curl_cffi", "feedparser", "tzdata")
 CLOCK_SKEW_WARN_SEC = 30.0
 REQUIRED_SEEDS = ("universe_seed.csv", "nse_holidays.json", "feeds.json")
 
@@ -61,6 +61,31 @@ def _packages(report: DoctorReport) -> None:
         report.add("timezone data", "ok", "Asia/Kolkata")
     except Exception as exc:  # noqa: BLE001
         report.add("timezone data", "fail", f"{type(exc).__name__}: install the tzdata package")
+    _server_time(report)
+
+
+def _server_time(report: DoctorReport) -> None:
+    """The server may run in any time zone: show that the application's own clock (UTC, IST) is right regardless."""
+    from app.clock import IST, get_clock
+
+    now = get_clock().now()
+    local = now.astimezone()
+    report.add("server time", "ok", f"UTC {now:%Y-%m-%d %H:%M:%S}, IST {now.astimezone(IST):%Y-%m-%d %H:%M:%S}; the server's own "
+               f"zone is {local.tzname()} (UTC{local:%z}) - irrelevant, all scheduling and dates use IST")
+
+
+def _http_transport(report: DoctorReport, s: Settings) -> None:
+    from ingestion.http import curl_cffi_info
+
+    info = curl_cffi_info()
+    if s.http_transport == "requests":
+        report.add("http transport", "warn", "HTTP_TRANSPORT=requests: no browser fingerprint (NSE / Yahoo may block)")
+    elif info["available"]:
+        profile = s.http_impersonate or "no impersonation"
+        report.add("http transport", "ok", f"curl_cffi {info['version']} ({profile}); {str(info['libcurl']).split(' ')[0]}")
+    else:
+        report.add("http transport", "warn", f"curl_cffi unavailable ({info['error'][:100]}): falling back to requests, "
+                   "NSE / Yahoo may block it (re-run the installer)")
 
 
 def _config(report: DoctorReport, env_file: str | None) -> Settings | None:
@@ -138,9 +163,8 @@ def _telegram_config(report: DoctorReport, s: Settings) -> None:
 
 
 def _network(report: DoctorReport, s: Settings) -> None:
-    import requests
-
-    from ingestion.http import USER_AGENT_SIMPLE
+    from app.errors import DataUnavailable
+    from ingestion.http import HttpClient
 
     probes = (
         ("Yahoo Finance", "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=5d&interval=1d", True),
@@ -148,14 +172,17 @@ def _network(report: DoctorReport, s: Settings) -> None:
         ("Telegram API", "https://api.telegram.org/", False),
     )
     for name, url, critical in probes:
+        client = HttpClient.from_settings("doctor", s, max_attempts=1, timeout=(10.0, 15.0), headers={"Accept": "*/*"})
         try:
-            response = requests.get(url, headers={"User-Agent": USER_AGENT_SIMPLE}, timeout=15)
-            ok = response.status_code < 400 or (name == "Telegram API" and response.status_code in (401, 404))
-            report.add(f"network: {name}", "ok" if ok else ("fail" if critical else "warn"), f"HTTP {response.status_code}")
+            response = client.get(url, soft_statuses=range(300, 600))  # any HTTP answer proves reachability; judge the status
+            ok = response.status < 400 or (name == "Telegram API" and response.status in (401, 404))
+            report.add(f"network: {name}", "ok" if ok else ("fail" if critical else "warn"), f"HTTP {response.status}")
             if name == "Telegram API":
                 _clock_skew(report, response.headers.get("Date"))
-        except requests.RequestException as exc:
-            report.add(f"network: {name}", "fail" if critical else "warn", type(exc).__name__)
+        except DataUnavailable as exc:
+            report.add(f"network: {name}", "fail" if critical else "warn", str(exc)[:100])
+        finally:
+            client.close()
     if s.telegram_bot_token:
         try:
             from notifications.telegram import TelegramClient
@@ -187,6 +214,7 @@ def run_doctor(*, offline: bool = False, env_file: str | None = None) -> DoctorR
         _paths(report, settings)
         _database(report, settings)
         _resources(report, settings)
+        _http_transport(report, settings)
         _telegram_config(report, settings)
         if not offline:
             _network(report, settings)

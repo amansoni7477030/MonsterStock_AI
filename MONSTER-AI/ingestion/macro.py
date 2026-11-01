@@ -28,9 +28,9 @@ class FredClient:
     clock: Clock | None = None
 
     def __post_init__(self) -> None:
-        self.http = self.http or HttpClient(
-            "fred", headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=0.6, timeout=(8.0, 25.0), max_attempts=3,
-            max_bytes=8 * 1024 * 1024, clock=self.clock)
+        self.http = self.http or HttpClient.from_settings(
+            "fred", self.settings, impersonate=None, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=0.6,
+            timeout=(8.0, 25.0), max_attempts=3, max_bytes=8 * 1024 * 1024, clock=self.clock)  # official API: honest UA
 
     @property
     def enabled(self) -> bool:

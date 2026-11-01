@@ -162,6 +162,12 @@ VARS: tuple[Var, ...] = (
     Var("http_timeout_sec", "HTTP_TIMEOUT_SEC", "30", _float, "Default HTTP read timeout.", "Providers"),
     Var("http_max_attempts", "HTTP_MAX_ATTEMPTS", "4", _int, "Bounded attempts per request.", "Providers"),
     Var("http_max_response_mb", "HTTP_MAX_RESPONSE_MB", "40", _int, "Abort responses larger than this (RAM guard).", "Providers"),
+    Var("http_transport", "HTTP_TRANSPORT", "auto", _choice("auto", "curl_cffi", "requests"),
+        "HTTP client for scraped providers (NSE, Yahoo, RSS, GDELT): auto = curl_cffi (real browser TLS / HTTP-2 "
+        "fingerprint, fewer blocks) with an automatic requests fallback.", "Providers"),
+    Var("http_impersonate", "HTTP_IMPERSONATE", "chrome", _str,
+        "Browser profile curl_cffi impersonates: chrome, safari, firefox, edge or a pinned version such as chrome131 "
+        "(empty = no impersonation). Proxies: set HTTPS_PROXY in the environment file.", "Providers"),
     Var("fred_api_key", "FRED_API_KEY", "", _opt_str, "Optional FRED key (enables vintage-aware macro data).", "Providers", True),
     Var("gdelt_enabled", "GDELT_ENABLED", "true", _bool, "Use the GDELT DOC API for global news discovery.", "Providers"),
     Var("news_feeds_file", "NEWS_FEEDS_FILE", "{home}/data/seeds/feeds.json", _path, "RSS/Atom feed registry.", "Providers"),
@@ -259,6 +265,8 @@ class Settings:
     http_timeout_sec: float = 30.0
     http_max_attempts: int = 4
     http_max_response_mb: int = 40
+    http_transport: str = "auto"
+    http_impersonate: str = "chrome"
     fred_api_key: str | None = None
     gdelt_enabled: bool = True
     news_feeds_file: Path = HOME_DEFAULT / "data" / "seeds" / "feeds.json"

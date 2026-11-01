@@ -8,13 +8,15 @@ stops the run; (5) vendor re-adjustments (splits/bonus) are detected and the his
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from app.clock import IST, Clock, get_clock, ist_date, parse_ts
+from app.clock import IST, Clock, get_clock, iso, ist_date, parse_ts
 from app.errors import CircuitOpen, DataUnavailable
 from app.logging_setup import redact
 from database.store import Store
@@ -27,6 +29,9 @@ from ingestion.yahoo import SymbolNotFound, YahooClient
 log = logging.getLogger(__name__)
 
 NOTFOUND_LIMIT = 3
+PROBE_MAX_AGE = timedelta(hours=24)  # a series is always fetched in full at least this often, whatever the probe says
+PROBE_MIN_SERIES = 4                 # below this a bulk probe saves nothing
+PROBE_REL_TOL = 1e-4
 
 
 @dataclass
@@ -34,6 +39,7 @@ class IngestReport:
     ok: int = 0
     failed: int = 0
     skipped: int = 0
+    unchanged: int = 0  # confirmed up to date by the bulk probe (counted in ``ok``; no per-symbol request was made)
     rows: int = 0
     partial: bool = False
     notes: list[str] = field(default_factory=list)
@@ -154,12 +160,58 @@ def _order_key(row: Any) -> tuple[int, str]:
     return (2, row["symbol"])
 
 
+def unchanged_by_probe(store: Store, yahoo: YahooClient, rows: Sequence[Any], now: datetime) -> set[int]:
+    """Instrument ids whose newest stored bar already equals the vendor's newest daily point (nothing new to download).
+
+    One spark request answers 20 symbols, so the ~33 global series cost 2 requests instead of 33 whenever their markets are
+    closed and nothing changed. The probe can only ever SKIP a fetch: any doubt (a newer vendor date, a different close, a
+    symbol the endpoint did not return, a failing probe, or a series not fetched in full for ``PROBE_MAX_AGE``) falls through
+    to the normal per-symbol fetch, which also keeps split / re-adjustment detection working."""
+    candidates: list[tuple[Any, str, str, float]] = []
+    for row in rows:
+        if row["kind"] == "equity":  # equities come from the official file; their vendor close need not match it
+            continue
+        fetched = parse_ts(store.kv_get(f"yahoo:fetched:{row['symbol']}"))
+        if fetched is None or now - fetched > PROBE_MAX_AGE:
+            continue
+        last = store.conn.execute(
+            "SELECT trade_date, close FROM bars_daily WHERE instrument_id = ? AND source_rank <= 1 "
+            "ORDER BY trade_date DESC LIMIT 1", (row["instrument_id"],)).fetchone()
+        if last is None or not last["close"]:
+            continue
+        candidates.append((row, row["yahoo_symbol"] or row["symbol"], last["trade_date"], float(last["close"])))
+    if len(candidates) < PROBE_MIN_SERIES:
+        return set()
+    try:
+        points = yahoo.spark_latest([ysym for _, ysym, _, _ in candidates])
+    except Exception as exc:  # noqa: BLE001 - the probe is an optimisation: failing open costs requests, never data
+        log.warning("bulk freshness probe failed (%s: %s); fetching the series one by one", type(exc).__name__, redact(str(exc)))
+        return set()
+    same: set[int] = set()
+    for row, ysym, last_date, last_close in candidates:
+        point = points.get(ysym)
+        if point is None:
+            continue
+        try:
+            zone: ZoneInfo | None = ZoneInfo(spec_for_instrument(row["symbol"], row["kind"]).tz)
+        except Exception:  # noqa: BLE001 - unknown zone: be conservative
+            zone = None
+        if zone is None:
+            continue
+        point_date = point.ts.astimezone(zone).date().isoformat()
+        if point_date <= last_date and math.isclose(point.close, last_close, rel_tol=PROBE_REL_TOL, abs_tol=1e-9):
+            same.add(int(row["instrument_id"]))
+    log.info("bulk freshness probe: %d of %d series unchanged (%d requests saved)", len(same), len(candidates), len(same))
+    return same
+
+
 def refresh_daily_bars(
     store: Store, yahoo: YahooClient, *, now: datetime, years: int, symbols: Iterable[str] | None = None,
     include_series: bool = True, include_equities: bool = True, deadline: float | None = None,
-    clock: Clock | None = None, only_universe: bool = True,
+    clock: Clock | None = None, only_universe: bool = True, probe: bool = True,
 ) -> IngestReport:
-    """Incrementally refresh bars for global series and the equity universe. ``deadline`` is a monotonic timestamp."""
+    """Incrementally refresh bars for global series and the equity universe. ``deadline`` is a monotonic timestamp.
+    ``probe`` first asks Yahoo's bulk endpoint which series have nothing new, and only fetches the others."""
     clk = clock or get_clock()
     wanted = set(symbols) if symbols is not None else None
     rows = []
@@ -168,12 +220,17 @@ def refresh_daily_bars(
     if include_equities:
         rows += store.list_instruments(kind="equity", in_universe=True if only_universe else None, status="active")
     rows = [r for r in sorted(rows, key=_order_key) if wanted is None or r["symbol"] in wanted]
+    unchanged = unchanged_by_probe(store, yahoo, rows, now) if probe else set()
     report = IngestReport()
     for row in rows:
         if deadline is not None and clk.monotonic() > deadline:
             report.partial = True
             report.note("deadline reached; remaining symbols deferred")
             break
+        if int(row["instrument_id"]) in unchanged:
+            report.ok += 1
+            report.unchanged += 1
+            continue
         try:
             written = ingest_symbol_daily(store, yahoo, row, now=now, years=years)
         except SymbolNotFound:
@@ -194,6 +251,7 @@ def refresh_daily_bars(
             log.exception("unexpected error ingesting %s", row["symbol"])
             continue
         store.kv_delete(f"notfound:{row['symbol']}")
+        store.kv_set(f"yahoo:fetched:{row['symbol']}", iso(now) or "")
         report.ok += 1
         report.rows += written
     store.record_source_result(

@@ -39,6 +39,10 @@ API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": HOME,
     "X-Requested-With": "XMLHttpRequest",
+    # what a browser sends for an XHR/fetch call from the NSE site itself (the impersonation profile defaults to a page load)
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 INDEX_FILES = {
     "nifty50": "ind_nifty50list.csv", "nifty100": "ind_nifty100list.csv", "nifty200": "ind_nifty200list.csv",
@@ -96,10 +100,9 @@ class NseArchive:
     """Official end-of-day files from nsearchives.nseindia.com."""
 
     def __init__(self, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
-        self.http = http or HttpClient(
-            "nse_archive", headers=BROWSER_HEADERS, min_interval=settings.nse_min_interval_sec,
-            timeout=(10.0, max(settings.http_timeout_sec, 60.0)), max_attempts=settings.http_max_attempts,
-            max_bytes=settings.http_max_response_mb * 1024 * 1024, clock=clock,
+        self.http = http or HttpClient.from_settings(
+            "nse_archive", settings, headers=BROWSER_HEADERS, min_interval=settings.nse_min_interval_sec,
+            timeout=(10.0, max(settings.http_timeout_sec, 60.0)), clock=clock,
         )
 
     def bhavcopy(self, day: date) -> list[dict[str, Any]] | None:
@@ -238,10 +241,9 @@ class NseApi:
     def __init__(self, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
         self.clock = clock
         self._warm_mark: float | None = None
-        self.http = http or HttpClient(
-            "nse_api", headers=BROWSER_HEADERS, min_interval=settings.nse_min_interval_sec,
-            timeout=(10.0, settings.http_timeout_sec), max_attempts=min(settings.http_max_attempts, 3),
-            max_bytes=settings.http_max_response_mb * 1024 * 1024, clock=clock,
+        self.http = http or HttpClient.from_settings(
+            "nse_api", settings, headers=BROWSER_HEADERS, min_interval=settings.nse_min_interval_sec,
+            max_attempts=min(settings.http_max_attempts, 3), clock=clock,
         )
         self.http.on_auth_failure = self._rewarm
         self._expiry_cache: dict[str, list[str]] = {}

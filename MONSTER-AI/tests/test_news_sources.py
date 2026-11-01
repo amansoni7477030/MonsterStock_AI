@@ -163,12 +163,12 @@ def patch_http(monkeypatch, fake_clock, handler):
     """The collectors build their own HttpClient for GDELT / the calendar: hand them a scripted one instead."""
     sessions = []
 
-    def factory(source, **kwargs):
+    def factory(source, settings, **kwargs):
         session = FakeSession(handler)
         sessions.append(session)
         return HttpClient(source, session=session, clock=fake_clock, max_attempts=1)
 
-    monkeypatch.setattr(ns, "HttpClient", factory)
+    monkeypatch.setattr(ns.HttpClient, "from_settings", staticmethod(factory))
     return sessions
 
 

@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 FEED_DISABLE_AFTER = 6
 FEED_DISABLE_HOURS = 24
+FEED_FULL_REFRESH_HOURS = 6  # conditional GETs are trusted for this long; then one unconditional fetch (a publisher may answer 304 forever)
 MAX_ITEMS_PER_FEED = 60
 TRACKING_PARAMS = {"fbclid", "gclid", "ref", "ocid", "cmpid", "taid", "mc_cid", "mc_eid", "guccounter", "guce_referrer"}
 
@@ -51,6 +52,7 @@ class CollectReport:
     ok: int = 0
     failed: int = 0
     skipped: int = 0
+    not_modified: int = 0  # feeds answered with 304: nothing new, nothing downloaded
     new_items: int = 0
     notes: list[str] = field(default_factory=list)
 
@@ -104,8 +106,8 @@ def _clean(text: Any, limit: int) -> str:
 class NewsCollector:
     def __init__(self, store: Store, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
         self.store, self.settings, self.clock = store, settings, clock
-        self.http = http or HttpClient(
-            "rss", headers={"User-Agent": USER_AGENT_SIMPLE, "Accept": "application/rss+xml, application/xml, text/xml, */*"},
+        self.http = http or HttpClient.from_settings(
+            "rss", settings, headers={"User-Agent": USER_AGENT_SIMPLE, "Accept": "application/rss+xml, application/xml, text/xml, */*"},
             min_interval=0.4, timeout=(8.0, 20.0), max_attempts=2, max_bytes=6 * 1024 * 1024, clock=clock,
             breaker=_NoBreaker(),
         )
@@ -126,6 +128,26 @@ class NewsCollector:
             self.store.kv_set(f"feed:{feed.id}:fails", "0")
             log.warning("feed %s disabled for %d h after %d failures", feed.id, FEED_DISABLE_HOURS, fails)
 
+    def _validators(self, feed: FeedSpec) -> dict[str, str]:
+        """``If-None-Match`` / ``If-Modified-Since`` for a feed fetched in full recently: an unchanged feed then costs one tiny
+        304 answer instead of a download (fewer requests bytes and fewer chances of a rate limit)."""
+        full_at = parse_ts(self.store.kv_get(f"feed:{feed.id}:full_at"))
+        if full_at is None or self._now() - full_at > timedelta(hours=FEED_FULL_REFRESH_HOURS):
+            return {}
+        headers: dict[str, str] = {}
+        etag = self.store.kv_get(f"feed:{feed.id}:etag")
+        modified = self.store.kv_get(f"feed:{feed.id}:lastmod")
+        if etag:
+            headers["If-None-Match"] = etag
+        if modified:
+            headers["If-Modified-Since"] = modified
+        return headers
+
+    def _remember_validators(self, feed: FeedSpec, response: Any) -> None:
+        self.store.kv_set(f"feed:{feed.id}:etag", response.headers.get("etag") or "")
+        self.store.kv_set(f"feed:{feed.id}:lastmod", response.headers.get("last-modified") or "")
+        self.store.kv_set(f"feed:{feed.id}:full_at", iso(self._now()) or "")
+
     def collect_rss(self, feeds: Iterable[FeedSpec], *, lookback_hours: int | None = None, deadline: float | None = None,
                     region: str | None = None) -> CollectReport:
         report = CollectReport()
@@ -142,7 +164,12 @@ class NewsCollector:
                 continue
             report.attempted += 1
             try:
-                response = self.http.get(feed.url)
+                response = self.http.get(feed.url, headers=self._validators(feed), soft_statuses=(304,))
+                if response.status == 304:
+                    report.ok += 1
+                    report.not_modified += 1
+                    self.store.kv_set(f"feed:{feed.id}:fails", "0")
+                    continue
                 parsed = feedparser.parse(response.content)
                 if not parsed.entries and getattr(parsed, "bozo", 0):
                     raise DataUnavailable("rss_news", "unparseable feed", retryable=True)
@@ -157,6 +184,7 @@ class NewsCollector:
                 self._feed_failure(feed)
                 continue
             self.store.kv_set(f"feed:{feed.id}:fails", "0")
+            self._remember_validators(feed, response)
             report.ok += 1
             report.new_items += self._store_entries(feed, parsed.entries[:MAX_ITEMS_PER_FEED], horizon)
         self.store.record_source_result(
@@ -197,8 +225,9 @@ class NewsCollector:
         report = CollectReport()
         if not self.settings.gdelt_enabled:
             return report
-        client = HttpClient("gdelt", headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=6.0, timeout=(8.0, 25.0),
-                            max_attempts=2, backoff_base=7.0, clock=self.clock, max_bytes=4 * 1024 * 1024)
+        client = HttpClient.from_settings(
+            "gdelt", self.settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=6.0, timeout=(8.0, 25.0),
+            max_attempts=2, backoff_base=7.0, clock=self.clock, max_bytes=4 * 1024 * 1024)
         clk = self.clock or get_clock()
         hours = lookback_hours or self.settings.news_lookback_hours
         now_iso = iso(self._now())
@@ -272,8 +301,9 @@ class NewsCollector:
 
     # -------------------------------------------------------------------------------- economic calendar
     def collect_econ_calendar(self) -> int:
-        client = HttpClient("econ_calendar", headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=1.0, timeout=(8.0, 20.0),
-                            max_attempts=2, clock=self.clock, max_bytes=2 * 1024 * 1024)
+        client = HttpClient.from_settings(
+            "econ_calendar", self.settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=1.0, timeout=(8.0, 20.0),
+            max_attempts=2, clock=self.clock, max_bytes=2 * 1024 * 1024)
         try:
             data = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json").json()
         except (DataUnavailable, CircuitOpen) as exc:

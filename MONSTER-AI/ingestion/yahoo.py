@@ -7,7 +7,7 @@ reported by Yahoo, which is how point-in-time availability is later computed (in
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 
 BASE = "https://query1.finance.yahoo.com/v8/finance/chart/"
 FALLBACK_BASE = "https://query2.finance.yahoo.com/v8/finance/chart/"
+SPARK_URL = "https://query1.finance.yahoo.com/v8/finance/spark"
+SPARK_FALLBACK_URL = "https://query2.finance.yahoo.com/v8/finance/spark"
+SPARK_MAX_SYMBOLS = 20  # hard limit of the endpoint ("Number of symbols needs to be less than or equal to 20")
 
 
 @dataclass
@@ -64,14 +67,9 @@ def _num(value: Any) -> float | None:
 class YahooClient:
     def __init__(self, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
         self.clock = clock
-        self.http = http or HttpClient(
-            "yahoo",
-            headers={"User-Agent": USER_AGENT_SIMPLE, "Accept": "application/json"},
-            min_interval=settings.yahoo_min_interval_sec,
-            timeout=(10.0, settings.http_timeout_sec),
-            max_attempts=settings.http_max_attempts,
-            max_bytes=settings.http_max_response_mb * 1024 * 1024,
-            clock=clock,
+        self.http = http or HttpClient.from_settings(
+            "yahoo", settings, headers={"User-Agent": USER_AGENT_SIMPLE, "Accept": "application/json"},
+            min_interval=settings.yahoo_min_interval_sec, clock=clock,
         )
 
     # ------------------------------------------------------------------------------------------ fetch
@@ -178,6 +176,56 @@ class YahooClient:
         source_ts = iso(datetime.fromtimestamp(int(stamp), timezone.utc)) if stamp else None
         change = ((price / prev - 1.0) * 100.0) if price and prev else None
         return {"symbol": symbol, "price": price, "prev_close": prev, "change_pct": change, "source_ts": source_ts}
+
+    def spark_latest(self, symbols: Sequence[str]) -> dict[str, SparkPoint]:
+        """Newest daily point of MANY symbols in ``ceil(n / 20)`` requests (the spark endpoint answers up to 20 symbols per
+        call; a chart call answers one). Used as a freshness probe so unchanged series are not fetched one by one."""
+        unique = list(dict.fromkeys(symbols))
+        out: dict[str, SparkPoint] = {}
+        for start in range(0, len(unique), SPARK_MAX_SYMBOLS):
+            chunk = unique[start:start + SPARK_MAX_SYMBOLS]
+            last: Exception | None = None
+            for base in (SPARK_URL, SPARK_FALLBACK_URL):
+                try:
+                    payload = self.http.get(base, params={"symbols": ",".join(chunk), "range": "5d", "interval": "1d"}).json()
+                except DataUnavailable as exc:
+                    last = exc
+                    continue
+                out.update(parse_spark(payload))
+                break
+            else:
+                raise last or DataUnavailable("yahoo", "spark probe failed")
+        return out
+
+
+@dataclass(frozen=True)
+class SparkPoint:
+    """The newest point of a spark series: when its bar started (UTC) and its last / closing price."""
+
+    ts: datetime
+    close: float
+
+
+def parse_spark(payload: Any) -> dict[str, SparkPoint]:
+    """``{symbol: SparkPoint}`` from a ``v8/finance/spark`` payload. Entries without a usable (timestamp, close) pair are
+    omitted, so the caller simply fetches those symbols the normal way."""
+    out: dict[str, SparkPoint] = {}
+    if not isinstance(payload, dict):
+        return out
+    for symbol, entry in payload.items():
+        if not isinstance(entry, dict):
+            continue
+        stamps, closes = entry.get("timestamp") or [], entry.get("close") or []
+        for idx in range(min(len(stamps), len(closes)) - 1, -1, -1):  # newest non-null point
+            close = _num(closes[idx])
+            if close is None:
+                continue
+            try:
+                out[str(symbol)] = SparkPoint(datetime.fromtimestamp(int(stamps[idx]), timezone.utc), close)
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+            break
+    return out
 
 
 def _at(seq: Any, idx: int) -> Any:
