@@ -295,10 +295,13 @@ class Scheduler:
             if head.critical and not self.running.critical and self.running.reason is None:
                 self._terminate(self.running, f"preempted by {head.entry.label}", mono)
             return
-        spec = JOBS[head.entry.job]
-        if spec.heavy and not head.critical and not (self._ram_ok(mono) and self._disk_ok(mono)):
+        for candidate in due:
+            spec = JOBS[candidate.entry.job]
+            # a heavy job that has to wait for RAM or disk must not hold back the light jobs behind it
+            if spec.heavy and not candidate.critical and not (self._ram_ok(mono) and self._disk_ok(mono)):
+                continue
+            self._launch(candidate, mono)
             return
-        self._launch(head, mono)
 
     def _launch(self, due: Due, mono: float) -> None:
         log.info("starting %s [%s] attempt %d/%d%s", due.entry.label, due.run_key, due.attempt, due.entry.max_attempts,

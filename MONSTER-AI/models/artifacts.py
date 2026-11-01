@@ -115,7 +115,7 @@ def read_bundle(directory: Path, *, verify: bool = True) -> tuple[dict[str, Any]
         meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
         calib = json.loads((directory / "calibration.json").read_text(encoding="utf-8"))
         stats = json.loads((directory / "feature_stats.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (FileNotFoundError, ValueError) as exc:  # other OSErrors are I/O hiccups, not damage: they propagate as they are
         raise ModelArtifactError(f"{directory.name}: unreadable artifact ({type(exc).__name__})") from exc
     boosters: dict[str, lgb.Booster] = {}
     for key in meta.get("booster_keys", []):

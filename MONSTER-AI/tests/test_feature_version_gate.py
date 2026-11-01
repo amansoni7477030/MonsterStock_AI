@@ -5,6 +5,7 @@ the registry refuses them, the scan falls back to the heuristic baseline and a r
 from __future__ import annotations
 
 import hashlib
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -87,3 +88,46 @@ def test_a_current_model_next_to_old_ones_is_the_one_served(reg, monkeypatch):
     register_under(reg, monkeypatch, PREVIOUS, "m-old-final", stage="final", status="shadow")
     register_under(reg, monkeypatch, FEATURE_VERSION, "m-new-final", stage="final", status="validated")
     assert reg.active_bundle("final").version == "m-new-final"
+
+
+# ------------------------------------------------------------------------------- transient vs definite damage
+def flaky_verify(reg, monkeypatch, error):
+    """``verify_record`` fails once with ``error``, then works: the first read hits an I/O problem, the next one does not."""
+    real, calls = reg.verify_record, {"n": 0}
+
+    def verify(record):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise error
+        return real(record)
+
+    monkeypatch.setattr(reg, "verify_record", verify)
+
+
+def test_an_io_hiccup_keeps_the_champion_and_serves_the_baseline_for_that_scan_only(reg, monkeypatch):
+    governance.register(reg, "m-1-final", status="validated")
+    flaky_verify(reg, monkeypatch, OSError(5, "Input/output error"))
+
+    assert reg.active_bundle("final").status == "baseline"  # this scan only
+    assert reg.active_record("final")["model_version"] == "m-1-final"
+    assert reg.store.get_model("m-1-final")["status"] == "validated"  # not retired
+    codes = [a["code"] for a in reg.store.pending_alerts(20)]
+    assert "model_load_failed" in codes and "model_artifact_invalid" not in codes
+
+    again = reg.active_bundle("final")  # the next scan reads it normally
+    assert isinstance(again, ModelBundle) and again.version == "m-1-final" and again.status == "validated"
+
+
+def test_an_io_hiccup_never_makes_a_challenger_replace_a_healthy_champion(reg, monkeypatch):
+    governance.register(reg, "m-champ-final", status="shadow", skill=0.3, edge=0.2)
+    flaky_verify(reg, monkeypatch, OSError(24, "Too many open files"))
+    decision = governance.register(reg, "m-weak-final", status="shadow", skill=0.05, edge=0.0)
+    assert decision["activate"] is False and reg.active_record("final")["model_version"] == "m-champ-final"
+
+
+def test_missing_files_are_definite_damage_and_still_retire_the_model(reg):
+    governance.register(reg, "m-1-final", status="validated")
+    shutil.rmtree(reg.artifact_dir("m-1-final"))
+    assert reg.active_bundle("final").status == "baseline"
+    assert reg.store.get_model("m-1-final")["status"] == "retired"
+    assert any(a["code"] == "model_artifact_invalid" for a in reg.store.pending_alerts(20))

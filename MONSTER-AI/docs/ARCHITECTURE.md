@@ -526,7 +526,7 @@ Every call to a scraped or public data source goes through one client, `ingestio
 - **Safety.** HTTPS only; a hard response-size cap (`HTTP_MAX_RESPONSE_MB`, a RAM guard); errors and logs carry host and path
   only, never the query string (it may hold a key); NSE's cookie handshake is re-done automatically on 401/403.
 - **Traceability.** One DEBUG line per request, WARNING lines for retries and give-ups, and per-source counters (requests,
-  failures, 429s, bytes) that the job runner prints as an `http:` summary at the end of every job.
+  failures, 429s, bytes) that the job runner logs as a `network:` line at the end of every job.
 
 ```mermaid
 flowchart TB
@@ -549,7 +549,7 @@ flowchart TB
     RESP -- "408 425 429 500 502 503 504" --> BACK["Retry-After or exponential back-off with jitter"]
     BACK --> RL
     RESP -- "other 4xx, or attempts used up" --> ERR["DataUnavailable, secret-safe message,<br/>breaker counts the failure"]
-    BODY --> STATS["per-source counters -> HTTP summary in the job log"]
+    BODY --> STATS["per-source counters -> the job's network line in the log"]
 ```
 
 **Bulk fetching and batching** keep the request count (and so the rate-limit exposure) low:
@@ -701,9 +701,9 @@ Every process (daemon, each job child, CLI commands, the dashboard) logs through
 - **Daily files, never renamed.** `logs/<role>-YYYY-MM-DD.log` (roles: `daemon`, `jobs`, `cli`, `health`, `train`, `bootstrap`,
   `dashboard`), at most 25 MB x 4 files per day with a drop-count marker, mode 0640. A shared `errors-YYYY-MM-DD.log` collects
   WARNING and above of **all** processes with their role and pid, so one file answers "what went wrong today". Concurrent
-  processes can append safely (no rotation renames), and logrotate is deliberately restricted to the `.out` and install logs.
-- **Traceable.** Stamps carry milliseconds and the offset; each job line carries its tag `<key>#<attempt> r<run_id>`; the
-  job runner logs start, duration, peak memory and the per-source HTTP summary; the daemon logs every finished job with its
+  processes can append safely (no rotation renames), and logrotate is deliberately restricted to redirected `.out` files and the install log.
+- **Traceable.** Stamps carry milliseconds and the offset; each job line carries its tag `[<job> <run key>#<attempt> r<run id>]`; the
+  job runner logs start, duration, peak memory and a per-source `network:` line; the daemon logs every finished job with its
   duration; unexpected exceptions are logged with tracebacks (token-bearing paths log only the place, `exception_site`).
 - **Crashes are captured:** `sys.excepthook`, thread and unraisable hooks, and `faulthandler` (native crashes) write to the log
   and to `fault-<role>.log`; warnings from libraries are captured too.

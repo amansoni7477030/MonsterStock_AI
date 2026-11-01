@@ -162,6 +162,24 @@ def test_unknown_available_memory_does_not_block_jobs(env, monkeypatch):
     assert env.s._ram_ok(0.0) is True
 
 
+def test_a_heavy_job_waiting_for_resources_never_holds_back_the_light_jobs_behind_it(env, monkeypatch):
+    monkeypatch.setattr(sched, "memory_info", lambda: {"available_mb": 10.0})
+    env.clock.set(ist(2026, 11, 1, 5, 35))  # Sunday: the heavy training and universe refresh are due, and so is the light calendar job
+    due = env.engine.due()
+    assert [d.entry.job for d in due][:2] == ["train", "refresh_universe"] and "refresh_calendar" in [d.entry.job for d in due]
+    env.s.tick()
+    assert [h.due.entry.job for h in env.launcher.started] == ["refresh_calendar"]  # not blocked by the deferred heavy jobs
+
+    env.launcher.finish_ok(env.launcher.started[0])  # the light job ends; the heavy ones are still waiting for memory
+    env.clock.advance(5)
+    env.s.tick()
+    assert [h.due.entry.job for h in env.launcher.started] == ["refresh_calendar"]
+    monkeypatch.setattr(sched, "memory_info", lambda: {"available_mb": 4000.0})
+    env.clock.advance(5)
+    env.s.tick()
+    assert [h.due.entry.job for h in env.launcher.started][-1] == "train"  # now the heavy job goes first, in its normal order
+
+
 def test_heavy_jobs_wait_for_disk_space_but_critical_ones_never_do(env, monkeypatch):
     monkeypatch.setattr(sched, "memory_info", lambda: {"available_mb": 4000.0})
     monkeypatch.setattr(sched, "disk_info", lambda path: {"free_mb": 100.0, "total_mb": 8000.0, "used_mb": 7900.0})

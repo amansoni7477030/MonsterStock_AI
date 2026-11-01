@@ -98,8 +98,10 @@ class ModelRegistry:
     def _champion_healthy(self, champion: dict[str, Any]) -> bool:
         try:
             self.verify_record(champion)
-        except (ModelArtifactError, OSError):
+        except (ModelArtifactError, FileNotFoundError):
             return False
+        except OSError:  # cannot tell: an I/O hiccup is no evidence against the champion
+            return True
         from app.clock import get_clock, parse_ts
 
         created = parse_ts(champion.get("created_at"))
@@ -122,7 +124,7 @@ class ModelRegistry:
                         f"feature version {bundle.meta.get('feature_version')} != {FEATURE_VERSION}")
                 bundle.meta["status"] = record["status"]
                 return bundle
-            except (ModelArtifactError, OSError) as exc:
+            except (ModelArtifactError, FileNotFoundError) as exc:  # definite damage: the files are wrong or gone
                 msg = redact(str(exc))
                 log.error("active model %s unusable: %s", record["model_version"], msg)
                 self.store.add_alert("error", "model_artifact_invalid", f"{record['model_version']}: {msg}",
@@ -133,6 +135,15 @@ class ModelRegistry:
                     self.store.conn.execute("UPDATE model_registry SET is_active = 0 WHERE model_version = ?",
                                             (record["model_version"],))
                 record = self.active_record(stage) if previous else None
+            except OSError as exc:
+                # An I/O hiccup (EIO, too many open files, a locked file ...) says nothing about the artifact: keep the champion,
+                # use the labelled baseline for this call only and try the model again next time.
+                msg = redact(f"{type(exc).__name__}: {exc}")
+                log.error("active model %s could not be read (%s); it is kept, this scan uses the baseline", record["model_version"], msg)
+                self.store.add_alert("error", "model_load_failed", f"{record['model_version']}: {msg} (the model is kept; the "
+                                     "heuristic baseline is used until it can be read again)",
+                                     dedupe_key=f"model-load:{record['model_version']}", dedupe_minutes=60)
+                return self.baseline(stage)
         return self.baseline(stage)
 
     # ------------------------------------------------------------------------------- governance

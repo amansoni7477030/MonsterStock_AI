@@ -8,10 +8,11 @@ alerts, nightly backups).
 - [Quickstart](#quickstart)
 - [What the installer does](#what-the-installer-does)
 - [Upgrade, rollback, uninstall](#upgrade-rollback-uninstall)
+- [Operating the deployed system](#operating-the-deployed-system)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Resource budget](#resource-budget)
-- [External training](#external-training-trainingmodeexternal)
+- [External training](#external-training-training_modeexternal)
 - [Reference](#reference)
 
 ## Quickstart
@@ -66,10 +67,34 @@ sudo monster-ai doctor                      # full preflight incl. feed reachabi
 
 The default mode is **SHADOW**: research output only, the system never places orders.
 
+**The server's time zone does not matter.** Leave it as the provider set it (UTC, a local zone, with or without daylight
+saving): the application stores UTC, computes every market time in IST and pins its own process to UTC. It does need a working
+clock, which the installer makes sure of (step 2: exactly one NTP service is active and synchronised).
+
 ## What the installer does
 
 `deployment/install.sh` is idempotent: run it again at any time to upgrade or repair. Every step is a function
 and prints `[n/14] ...`.
+
+```mermaid
+flowchart TB
+    START["install.sh --yes<br/>(from deploy_remote.* or directly on the server)"] --> P1["1 preflight: root, OS, arch, systemd, Python,<br/>disk, RAM, HTTPS reachability"]
+    P1 --> P2["2 packages and NTP"]
+    P2 --> P3["3 swap file (safety net)"]
+    P3 --> P4["4 monster user and directories"]
+    P4 --> P5["5 stage the release in /opt/monster-ai.new,<br/>stop services, swap atomically,<br/>keep the previous release as .prev"]
+    P5 --> P6["6 virtualenv from binary wheels<br/>(curl_cffi, numpy, LightGBM ...)"]
+    P6 --> P7["7 /etc/monster-ai/monster.env<br/>merge, never lose a value"]
+    P7 --> P8["8 doctor --offline validates the configuration"]
+    P8 --> P9["9 Telegram chat id discovery"]
+    P9 --> P10["10 init: database, migrations, calendar"]
+    P10 --> P11["11 systemd units, journald, logrotate,<br/>start the daemon and the health timer"]
+    P11 --> OK{"daemon READY=1 and stable?"}
+    OK -- no --> RB["automatic rollback to .prev<br/>exit code 3, failed tree kept in .failed"]
+    OK -- yes --> P12["12 bootstrap in the background<br/>(monster-ai-bootstrap.service)"]
+    P12 --> P13["13 verification: health, Telegram test, feeds"]
+    P13 --> P14["14 summary"]
+```
 
 | # | Step | Notes |
 |---|------|-------|
@@ -78,12 +103,12 @@ and prints `[n/14] ...`.
 | 3 | Swap | if total swap < 512 MB: `/swapfile` of 1 GB (512 MB when less than 3.5 GB would stay free), `fallocate` with `dd` fallback, `chmod 600`, one `/etc/fstab` line, `/etc/sysctl.d/99-monster.conf` (`vm.swappiness=10`, `vm.vfs_cache_pressure=50`, `vm.overcommit_memory=0`). Swap is a safety net, **not** a substitute for RAM. `--skip-swap` disables it |
 | 4 | User and directories | system user/group `monster` (no login shell, no sudo); `/var/lib/monster-ai` and `/var/log/monster-ai` `monster:monster 0750`; `/etc/monster-ai` `root:monster 0750` |
 | 5 | Release staging | copies the tree (no `.git .venv __pycache__ tests .github *.db *.log` runtime state, **never env files**) to `/opt/monster-ai.new`, stops the services gracefully (on weekdays it waits out 09:00-09:16 IST), swaps it in atomically (`/opt/monster-ai` -> `/opt/monster-ai.prev`) |
-| 6 | Virtualenv | `/opt/monster-ai/.venv`; `pip install --no-cache-dir --only-binary=:all: --no-binary=sgmllib3k -r requirements.txt` with 3 tries and backoff (dashboard requirements only when enabled); reused (hard-linked) when the requirements hash is unchanged; `pip check`, smoke import, `compileall` as root |
+| 6 | Virtualenv | `/opt/monster-ai/.venv`; `pip install --no-cache-dir --only-binary=:all: --no-binary=sgmllib3k -r requirements.txt` with 3 tries and backoff (dashboard requirements only when enabled); every package, **curl_cffi** included (libcurl is bundled in its wheel), comes as a binary wheel, nothing is compiled; reused (hard-linked) when the requirements hash is unchanged; `pip check`, smoke import, `compileall` as root |
 | 7 | Configuration | `/etc/monster-ai/monster.env` (`root:monster 0640`) is created from `--env-file`, else the project `.env`, else `.env.example`. An existing file **never loses or changes a non-empty value**; missing keys are appended; with `--env-file`, keys that are non-empty there and empty/missing on the server are filled in. `MONSTER_ENV/HOME/DATA_DIR/LOG_DIR` are forced. Secrets are never printed |
 | 8 | Validation | `doctor --offline` as the `monster` user; stops with the application's own message when the configuration is invalid |
 | 9 | Telegram | token present, chat id missing -> waits for your message (180 s) and stores the id; no token -> loud warning with the exact file, key and command to re-run (never a failure) |
 | 10 | Initialise | `init` as `monster` |
-| 11 | systemd | installs the units, journald limits (100 MB / 50 MB / 2 weeks), logrotate, the `monster-ai` command, `enable --now` the daemon and the health timer; waits for `READY=1` and a stable process, **rolls back automatically** if the daemon does not come up |
+| 11 | systemd | installs the units, journald limits (100 MB / 50 MB / 2 weeks), logrotate for redirected `.out` files and the install log (the application writes and prunes its own daily log files), the `monster-ai` command, `enable --now` the daemon and the health timer; waits for `READY=1` and a stable process, **rolls back automatically** if the daemon does not come up |
 | 12 | Bootstrap | `systemctl start --no-block monster-ai-bootstrap.service`, polled every 15 s for up to 120 min; on failure the last 40 log lines are shown (the daemon keeps retrying by itself) |
 | 13 | Verification | daemon state, `health --json`, `telegram-test` (when configured), data-feed reachability from `doctor --json` |
 | 14 | Summary | versions, paths, useful commands, warnings, reminder that the mode is SHADOW |
@@ -137,6 +162,34 @@ sudo bash /opt/monster-ai/deployment/uninstall.sh --purge      # also deletes th
 sudo bash /opt/monster-ai/deployment/uninstall.sh --purge-swap # also removes /swapfile (never done otherwise)
 ```
 
+## Operating the deployed system
+
+After the installation nothing has to be done by hand: the daemon, the health timer, the nightly backup and the nightly retention
+run by themselves, the holiday calendar renews itself every year, and the logs and the database stay within their budgets. The
+commands you may want (all through the wrapper, `sudo monster-ai <command>`; the full runbook is [docs/OPERATIONS.md](../docs/OPERATIONS.md)):
+
+```bash
+sudo monster-ai health                  # exit 0 ok / 1 warning / 2 critical, with the reasons
+sudo monster-ai jobs                    # timetable and the last runs of every job
+sudo monster-ai logs                    # the newest day's warnings and errors of every process
+sudo monster-ai logs --role daemon -f   # follow the scheduler
+sudo monster-ai storage                 # disk, WAL, backups, logs, row counts and retention windows
+sudo monster-ai diag                    # redacted bundle (/var/lib/monster-ai/diag/) to attach to a bug report
+sudo monster-ai version                 # release and code fingerprint
+journalctl -u monster-ai -f             # the daemon through journald
+```
+
+| Where | What lives there |
+|-------|------------------|
+| `/var/log/monster-ai/<role>-YYYY-MM-DD.log` | the application's own daily logs (never renamed, at most 25 MB x 4 files per role and day, mode 0640) |
+| `/var/log/monster-ai/errors-YYYY-MM-DD.log` | every WARNING and ERROR of every process in one file |
+| `/var/log/monster-ai/fault-<role>.log` | native crash traces (`faulthandler`) |
+| `/var/log/monster-ai/*.out`, `/var/log/monster-ai-install.log` | output of manual runs you redirect into the log directory, and the installer transcript (rotated by logrotate) |
+| `/var/lib/monster-ai/calendar_overrides.json` | optional operator calendar overrides (survive upgrades), see the runbook |
+
+The application prunes its own daily logs (30 days within 150 MB: `LOG_RETENTION_DAYS`, `LOG_MAX_MB`); logrotate deliberately does not
+touch them, because `copytruncate` would empty a file that several processes append to.
+
 ## Troubleshooting
 
 | Symptom | Cause | What to do |
@@ -145,6 +198,9 @@ sudo bash /opt/monster-ai/deployment/uninstall.sh --purge-swap # also removes /s
 | `could not create a swap file` / `cannot hold a swap file` | file system without swap-file support (ZFS, overlay, tmpfs, some btrfs setups) | Use `--skip-swap`, add swap another way (partition, zram) or choose a larger server |
 | `PyPI index ... is unreachable` | DNS, outbound firewall or proxy; the installer aborts before changing anything | `curl -I https://pypi.org/simple/pip/` on the server; allow outbound HTTPS to `pypi.org` and `files.pythonhosted.org`; behind a proxy log in as root and `export https_proxy=...` before running the installer |
 | `NSE archives ... is unreachable` or HTTP 403 | NSE blocks some data-centre ranges | Not fatal: MONSTER AI runs in **degraded mode** (fewer sources, data gaps are flagged, reports say so). Try again later or use an Indian region; `NSE_ENABLED=false` stops the attempts |
+| `http transport: requests (curl_cffi unavailable ...)` in the logs | the curl_cffi wheel could not be imported (unsupported platform, broken libc) | Not fatal: the client falls back to `requests`, but providers that fingerprint TLS may block it more often. `pip check` in `/opt/monster-ai/.venv`; reinstall with the installer; `HTTP_TRANSPORT=requests` silences the warning |
+| the server is in another time zone, or changes to daylight saving | none: this is supported | Nothing to do: storage is UTC, market logic is IST, the process zone is pinned to UTC. Only log stamps use `MONSTER_TIMEZONE` |
+| `heartbeat_db_stale`, `storage_over_budget`, `wal_large`, `daemon_restarted` alerts | see the runbook's alert table | [docs/OPERATIONS.md](../docs/OPERATIONS.md#alerts-and-what-to-do) |
 | `Yahoo Finance ... is unreachable` | outbound block / rate limit | warning only; the bootstrap and the daemon retry with backoff |
 | Chat id was not discovered | you did not message the bot within 180 s, a webhook is set on the bot, or another program consumes its updates | Send `/start` to the bot and run the installer again, or set `TELEGRAM_CHAT_ID=<number>` in `/etc/monster-ai/monster.env` |
 | No Telegram token | `TELEGRAM_BOT_TOKEN` empty | Create a bot with @BotFather, `sudo nano /etc/monster-ai/monster.env`, set `TELEGRAM_BOT_TOKEN=...`, then `sudo bash /opt/monster-ai/deployment/install.sh --yes` |
@@ -185,7 +241,7 @@ sudo bash /opt/monster-ai/deployment/uninstall.sh --purge-swap # also removes /s
 |----------|--------|
 | RAM | daemon `MemoryHigh=750M` / `MemoryMax=880M` (one heavy job at a time, job RSS watchdog at 720 MB), bootstrap the same ceiling with `Nice=10` and idle I/O, health check <= 450 MB, failure alert <= 450 MB, dashboard <= 250 MB; BLAS/OpenMP pinned to 1 thread; `OOMScoreAdjust=-300` for the daemon |
 | Swap | 1 GB (512 MB on tight disks) as a safety net, `vm.swappiness=10` |
-| Disk | needs >= 3 GB free to install; code + virtualenv about 0.5 GB, the previous release shares the venv through hard links when the requirements did not change; journal <= 100 MB; app logs 5 x 5 MB per file; database and backups are bounded by the application's retention (`BACKUP_KEEP_*`, cache limits, emergency cleanup at `MIN_FREE_DISK_MB_CRIT`) |
+| Disk | needs >= 3 GB free to install; code + virtualenv about 0.5 GB, the previous release shares the venv through hard links when the requirements did not change; journal <= 100 MB; app logs 30 days within 150 MB (daily files, `LOG_RETENTION_DAYS` / `LOG_MAX_MB`); the data directory has a 4000 MB budget (`DATA_MAX_MB`) enforced by the nightly retention of every table, cache and backup (`*_RETENTION_DAYS`, `BACKUP_KEEP_*`, `BACKUP_MAX_MB`), with shorter windows under disk pressure and an emergency cleanup at `MIN_FREE_DISK_MB_CRIT` |
 | CPU | one vCPU is enough; background work runs at `Nice=10` |
 | Network | outbound HTTPS only (PyPI at install time, Yahoo, NSE, GDELT/RSS, Telegram, optional S3), UDP 123 for NTP |
 | Time | install about 5 minutes; bootstrap 10-60 minutes |
@@ -224,8 +280,8 @@ pulls and verifies**:
 |------|---------|
 | `/opt/monster-ai` | code (root-owned, read-only to the service), `.venv`, `.requirements.sha256`, `.committed` (the release started successfully; only a committed release may replace `.prev`, so a killed installer never loses the last good release) |
 | `/opt/monster-ai.prev` / `.failed` | previous release (rollback) / last failed release (diagnostics) |
-| `/var/lib/monster-ai` | state: `monster.db`, `models/`, `cache/`, `backups/`, `tmp/`, `locks/` (`monster:monster 0750`) |
-| `/var/log/monster-ai` | application logs (`monster:monster 0750`); `/var/log/monster-ai-install.log` is the installer transcript |
+| `/var/lib/monster-ai` | state: `monster.db`, `models/`, `cache/`, `backups/`, `tmp/`, `locks/` (job locks and `daemon.heartbeat`), `diag/` (diagnostic bundles), optional `calendar_overrides.json` (`monster:monster 0750`) |
+| `/var/log/monster-ai` | application logs: daily `<role>-YYYY-MM-DD.log`, `errors-YYYY-MM-DD.log`, `fault-<role>.log` (`monster:monster 0750`); `/var/log/monster-ai-install.log` is the installer transcript |
 | `/etc/monster-ai/monster.env` | configuration and secrets (`root:monster 0640`) |
 | `/etc/systemd/system/monster-ai*.service`, `*.timer` | the units |
 | `/usr/local/bin/monster-ai` | wrapper: `sudo monster-ai <command>` runs `python -m app.cli` as `monster` with the production environment |
