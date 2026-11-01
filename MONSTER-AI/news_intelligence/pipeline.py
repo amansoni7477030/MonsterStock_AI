@@ -35,6 +35,7 @@ from event_graph.propagation import GraphImpactEngine, StockImpact
 from event_graph.repository import GraphRepository
 from ingestion.adjust import adjusted_bars
 from news_intelligence import features as feat
+from news_intelligence.context import MAX_MENTIONED, NewsContext, WebBrief
 from news_intelligence.dedup import (
     MAX_ORIGINS,
     Clusterer,
@@ -46,7 +47,6 @@ from news_intelligence.dedup import (
     Signature,
     event_confidence,
 )
-from news_intelligence.context import MAX_MENTIONED, NewsContext, WebBrief
 from news_intelligence.entities import Entity, EntityResolver
 from news_intelligence.events import (
     EVENT_TYPES,
@@ -701,7 +701,10 @@ class NewsPipeline:
         )
         if analysed is None:
             return None
-        draft, entities, _scan, method, quote, event_time, _brief = analysed  # a filing is first-hand: it never gets a web check (disseminated or seen).astimezone(IST).date().isoformat()
+        draft, entities, _scan, method, quote, event_time, _brief = analysed  # a filing is first-hand: it never gets a web check
+        if seen is None:
+            raise ValueError("first_seen_at is not a timestamp")
+        day = (disseminated or seen).astimezone(IST).date().isoformat()
         filing_key = f"{symbol or row['company'] or 'NA'}:{draft.event_type}:{day}"
         sig = Signature.build(title, body)
         primary = symbol or _primary_id(entities)
@@ -729,6 +732,7 @@ class NewsPipeline:
             "title": p.title[:200], "url": p.url, "published_at": p.published_iso, "quote": p.quote,
             "fkey": p.item.filing_key, "sc": source_class_of(p.source_kind),
             "rum": True if p.item.is_rumour else None, "den": True if p.item.is_denial else None,
+            "web": p.extra.get("web"),  # what the web check found (audit trail of a rumour or refutation flag)
             # the event time is unknown (rules only, or an unverified LLM claim): the publication time is an upper bound
             "event_time_bound": p.published_iso if p.event_time_iso is None else None,
         }
@@ -941,7 +945,7 @@ class NewsPipeline:
         days = int(retention_days if retention_days is not None else self.settings.news_retention_days)
         now = self.clock.now()
         cutoff = iso(now - timedelta(days=days))
-        out = {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0}
+        out = {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0, "web_cache": 0}
         for table, column, extra in (("news_raw", "article_id", ""), ("filings", "filing_id", " AND processed <> 0")):
             with self._bulk_delete():
                 while True:
@@ -971,6 +975,7 @@ class NewsPipeline:
             out["signatures"] = max(removed.rowcount, 0)
         out["llm_cache"] = self.llm.prune_cache() if self.llm is not None else prune_llm_cache(self.store, now)
         out["jev_cache"] = self.jev.prune_cache() if self.jev is not None else prune_jev_cache(self.store, now)
+        out["web_cache"] = self.web.prune_cache() if self.web is not None else prune_web_cache(self.store, now)
         return out
 
     # ===================================================================================== queries

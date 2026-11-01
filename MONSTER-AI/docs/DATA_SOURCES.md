@@ -14,6 +14,7 @@ Generated from `ingestion/registry.py` (run `python scripts/generate_docs.py`). 
 | `rss_news` | important | Publisher RSS/Atom feeds (data/seeds/feeds.json) | gdelt |
 | `gdelt` | optional | GDELT Project DOC 2.0 API | rss_news |
 | `llm_extraction` | optional | Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API | rules |
+| `llm_web` | optional | Groq built-in browser_search tool (web search run on Groq's servers) on a gpt-oss model | llm_extraction |
 | `jev_judgment` | optional | TypeSafe AI - Jev (System One decision model) | rules |
 
 ## Transport and request strategy
@@ -156,6 +157,19 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Licensing:** Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.
 - **Failure behaviour:** Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health
 - **Backup source:** rules
+
+## `llm_web` - Groq built-in browser_search tool (web search run on Groq's servers) on a gpt-oss model
+
+- **Endpoint:** `https://api.groq.com/openai/v1/chat/completions with tools=[{"type": "browser_search"}] (GROQ_API_KEY)`
+- **Coverage:** Web check of one unconfirmed-looking company news item: do independent outlets report the same facts, did anyone deny or correct it, is it old news
+- **Timestamp meaning:** n/a
+- **Update frequency:** On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job, 30% of the LLM time box, 1-day result cache)
+- **History depth:** Live web only: never used for backtests or replays
+- **Rate limits:** Needs a plan whose per-minute token limit exceeds one web search (the free tier's 8k does not): HTTP 413 or a rejected tool backs the check off for 6 h
+- **Transport and request strategy:** not scraped: the same Groq chat endpoint, with `tools=[{"type": "browser_search"}]` and `tool_choice=required` on a gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is validated field by field before it reaches the extraction or Jev.
+- **Licensing:** Governed by Groq's terms (built-in tools are not HIPAA covered and are not available on regional endpoints); only public news text is sent - never keys, positions or other data.
+- **Failure behaviour:** The item is extracted and judged without the web check; repeated failures appear in source health
+- **Backup source:** llm_extraction
 
 ## `jev_judgment` - TypeSafe AI - Jev (System One decision model)
 
