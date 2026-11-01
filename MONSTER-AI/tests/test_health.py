@@ -102,6 +102,17 @@ def test_stale_bars_and_models_and_backup(env):
     assert crit and crit[0].level == "crit"
 
 
+def test_an_unencrypted_backup_is_flagged_only_when_encryption_was_requested(env):
+    env.store.kv_set_json("backup.last", {"at": "2026-11-02T04:00:00Z", "encrypted": False})
+    assert "backup_unencrypted" not in codes(evaluate_health(env.store, env.settings, env.clock))  # no passphrase: plain is intended
+    settings = env.settings.__class__(**{**env.settings.__dict__, "backup_passphrase": "secret-pass"})
+    report = evaluate_health(env.store, settings, env.clock)
+    problem = next(p for p in report.problems if p.code == "backup_unencrypted")
+    assert problem.level == "warn" and "secret-pass" not in problem.message
+    env.store.kv_set_json("backup.last", {"at": "2026-11-02T04:00:00Z", "encrypted": True})
+    assert "backup_unencrypted" not in codes(evaluate_health(env.store, settings, env.clock))
+
+
 def test_failing_source_and_calibration_drift(env):
     from ingestion.registry import register_all
 

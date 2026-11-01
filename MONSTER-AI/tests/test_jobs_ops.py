@@ -45,6 +45,32 @@ def test_backup_failure_to_verify_is_a_failed_job(env, monkeypatch):
     assert jobs.backup(make_job_context(env.settings, env.store, env.clock)).status == "failed"
 
 
+def test_an_unencrypted_backup_is_never_uploaded_when_encryption_was_requested(env, monkeypatch):
+    from database import backup as backup_module
+
+    def no_gpg(*_a, **_k):
+        raise OSError("gpg missing")
+
+    monkeypatch.setattr(backup_module.subprocess, "run", no_gpg)
+    uploads = []
+    monkeypatch.setattr(jobs, "_upload_backup", lambda ctx, path: uploads.append(path) or "backups/x")
+    settings = env.settings.__class__(**{**env.settings.__dict__, "backup_passphrase": "secret-pass"})
+    result = jobs.backup(make_job_context(settings, env.store, env.clock))
+    assert result.status == "success" and result.metrics["encrypted"] is False and result.metrics["upload_skipped"] == "unencrypted"
+    assert uploads == [] and "remote" not in result.metrics  # the plaintext copy stays on the server
+    alert = next(a for a in env.store.pending_alerts(10) if a["code"] == "backup_encryption_failed")
+    assert alert["level"] == "error" and "UNENCRYPTED" in alert["message"] and "secret-pass" not in alert["message"]
+    assert list(Path(settings.backup_dir).glob("monster-*.db.gz"))  # a restore point exists
+
+
+def test_a_plain_backup_without_a_passphrase_is_uploaded_as_before(env, monkeypatch):
+    uploads = []
+    monkeypatch.setattr(jobs, "_upload_backup", lambda ctx, path: uploads.append(path) or "backups/x")
+    result = jobs.backup(make_job_context(env.settings, env.store, env.clock))
+    assert result.status == "success" and len(uploads) == 1 and result.metrics["remote"] == "backups/x"
+    assert not [a for a in env.store.pending_alerts(10) if a["code"] == "backup_encryption_failed"]
+
+
 # --------------------------------------------------------------------------------------------- housekeeping
 def test_housekeeping_cleans_up_and_reports_disk_state(env):
     env.store.add_alert("warning", "old", "stale alert")

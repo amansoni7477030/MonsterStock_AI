@@ -24,7 +24,7 @@ def trading_days(count: int, start: str = "2026-06-01") -> list[str]:
 @dataclass
 class Pick:
     symbol: str
-    p: float = 0.5  # frozen P(range >= primary threshold)
+    p: float = 0.5  # frozen P(range > primary threshold)
     q10: float = 1.5
     q50: float = 3.0
     q90: float = 6.0

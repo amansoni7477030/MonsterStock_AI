@@ -134,9 +134,34 @@ def evaluate_day(store: Store, settings: Settings, trade_date: str) -> EveningSu
         n=len(hits), model_hit_rate=float(np.mean(hits)) if hits else None, model_hit_ci=(lo, hi) if hits else None,
         baseline_hit_rates=baseline_rates, mean_range_pct=float(model["range_pct"].mean()),
         baseline_mean_range_pct=baseline_range, rolling=rolling,
-        calibration_note=_calibration_note(rolling), provisional=not validated, missing_symbols=missing + meta_missing,
+        calibration_note=_calibration_note(rolling), data_quality_notes=_quality_notes(store, trade_date, stage, rows),
+        provisional=not validated, missing_symbols=missing + meta_missing,
         live_record=_live_record(store, settings, trade_date),
     )
+
+
+def _quality_notes(store: Store, trade_date: str, stage: str, rows: list[EveningRow]) -> list[str]:
+    """Why a day's numbers deserve care: how the day was scored, how good the data behind the frozen snapshot was, and which
+    outcomes are still provisional. A failure here only drops the notes."""
+    notes: list[str] = []
+    try:
+        if stage == "pre":
+            notes.append("scored on the preliminary snapshot: no final report was frozen that day")
+        scored = [r for r in rows if r.range_pct is not None]
+        provisional = [r for r in scored if not r.validated]
+        if provisional:
+            notes.append(f"{len(provisional)} of {len(scored)} outcomes come from provisional vendor bars "
+                         "(the official file replaces them when it is published)")
+        snapshot = store.effective_snapshot(trade_date, stage) or {}
+        quality = snapshot.get("data_quality") or {}
+        if quality.get("status") == "degraded":
+            reasons = "; ".join(str(m) for m in (quality.get("messages") or [])[:3])
+            notes.append("the snapshot was frozen with degraded data" + (f": {reasons}" if reasons else ""))
+        if ((snapshot.get("payload") or {}).get("meta") or {}).get("late"):
+            notes.append("the report was frozen after the delivery deadline and was not sent on time")
+    except Exception:  # noqa: BLE001 - notes enrich the report, they never cost it
+        log.warning("data-quality notes for %s failed", trade_date, exc_info=True)
+    return notes
 
 
 def _live_record(store: Store, settings: Settings, trade_date: str) -> dict[str, list[dict[str, Any]]]:

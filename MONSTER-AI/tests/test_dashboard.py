@@ -634,7 +634,7 @@ def test_html_page_escapes_every_dynamic_value(client):
 def test_html_page_content(client):
     html = client.get("/").text
     for expected in ("MONSTER AI", "SHADOW", "not trading advice", "never places orders", "Latest candidates (2026-11-02)",
-                     "Final scan - top 3", "Pre-scan - top 1", "P(range &gt;= 3%)", "47.0%", "headline for BBB",
+                     "Final scan - top 3", "Pre-scan - top 1", "P(range &gt; 3%)", "47.0%", "headline for BBB",
                      "m-final-1", "Feed health", "yahoo_daily", "failing", "Recent jobs", "Performance",
                      "Validated outcomes: 1 over 1 trading day(s)", "top5_hit_rate", "n &lt; 30", "tier:STRONG",
                      "22.0% - 61.0%", "regime:high_vol", "rolling_30d (as of 2026-11-02)"):

@@ -98,6 +98,36 @@ def test_vendor_outcomes_are_provisional_until_the_official_file_arrives(env):
     assert ev.evaluate_day(env.store, env.settings, "2026-11-02").provisional is False
 
 
+def test_the_evening_summary_explains_which_numbers_deserve_care(env):
+    frozen_prelim(env)
+    add_monday_bars(env, source="yahoo", rank=1)
+    ev.collect_outcomes(env.store, env.settings, "2026-11-02")
+    notes = ev.evaluate_day(env.store, env.settings, "2026-11-02").data_quality_notes
+    assert any("preliminary snapshot" in n for n in notes)
+    assert any(n.startswith("5 of 5 outcomes come from provisional vendor bars") for n in notes)
+
+    add_monday_bars(env)  # the official file arrives: the provisional note goes away
+    ev.collect_outcomes(env.store, env.settings, "2026-11-02")
+    after = ev.evaluate_day(env.store, env.settings, "2026-11-02").data_quality_notes
+    assert not any("provisional" in n for n in after) and any("preliminary snapshot" in n for n in after)
+
+
+def test_a_snapshot_frozen_on_degraded_data_is_said_to_be(env, monkeypatch):
+    frozen_prelim(env)
+    add_monday_bars(env)
+    ev.collect_outcomes(env.store, env.settings, "2026-11-02")
+    real = env.store.effective_snapshot
+    degraded = {"status": "degraded", "messages": ["GIFT Nifty: no quote", "News feeds: never collected", "x", "dropped fourth"]}
+
+    def effective(day, stage):  # snapshots are immutable (a trigger forbids UPDATE), so the fake sits at the accessor
+        snap = real(day, stage)
+        return {**snap, "data_quality": degraded} if snap else snap
+
+    monkeypatch.setattr(env.store, "effective_snapshot", effective)
+    notes = ev.evaluate_day(env.store, env.settings, "2026-11-02").data_quality_notes
+    assert any("degraded data: GIFT Nifty: no quote; News feeds: never collected; x" in n and "dropped" not in n for n in notes)
+
+
 def test_evaluate_job_scores_persists_metrics_and_sends_one_evening_report(env):
     ctx = frozen_prelim(env)
     add_monday_bars(env)

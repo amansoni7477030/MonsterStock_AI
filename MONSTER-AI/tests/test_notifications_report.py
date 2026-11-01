@@ -115,7 +115,7 @@ def test_final_report_layout_golden_lines():
         "<b>MONSTER AI | NSE LARGE-MOVE SCAN</b>",
         "Date: 2026-11-02 (Mon) | Snapshot: 2026-11-02 09:12:00 IST | Stage: FINAL | Model: fake-model-0.1 [VALIDATED]",
         "<b>#1 FAKECO - STRONG</b>  Fake Company Ltd | Fake Sector | F&amp;O",
-        "P(range &gt;= 3%): 62% (calibrated)   [1%: 91% | 2%: 78% | 3%: 62% | 5%: 31%]",
+        "P(range &gt; 3%): 62% (calibrated)   [1%: 91% | 2%: 78% | 3%: 62% | 5%: 31%]",
         "P(unusual for this stock): 40%",
         "Expected intraday range: 3.4% (80% interval 2.1-5.6%)   Max excursion from open (q50/q90): 2.2% / 3.8%",
         "Direction (secondary, not a trade signal): P(up close) 52% / P(down close) 48%",
@@ -385,7 +385,7 @@ def test_missing_and_non_finite_values_render_as_n_a_never_as_numbers():
     got = lines(messages)
     for line in (
         "<b>#1 FAKECO - STRONG</b>",
-        "P(range &gt;= 3%): n/a (calibrated)   [1%: n/a | 3%: n/a]",
+        "P(range &gt; 3%): n/a (calibrated)   [1%: n/a | 3%: n/a]",
         "P(unusual for this stock): n/a",
         "Expected intraday range: n/a (80% interval n/a)   Max excursion from open (q50/q90): n/a / n/a",
         "Direction (secondary, not a trade signal): P(up close) n/a / P(down close) n/a",
@@ -413,7 +413,7 @@ def test_completely_empty_candidate_and_context_still_render():
     assert_telegram_safe(messages)
     text = "\n".join(messages)
     assert "<b>#1 UNKNOWN - n/a</b>" in text and "Snapshot: n/a" in text
-    assert "P(range &gt;= n/a): n/a (calibrated)" in text and not _BAD_NUMBER.search(text)
+    assert "P(range &gt; n/a): n/a (calibrated)" in text and not _BAD_NUMBER.search(text)
     odd = "\n".join(render_final_report(make_ctx(trade_date="<b>bad</b>-and-long")))
     assert "Date: &lt;b&gt;bad&lt;/b&gt; |" in odd and "-and-long" not in odd
     assert "Date: 2026-11-02 (Mon) |" in "\n".join(render_final_report(make_ctx(trade_date="2026-11-02T00:00:00")))
@@ -450,7 +450,7 @@ def test_non_integer_thresholds_sort_numerically_and_pick_the_primary():
     p = {"hit_10": 0.05, "hit_2.5": 0.55, "hit_1": 0.9, "hit_2_5": 0.5, "unusual": 0.3, "up": 0.5, "down": 0.5}
     cand = make_candidate(p=p, primary_threshold=2.5)
     text = "\n".join(render_final_report(make_ctx([cand])))
-    assert "P(range &gt;= 2.5%):" in text and "[1%: 90% | 2.5%: 5" in text and "| 10%: 5%]" in text
+    assert "P(range &gt; 2.5%):" in text and "[1%: 90% | 2.5%: 5" in text and "| 10%: 5%]" in text
 
 
 def test_range_and_cost_formatting_edge_cases():
@@ -604,7 +604,7 @@ def test_evening_report_golden_lines_and_table():
     got = lines(messages)
     for line in (
         "<b>MONSTER AI | EVENING EVALUATION</b>",
-        "Date: 2026-11-02 (Mon) | Stage: FINAL | Model: fake-model-0.1 | Target: intraday range &gt;= 3% of open",
+        "Date: 2026-11-02 (Mon) | Stage: FINAL | Model: fake-model-0.1 | Target: intraday range &gt; 3% of open",
         "<b>PROVISIONAL: vendor data, official file pending</b>",
         "Top-3 hit rate: 1/2 (CI 9%-91%)",
         "Baseline hit rates: atr 40%, random 20%",
@@ -640,7 +640,7 @@ def test_evening_report_validated_flag_and_missing_statistics():
         "<b>PROVISIONAL: vendor data, official file pending</b>",
     ):
         assert line in got, line
-    assert "Stage: PRELIMINARY" in "\n".join(got) and "Target: intraday range &gt;= 2.5% of open" in "\n".join(got)
+    assert "Stage: PRELIMINARY" in "\n".join(got) and "Target: intraday range &gt; 2.5% of open" in "\n".join(got)
     assert not any(ln.startswith(("Calibration", "Data-quality", "Missing symbols")) for ln in got)
 
 

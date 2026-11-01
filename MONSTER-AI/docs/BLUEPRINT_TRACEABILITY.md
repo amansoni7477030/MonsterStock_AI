@@ -36,9 +36,9 @@ Counts per blueprint section, taken from the tables below. A ⚠️ row may be a
 | §15 | Backtesting and research controls | 1 | 11 | 10 | 0 | 22 |
 | §16 | Production architecture for 1 GB RAM / 8 GB storage | 10 | 4 | 3 | 2 | 19 |
 | §17 | Daily automation schedule | 6 | 4 | 7 | 0 | 17 |
-| §18 | Telegram report specification | 11 | 0 | 1 | 0 | 12 |
+| §18 | Telegram report specification | 10 | 1 | 1 | 0 | 12 |
 | §19 | End-of-day feedback and model governance | 4 | 5 | 4 | 0 | 13 |
-| §20 | Failure handling and security | 5 | 5 | 4 | 0 | 14 |
+| §20 | Failure handling and security | 4 | 6 | 4 | 0 | 14 |
 | §21 | Repository / codebase layout | 2 | 0 | 6 | 1 | 9 |
 | §22 | Phased implementation roadmap | 4 | 2 | 6 | 0 | 12 |
 | §23 | Acceptance criteria and definition of done | 4 | 4 | 6 | 0 | 14 |
@@ -46,7 +46,7 @@ Counts per blueprint section, taken from the tables below. A ⚠️ row may be a
 | §25 | Final operating principle | 0 | 0 | 2 | 0 | 2 |
 | Appendix A | Key formulas and definitions | 3 | 2 | 0 | 1 | 6 |
 | Appendix B | Initial operational checklist | 8 | 1 | 2 | 1 | 12 |
-| **Total** | | **137** | **57** | **144** | **14** | **352** |
+| **Total** | | **135** | **59** | **144** | **14** | **352** |
 
 ## §1 Product objective and scope
 
@@ -79,7 +79,7 @@ Counts per blueprint section, taken from the tables below. A ⚠️ row may be a
 | 2.11 | Market regime engine: trend, risk-on/off, volatility, event regime | [regime.py](../features/regime.py) `market_features`, `describe` | `test_features_leakage.py`, `test_features_calendar_sector.py` | ⚠️ | The "event" regime is F&O expiry share only; macro-event days are not a regime input |
 | 2.12 | Similar-day engine, meta-ranker, gates, top-5, Telegram/dashboard, retraining worker | [similar_day.py](../features/similar_day.py); [ranker.py](../ranking/ranker.py); [scan.py](../automation/scan.py); [service.py](../notifications/service.py); [app.py](../dashboard/app.py); [train.yml](../.github/workflows/train.yml) | `test_features_similar_day.py`, `test_ranker.py`, `test_scan.py`, `test_dashboard.py`, `test_external_models.py` | ✅ | Dashboard is optional and off by default |
 | 2.13 | Specialist models: news, event, global, technical, F&O, volatility, regime | [specialists.py](../models/specialists.py) `SPECIALISTS`; [training.py](../models/training.py) `_fit_specialists` | `test_training_pipeline.py`, `test_uncertainty.py` | ⚠️ | Built: technical, global, regime, F&O, pre-market, events (results calendar only), direction. Not built: a news model (news features are not model inputs) and a separate volatility specialist (volatility sits in the technical family) |
-| 2.14 | End-of-day evaluation: actual range, calibration, attribution, monitoring | [evaluate.py](../backtesting/evaluate.py) `collect_outcomes`, `evaluate_day`, `persist_metrics`; [live_record.py](../backtesting/live_record.py) `build`; [health.py](../automation/health.py) `_check_performance` | `test_jobs_eval.py`, `test_effective_evaluation.py`, `test_live_record.py`, `test_health.py` | ⚠️ | Actual ranges, calibration, a rolling live record, slices and drift alerts exist (see §15 and §19); there is no post-hoc attribution, and the evening summary's `data_quality_notes` is never filled |
+| 2.14 | End-of-day evaluation: actual range, calibration, attribution, monitoring | [evaluate.py](../backtesting/evaluate.py) `collect_outcomes`, `evaluate_day`, `persist_metrics`; [live_record.py](../backtesting/live_record.py) `build`; [health.py](../automation/health.py) `_check_performance` | `test_jobs_eval.py`, `test_effective_evaluation.py`, `test_live_record.py`, `test_health.py` | ⚠️ | Actual ranges, calibration, a rolling live record, slices and drift alerts exist (see §15 and §19); there is no post-hoc attribution, and the evening summary's data-quality notes (preliminary-only scoring, provisional outcomes, degraded or late snapshots) were added after the audit |
 | 2.15 | Each engine documents input schema, output schema, timestamp policy, failure behaviour and tests | [schema.py](../features/schema.py); [registry.py](../ingestion/registry.py); module docstrings | `test_utils.py`, `test_docs.py` | ⚠️ | Contracts live in module docstrings, the feature schema hash and the generated source register; there is no per-engine contract table |
 
 ## §3 Data acquisition strategy
@@ -92,7 +92,7 @@ Counts per blueprint section, taken from the tables below. A ⚠️ row may be a
 | 3.4 | Exchange filings are primary evidence; keep timestamp and document | [news_sources.py](../ingestion/news_sources.py) `collect_filings`; [nse.py](../ingestion/nse.py) `parse_announcements`; [jobs.py](../automation/jobs.py) `filings_window` | `test_news_sources.py`, `test_jobs_ingest.py` | ⚠️ | Dissemination time is kept (IST made explicit); the document itself is not (URL and up to 2000 characters of text). NSE only. Window bug fixed: Monday no longer misses Friday's filings. Last collection slot is 08:10 |
 | 3.5 | Global news: GDELT for discovery, publisher RSS | [news_sources.py](../ingestion/news_sources.py) `collect_rss`, `collect_gdelt`; [feeds.json](../data/seeds/feeds.json) | `test_news_sources.py`, `test_bulk_fetch.py` | ✅ | GDELT `published_at` is its `seendate` (discovery time); RSS uses conditional GET |
 | 3.6 | Macro: store release time | [macro.py](../ingestion/macro.py) `FredClient.collect` | `test_macro.py` | ⚠️ | `realtime_start` is a date, not a clock time; FRED needs an API key |
-| 3.7 | Macro: observation period and first-release values | `FredClient.collect` (`output_type=4`); table `macro_observations` | `test_macro.py` | ⚠️ | First-release values are stored, but nothing reads `macro_observations` or `econ_calendar`; the register's "event-day flags default to 0" has no code behind it |
+| 3.7 | Macro: observation period and first-release values | `FredClient.collect` (`output_type=4`); table `macro_observations` | `test_macro.py` | ⚠️ | First-release values are stored, but nothing reads `macro_observations` or `econ_calendar`; the source register now says so instead of promising event-day flags |
 | 3.8 | Macro: revisions | `FredClient.collect` | `test_macro.py` | ⚠️ | Not built: only the initial release is requested, later revisions are not stored |
 | 3.9 | Global market prices: do not assume a research feed is production-grade | [registry.py](../ingestion/registry.py) `UNLICENSED`; [series.py](../ingestion/series.py) | `test_docs.py` | ⚠️ | The limitation is documented and flagged, but Yahoo is the only source of the 33 global series and no fallback exists |
 | 3.10 | Commodities, FX, bonds: align close times and time zones | [series.py](../ingestion/series.py) `SeriesSpec.available_at`; [clock.py](../app/clock.py) `local_close_utc` | `test_clock.py`, `test_ingestion_parsers.py`, `test_features_leakage.py` | ✅ | Per-series zone, close time and publication lag; DST handled with `zoneinfo` |
@@ -291,8 +291,8 @@ Counts per blueprint section, taken from the tables below. A ⚠️ row may be a
 | 13.12 | Expected range quantiles | `_meta_targets`; `train_stage` (`quantiles`, `range_80pct_interval_coverage`) | `test_training_pipeline.py`, `test_walkforward_render.py` | ✅ | Interval coverage and pinball loss are reported on the holdout; coverage is not a promotion gate |
 | 13.13 | Secondary labels: direction, P(up), P(down) | `make_labels` (`y_up`, `y_dir`); `SPECIALISTS` (`direction`); [inference.py](../models/inference.py) `ModelBundle.predict` | `test_training_pipeline.py` | ✅ | Calibrated, shown as secondary |
 | 13.14 | Secondary labels: maximum favourable and adverse excursion from a defined entry | none | none | ⚠️ | Not built: only the direction-agnostic maximum excursion exists |
-| 13.15 | Define the target precisely and consistently | [labels.py](../features/labels.py) `make_labels`; [evaluate.py](../backtesting/evaluate.py) `outcome_metrics`; [store.py](../database/store.py) `realised_ranges` | `test_features_leakage.py`, `test_jobs_eval.py`, `test_live_record.py` | ⚠️ | Range, excursion and direction formulas exist in three places (labels, outcome metrics, a SQL expression) and agree, but no single shared function enforces it. Labels use "range >" while the report text says "range >=" |
-| 13.16 | Executable entry/exit research with spread, slippage, stops | [costs.py](../ranking/costs.py) (cost estimate only) | none | ⚠️ | Not built: no execution simulator; the `labels.py` docstring still points at a `backtesting.execution` module that does not exist |
+| 13.15 | Define the target precisely and consistently | [labels.py](../features/labels.py) `make_labels`; [evaluate.py](../backtesting/evaluate.py) `outcome_metrics`; [store.py](../database/store.py) `realised_ranges` | `test_features_leakage.py`, `test_jobs_eval.py`, `test_live_record.py` | ⚠️ | Range, excursion and direction formulas exist in three places (labels, outcome metrics, a SQL expression) and agree, but no single shared function enforces it. Labels, evaluation, the report and the dashboard all say "range >" (the report and the dashboard said "range >=" before the audit fix) |
+| 13.16 | Executable entry/exit research with spread, slippage, stops | [costs.py](../ranking/costs.py) (cost estimate only) | none | ⚠️ | Not built: no execution simulator (a stale docstring reference to a `backtesting.execution` module was corrected) |
 
 ## §14 Meta-ranking, uncertainty and abstention
 
@@ -379,7 +379,7 @@ The deployment rows are validated statically on a Windows machine (structure tes
 | 17.8 | Before 09:15: send the report only if cutoff and data checks pass | [service.py](../notifications/service.py) `send_report`; `run_scan`; [freshness.py](../ingestion/freshness.py) | `test_scan.py`, `test_notifications_service.py` | ✅ | A late report is withheld and recorded; a blocked scan sends a failure notice instead of a report |
 | 17.9 | During the session: no rewriting of the pre-open prediction | triggers in [0001_init.sql](../database/migrations/0001_init.sql) | `test_database.py` | ✅ | No in-session monitoring job exists (the blueprint marks it optional); snapshots and predictions are write-protected |
 | 17.10 | After 15:30: collect official outcomes and calculate labels | [schedule.py](../automation/schedule.py) `SCHEDULE` (`ingest_eod` 17:45); [evaluate.py](../backtesting/evaluate.py) `collect_outcomes` | `test_jobs_ingest.py`, `test_jobs_eval.py` | ⚠️ | Runs from 17:45 because NSE publishes the official file in the evening; outcomes are provisional (vendor bars) until it arrives and are upgraded to official ones during housekeeping |
-| 17.11 | 16:00 onward: evaluation, attribution, calibration, data quality | `evaluate` (18:15); [report.py](../notifications/report.py) `render_evening_report`; [evaluate.py](../backtesting/evaluate.py) `evaluate_day`, `persist_metrics` | `test_jobs_eval.py`, `test_evening_live_record.py`, `test_notifications_report.py` | ⚠️ | Evaluation, calibration and the live record run at 18:15; there is no attribution and the evening summary's data-quality notes are never populated |
+| 17.11 | 16:00 onward: evaluation, attribution, calibration, data quality | `evaluate` (18:15); [report.py](../notifications/report.py) `render_evening_report`; [evaluate.py](../backtesting/evaluate.py) `evaluate_day`, `persist_metrics` | `test_jobs_eval.py`, `test_evening_live_record.py`, `test_notifications_report.py` | ⚠️ | Evaluation, calibration and the live record run at 18:15; there is no attribution; the evening summary's data-quality notes are populated since the audit (preliminary-only scoring, provisional outcomes, degraded or late snapshots) |
 | 17.12 | Weekly or monthly external training; deploy only if improved | `train` (Saturday 02:00); [registry.py](../models/registry.py) `_decide`; [train.yml](../.github/workflows/train.yml) | `test_registry_governance.py`, `test_external_models.py`, `test_schedule.py` | ✅ | Candidates activate only if they match or beat the champion's gate metrics |
 | 17.13 | Exchange holidays through an exchange calendar | [calendar.py](../automation/calendar.py) `ExchangeCalendar`, `rule_holidays`, `refresh_calendar`, `infer_holidays_from_bars`; [scan.py](../automation/scan.py) `suspected_holiday` | `test_calendar_any_year.py`, `test_calendar_freshness.py` | 🔧 | Audit probe: 2027-01-26 counted as a trading day once the 2026 seed ended. Now layered: official list (seed plus NSE API), rules for fixed holidays and Good Friday, inferred closures, operator overrides; health warns 21 days before the official list ends. Lunar holidays are never guessed; a final-scan live check covers them |
 | 17.14 | Special sessions and early closes | [calendar.py](../automation/calendar.py) `SessionInfo`, `seed_calendar`; [special_sessions.json](../data/seeds/special_sessions.json) | `test_calendar_any_year.py`, `test_calendar_freshness.py` | ⚠️ | An empty override template ships and operators can add sessions or closures; session times do not drive scan windows and Muhurat is treated as a holiday |
@@ -393,7 +393,7 @@ The deployment rows are validated statically on a Windows machine (structure tes
 |---|---|---|---|---|---|
 | 18.1 | Header: date, snapshot timestamp, model version (never optional) | [report.py](../notifications/report.py) `_render_report` | `test_notifications_report.py` | ✅ | A report without a model version is refused, so illustrative output cannot be sent as live |
 | 18.2 | Candidate line with STRONG, MODERATE or WATCH; weak labelled weak | `_tier_label`, `WEAK_LABEL`; [ranker.py](../ranking/ranker.py) `decide_tier` | `test_notifications_report.py`, `test_ranker.py` | ✅ | Capped tiers are shown as WATCH |
-| 18.3 | P(range > threshold), calibrated; heuristic output flagged | `_candidate_block`; `HEURISTIC_LABEL` | `test_report_labels.py`, `test_notifications_report.py` | ✅ | The text says "range >=" while labels and training use "range >" (see 13.15) |
+| 18.3 | P(range > threshold), calibrated; heuristic output flagged | `_candidate_block`; `HEURISTIC_LABEL` | `test_report_labels.py`, `test_notifications_report.py` | 🔧 | The text and the labels now agree on "range >" (the text said "range >=" before the audit fix; see 13.15) |
 | 18.4 | Expected intraday range with an interval | `_candidate_block` | `test_notifications_report.py` | ✅ | Median plus an 80 % interval and the maximum-excursion quantiles |
 | 18.5 | P(up close) and P(down close), separate from the range probability | `_candidate_block`; `DISCLAIMER` | `test_notifications_report.py` | ✅ | Labelled "secondary, not a trade signal" |
 | 18.6 | Main catalyst with event and source links | `_catalyst_line`, `_provenance`; [types.py](../ranking/types.py) `Catalyst`; [intel.py](../automation/intel.py) `Intel.catalysts` | `test_notifications_report.py`, `test_ranking_types_fields.py` | ✅ | Headline, source, link and a provenance tag such as `[RUMOUR - unconfirmed; social media; 2 independent sources; 1 conflicting]`; `Catalyst.event_id` is frozen with the prediction |
@@ -433,12 +433,12 @@ The deployment rows are validated statically on a Windows machine (structure tes
 | 20.5 | Telegram failure: retry, record delivery status, expose job failure | [service.py](../notifications/service.py) `_deliver`; [telegram.py](../notifications/telegram.py) | `test_notifications_service.py`, `test_notifications_telegram.py`, `test_health.py` | ✅ | `deliveries` ledger; failure raises an alert and a failed job |
 | 20.6 | Process crash: restart, alert, preserve the last successful run | [monster-ai.service](../deployment/systemd/monster-ai.service); [scheduler.py](../automation/scheduler.py) `_register_start`, `_after_exit`; [health.py](../automation/health.py) `_check_heartbeat` | `test_scheduler.py`, `test_scheduler_details.py`, `test_health.py` | 🔧 | Audit: a daemon crash was silent because `OnFailure=` cannot fire with `Restart=always`. Now the restarted daemon alerts `daemon_restarted`; the heartbeat is also written to a file independent of the database lock |
 | 20.7 | Database issue: stop writes safely, restore a verified backup, alert | [health.py](../automation/health.py) `_check_database`; [backup.py](../database/backup.py) `restore_latest_valid`; [cli.py](../app/cli.py) `cmd_backup` | `test_health.py`, `test_backup.py`, `test_cli.py` | ⚠️ | Corruption is detected and alerted; restore is a manual command and there is no automatic write freeze |
-| 20.8 | Invalid model artifact: reject it and continue with the last approved version | [registry.py](../models/registry.py) `active_bundle`, `rollback`, `verify_record`; [signing.py](../models/signing.py) | `test_training_pipeline.py`, `test_registry_governance.py`, `test_signing.py` | ✅ | Falls back to the previous version, then to the baseline. A transient `OSError` while reading an artifact also retires the champion |
+| 20.8 | Invalid model artifact: reject it and continue with the last approved version | [registry.py](../models/registry.py) `active_bundle`, `rollback`, `verify_record`; [signing.py](../models/signing.py) | `test_training_pipeline.py`, `test_registry_governance.py`, `test_signing.py`, `test_feature_version_gate.py` | 🔧 | Falls back to the previous version, then to the baseline. A transient `OSError` while reading an artifact used to retire the champion for good; it now keeps the model, serves the baseline for that scan and raises `model_load_failed` (only definite damage retires a model) |
 | 20.9 | Low signal quality: abstain or label weak | [ranker.py](../ranking/ranker.py) `decide_tier` | `test_ranker.py`, `test_notifications_report.py` | ✅ | |
 | 20.10 | Disk or RAM pressure: alert, rotate logs, clean temp files, no concurrent heavy jobs | [scheduler.py](../automation/scheduler.py) `_disk_ok`, `_ram_ok`; [resources.py](../app/resources.py) `emergency_cleanup`; [retention.py](../automation/retention.py) `disk_pressure` | `test_scheduler_details.py`, `test_retention.py`, `test_jobs_ops.py`, `test_runtime_guards.py` | 🔧 | Audit: critical disk did not block heavy jobs. Now heavy jobs wait, `train` has a free-disk precheck and retention windows shrink under pressure. A heavy job waiting for RAM still holds back every other due job |
 | 20.11 | Secrets in environment or a secrets manager, never in source or logs | [config.py](../app/config.py) `Settings.redacted`; [logging_setup.py](../app/logging_setup.py) `redact`, `register_secret`; [install.sh](../deployment/install.sh) | `test_logging.py`, `test_config.py`, `test_deployment_files.py`, `test_notifications_telegram.py` | ✅ | Redaction in every log formatter and in diagnostics bundles; env file mode 0640 |
 | 20.12 | SSH keys, package updates, restricted access | [README.md](../deployment/README.md) (Security notes) | `test_deployment_files.py` | ⚠️ | An operator task: the installer does not configure key-only SSH, unattended upgrades or a firewall |
-| 20.13 | File permissions, backup encryption, no unauthenticated dashboards | [monster-ai.service](../deployment/systemd/monster-ai.service) (`UMask=0027`); [backup.py](../database/backup.py) `_gpg`; [config.py](../app/config.py) | `test_backup.py`, `test_deployment_files.py` | ⚠️ | Encryption is opt-in (`BACKUP_PASSPHRASE`); if gpg fails a plaintext backup is stored and only logged at ERROR |
+| 20.13 | File permissions, backup encryption, no unauthenticated dashboards | [monster-ai.service](../deployment/systemd/monster-ai.service) (`UMask=0027`); [backup.py](../database/backup.py) `_gpg`; [config.py](../app/config.py) | `test_backup.py`, `test_deployment_files.py`, `test_jobs_ops.py`, `test_health.py` | ⚠️ | Encryption is opt-in (`BACKUP_PASSPHRASE`); if gpg fails the local copy stays unencrypted but is no longer uploaded off-box, and `backup_encryption_failed` plus a health warning are raised (fixed after the audit) |
 | 20.14 | Dashboard not exposed without authentication | [app.py](../dashboard/app.py) `_Auth`, `run_dashboard`; [config.py](../app/config.py) `validate` | `test_dashboard.py` | ✅ | Non-loopback binding requires a token; lockout after repeated failures |
 
 ## §21 Repository / codebase layout
@@ -565,12 +565,12 @@ The deployment rows are validated statically on a Windows machine (structure tes
 - Replays read bars by trade date rather than by `received_at`; names this database never ingested and index membership history stay unknown (printed in every backtest report).
 - Event typing has gaps: China stimulus and property, PBoC, SEC enforcement, Bank of Korea, energy-supply outages and product recalls come out as `other`.
 - The holiday calendar never guesses lunar holidays; until NSE publishes a year's list the final scan confirms the day live. The shipped seed covers 2026.
-- `econ_calendar` and FRED first-release data are stored but read by nothing, although the source register says event-day flags default to 0.
-- A heavy job waiting for RAM or disk holds back every other due job, and critical jobs cannot preempt each other.
-- A transient `OSError` while reading a model artifact retires the champion; only the newest 5 versions per stage are kept; signing is HMAC with a shared key.
-- If gpg fails, a plaintext backup is stored and only logged at ERROR.
-- Dead or stale code: `MIN_NEWS_MODEL_DAYS`, `TRAINING_DOW`, `fetch_intraday`, the live option-chain reader, five unused exception types, and a `labels.py` docstring that points at a nonexistent `backtesting.execution`; the report says "range >=" while labels use "range >".
-- The evening summary's `data_quality_notes` is never filled, and there is no post-hoc attribution.
+- `econ_calendar` and FRED first-release data are stored but read by nothing (the source register now says so instead of promising event-day flags).
+- Critical jobs cannot preempt each other.
+- Only the newest 5 model versions per stage are kept; signing is HMAC with a shared key.
+- If gpg fails while `BACKUP_PASSPHRASE` is set, the local backup stays unencrypted (it is never uploaded off-box and an alert is raised).
+- Dead or stale code: `MIN_NEWS_MODEL_DAYS`, `TRAINING_DOW`, `fetch_intraday`, the live option-chain reader and five unused exception types.
+- There is no post-hoc attribution of outcomes by event type or model.
 - Live-record intervals need at least 5 evaluated days and slices at least 5 picks, so they stay empty until days accumulate.
 - Host hardening (key-only SSH, updates, firewall) is the operator's job.
 
@@ -610,12 +610,14 @@ The deployment rows are validated statically on a Windows machine (structure tes
 - The preliminary "gap" baseline was yesterday's range: `recent_range` and `gap` are separate baselines.
 - Catalysts show rumour, source class, independent sources and conflicts; GIFT Nifty appears in the regime line while fresh; ex-date names carry a report note.
 - Explainer failures were swallowed silently: logged at WARNING.
+- The report and the dashboard said "range >=" where labels and evaluation use "range >": all say "range >" now.
 
 **Evaluation**
 - Snapshot and predictions were separate commits: one transaction, with repair of an interrupted older freeze.
 - A forced re-scan double-counted picks and `rolling_summary` pooled both stages: only effective snapshots are scored, one stage per day.
 - The features hash could not be re-verified: it now covers the stored values; every snapshot freezes per-source freshness and a code stamp.
 - Intervals ignored day clustering and range-forecast error, NDCG, rank IC, median range and slices were missing or unused: day-block bootstrap and a live record in the evening report, `eval_metrics` and the dashboard.
+- The evening summary's data-quality notes were never filled: preliminary-only scoring, provisional outcomes and degraded or late snapshots are now stated.
 
 **Operations and deployment**
 - Unbounded growth of events, quotes, metrics and deliveries: `retention.py`, a data budget, a backup budget, VACUUM policy and a `storage` command.
@@ -623,6 +625,10 @@ The deployment rows are validated statically on a Windows machine (structure tes
 - A daemon crash was silent and its heartbeat shared the SQLite writer lock: heartbeat file and a `daemon_restarted` alert.
 - Critical disk did not block heavy jobs: `_disk_ok` and a `train` precheck; a daily false `stale_bars` alert was removed.
 - UTC or naive dates in bootstrap, health, universe and model stamps: IST helpers, a pinned process zone, an AST guard and a five-zone matrix test.
+- A heavy job waiting for RAM or disk held back every other due job: the scheduler now skips it and launches the first runnable job.
+- A transient I/O error while reading the active model retired the champion for good: only definite damage retires a model now; an I/O error keeps it, the baseline serves that scan and `model_load_failed` is raised.
+- A failed gpg run stored a plaintext backup that would have been uploaded off-box: it stays local, `backup_encryption_failed` is raised and health warns until it is fixed.
+- The source register promised event-day flags from the economic calendar although nothing reads it: it now says what is stored and unused.
 
 ## Keeping this document true
 

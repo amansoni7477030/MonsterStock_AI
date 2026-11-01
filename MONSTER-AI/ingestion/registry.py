@@ -113,7 +113,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         endpoint="https://api.stlouisfed.org/fred/series/observations", coverage="US rates and macro series with vintages when an API key is set",
         timestamp_meaning="observation_date + realtime_start (first-release timestamp)", update_frequency="Per release",
         history_depth="Decades", rate_limits="120 requests/minute with key", license_notes="Free with an API key; see FRED terms.",
-        failure_behavior="Optional; market-based yields come from Yahoo; revised values are never used as point-in-time history",
+        failure_behavior="Optional and informational: first-release values are stored (macro_observations) but no feature or report line reads them yet; market-based yields come from Yahoo; revised values are never used as point-in-time history",
         backup_source="yahoo_daily", criticality="optional",
     ),
     dict(
@@ -121,7 +121,8 @@ SOURCES: tuple[dict[str, Any], ...] = (
         endpoint="https://nfs.faireconomy.media/ff_calendar_thisweek.json", coverage="Scheduled macro releases with impact tags",
         timestamp_meaning="Scheduled release time with UTC offset", update_frequency="Daily", history_depth="Current week",
         rate_limits="Fetch at most a few times per day", license_notes=UNLICENSED,
-        failure_behavior="Optional: event-day regime flags default to 0", backup_source=None, criticality="optional",
+        failure_behavior="Optional and informational: the schedule is stored (econ_calendar) but no feature or report line reads it yet, so a failure changes nothing",
+        backup_source=None, criticality="optional",
     ),
     dict(
         source_id="llm_extraction", provider="Configured OpenAI-compatible LLM API", endpoint="LLM_API_BASE/chat/completions",

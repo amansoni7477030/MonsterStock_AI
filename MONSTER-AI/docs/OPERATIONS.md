@@ -117,7 +117,7 @@ Optional capabilities, all off by default:
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
 | External training | `TRAINING_MODE=external`, `MODEL_SIGNING_KEY`, `MODEL_ARTIFACT_URL` or `S3_*` |
 | Dashboard | `DASHBOARD_ENABLED=true` (+ `DASHBOARD_TOKEN` if bound beyond loopback) |
-| Macro series | `FRED_API_KEY` |
+| Macro series | `FRED_API_KEY` (stored for research; no feature reads it yet) |
 
 ## Alerts and what to do
 
@@ -142,11 +142,13 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `health_no_universe` | no instruments yet | the bootstrap has not finished: `systemctl status monster-ai-bootstrap` |
 | `price_basis_unresolved` | the exchange's previous close differs from the stored one for some stocks (a split or bonus) but the vendor has reported no split after six sessions: their history may be on the wrong price basis | check the corporate action for the named stocks; if the vendor will not fix it, `monster-ai run-job collect_india --force` after it does, or accept that these names are unreliable until then |
 | `health_no_model_<stage>` / `health_model_stale_<stage>` / `health_training_overdue` | no active model / model older than 120 days / no successful training for 14 days | `models list`; `train`; in external mode check the worker and `model_sync_failed` |
-| `model_artifact_invalid` | the active model failed its integrity check, or has another feature version; the system rolled back (or fell back to the baseline) | `models list`; retrain or `models activate` a good version; check disk health |
+| `model_artifact_invalid` | the active model failed its integrity check (missing or altered files), or has another feature version; the system rolled back (or fell back to the baseline) | `models list`; retrain or `models activate` a good version; check disk health |
+| `model_load_failed` | the active model could not be **read** because of an I/O error (bad block, out of file handles ...): it is kept, and the labelled baseline serves that scan only | `dmesg`, `ulimit -n`, disk health; the next scan reads the model again by itself |
 | `model_inputs_missing` / `model_predict_failed` | many model inputs were unavailable at scan time (scored with missing values, the report notes it) / the model crashed while scoring (the heuristic baseline is used for that report) | read the message; usually follows a data outage |
 | `training_failed` | a stage could not be trained (not enough history, degenerate labels, or too little free disk) | `monster-ai logs --role train`; the previous champion stays active |
 | `model_sync_failed` | external mode: the signed bundle was missing, unsigned, tampered, for another feature version or failed its gates | check the worker run and that `MODEL_SIGNING_KEY` is identical on both sides |
 | `backup_upload_failed` | local backup is fine, the off-box copy failed | check `S3_*` and connectivity; the next night retries |
+| `backup_encryption_failed` / `health_backup_unencrypted` | `BACKUP_PASSPHRASE` is set but gpg failed: the local backup is **unencrypted** and is deliberately **not** uploaded off-box | `sudo apt install gnupg`; `sudo monster-ai backup`; check the passphrase |
 | `health_backup_old` / `health_no_backup` | last backup older than 36 h (warning) / 72 h (critical); none yet | `monster-ai backup`; check disk space |
 | `resources` | low disk or RAM | [disk / memory](#disk-or-memory-pressure) |
 | `health_storage_budget` / `health_storage_over_budget` | the data directory uses 80 % of / more than `DATA_MAX_MB` | `monster-ai storage`; `monster-ai storage --prune`; see [storage](#storage-and-retention) |
@@ -432,7 +434,7 @@ does it).
   summary and `health_calibration_drift` check exactly that on live data.
 - Rank, not certainty: the useful claim is that the top picks reach large ranges *more often than simple rules* (recent range,
   ATR, volume), measured out of sample with a confidence interval. On the project's real-data training run the model beat the
-  best simple baseline by a few percentage points (hit rate on the top-5 for range >= 3 %), not by a wide margin: volatility
+  best simple baseline by a few percentage points (hit rate on the top-5 for range > 3 %), not by a wide margin: volatility
   persistence explains most of it. Do not expect miracles.
 - Every live statistic comes with its **sample size and a 95 % interval** (a day-block bootstrap, because the picks of one day are
   dependent); with fewer than five days it prints `n/a` instead of a number it cannot support. A day is scored once, on its final

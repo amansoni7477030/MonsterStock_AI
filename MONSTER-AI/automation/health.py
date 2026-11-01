@@ -214,7 +214,7 @@ def _check_sources(report: HealthReport, store: Store) -> None:
     report.checks["failing_sources"] = [h["source_id"] for h in failing]
 
 
-def _check_backup(report: HealthReport, store: Store, now: datetime) -> None:
+def _check_backup(report: HealthReport, store: Store, settings: Settings, now: datetime) -> None:
     last = store.kv_get_json("backup.last")
     age = _age_hours(last.get("at"), now) if last else None
     report.checks["backup_age_h"] = None if age is None else round(age, 1)
@@ -225,6 +225,9 @@ def _check_backup(report: HealthReport, store: Store, now: datetime) -> None:
         report.add("crit", "backup_old", f"last backup is {age:.0f} h old")
     elif age > BACKUP_WARN_HOURS:
         report.add("warn", "backup_old", f"last backup is {age:.0f} h old")
+    if last and settings.backup_passphrase and last.get("encrypted") is False:
+        report.add("warn", "backup_unencrypted", "BACKUP_PASSPHRASE is set but the last backup is not encrypted (is gpg installed?); "
+                   "it stays on this server and is not uploaded off-box")
 
 
 def _check_notifications(report: HealthReport, store: Store, settings: Settings) -> None:
@@ -340,7 +343,7 @@ def evaluate_health(store: Store, settings: Settings, clock: Clock | None = None
         ("storage", lambda: _check_storage(report, store, settings, now)),
         ("models", lambda: _check_models(report, store, settings, now)),
         ("sources", lambda: _check_sources(report, store)),
-        ("backup", lambda: _check_backup(report, store, now)),
+        ("backup", lambda: _check_backup(report, store, settings, now)),
         ("notifications", lambda: _check_notifications(report, store, settings)),
         ("performance", lambda: _check_performance(report, store)),
     ):

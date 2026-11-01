@@ -288,7 +288,7 @@ def _candidate_block(cand: Any, position: int, *, weak: bool, capped: bool, heur
     primary_p = next((v for t, v in hits if primary is not None and abs(t - primary) < 1e-9), None)
     threshold = f"{_thr(primary)}%" if primary is not None else NA
     basis = HEURISTIC_LABEL if heuristic else "calibrated"
-    p_line = f"P(range &gt;= {threshold}): {_pct(primary_p)} ({basis})"
+    p_line = f"P(range &gt; {threshold}): {_pct(primary_p)} ({basis})"
     if hits:
         p_line += "   [" + " | ".join(f"{_thr(t)}%: {_pct(v)}" for t, v in hits) + "]"
 
@@ -544,7 +544,7 @@ def render_evening_report(summary: EveningSummary) -> list[str]:
     head = [
         "<b>MONSTER AI | EVENING EVALUATION</b>",
         f"Date: {_date_label(_get(summary, 'trade_date'))} | Stage: {_stage_label(_get(summary, 'stage'))} | "
-        f"Model: {_esc(version)} | Target: intraday range &gt;= {threshold}% of open",
+        f"Model: {_esc(version)} | Target: intraday range &gt; {threshold}% of open",
         f"<b>{PROVISIONAL_LABEL if provisional else VALIDATED_LABEL}</b>",
     ]
     blocks = ["\n".join(head)]

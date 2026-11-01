@@ -144,7 +144,13 @@ server with native systemd (no containers).
 - **Operations.** The filings window follows the previous trading day (it missed filings after a long weekend); the app's logs no longer
   clash with logrotate (`copytruncate` emptied daily files); concurrent job processes no longer share a rotating file handler; the job tag
   of log lines is set; the daily bar flow never replaced provisional vendor bars with the official file once vendor coverage was complete;
-  the bootstrap used the UTC date where the exchange date is meant.
+  the bootstrap used the UTC date where the exchange date is meant; a transient I/O error while reading the active model retired it for good
+  (now the model is kept, the labelled baseline serves that scan and `model_load_failed` is raised; only definite damage retires a model);
+  a heavy job waiting for RAM or disk held back every light job behind it in the queue; a failed gpg run with `BACKUP_PASSPHRASE` set left an
+  unencrypted backup that would have been uploaded off-box (it now stays local, `backup_encryption_failed` and a health warning are raised);
+  the evening summary's data-quality notes were never filled (now: preliminary-only scoring, provisional outcomes, degraded or late snapshots);
+  the report and the dashboard said "range >=" where labels and evaluation use "range >"; the source catalogue claimed event-day flags from
+  the economic calendar although nothing reads it (FRED and the economic calendar are collected for research only, and now say so).
 
 ### Verified on real data
 

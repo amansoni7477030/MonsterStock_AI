@@ -351,7 +351,17 @@ def backup(ctx: JobContext) -> JobResult:
     if not verify_backup(result.path, s.backup_passphrase):
         return JobResult("failed", f"backup {result.path.name} failed verification")
     info = {"file": result.path.name, "bytes": result.size_bytes, "encrypted": result.encrypted, "pruned": len(result.pruned)}
-    remote = _upload_backup(ctx, result.path)
+    if s.backup_passphrase and not result.encrypted:
+        # Encryption was requested but gpg failed: the local copy stays (a restore point beats none) but it never leaves this server.
+        ctx.store.add_alert("error", "backup_encryption_failed",
+                            "BACKUP_PASSPHRASE is set but gpg could not encrypt the backup: the local copy is UNENCRYPTED and was NOT "
+                            "uploaded off-box. Check that gnupg is installed (apt install gnupg) and run: monster-ai backup",
+                            dedupe_key="backup-encryption", dedupe_minutes=720)
+        log.error("backup %s is unencrypted although BACKUP_PASSPHRASE is set; not uploading it off-box", result.path.name)
+        info["upload_skipped"] = "unencrypted"
+        remote = None
+    else:
+        remote = _upload_backup(ctx, result.path)
     if remote:
         info["remote"] = remote
     ctx.store.kv_set_json("backup.last", {**info, "at": ctx.store.now()})

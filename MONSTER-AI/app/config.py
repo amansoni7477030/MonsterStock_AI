@@ -143,7 +143,7 @@ VARS: tuple[Var, ...] = (
     Var("primary_threshold", "PRIMARY_THRESHOLD", "3", _float, "Threshold (%) whose calibrated probability drives the ranking.", "Targets"),
     Var("unusual_k", "UNUSUAL_K", "1.5", _float, "Volatility-adjusted threshold: range > k x trailing mean range.", "Targets"),
     Var("top_n", "TOP_N", "5", _int, "Number of candidates reported.", "Targets"),
-    Var("tier_strong_p", "TIER_STRONG_P", "0.55", _float, "Calibrated P(range >= primary) for STRONG.", "Targets"),
+    Var("tier_strong_p", "TIER_STRONG_P", "0.55", _float, "Calibrated P(range > primary) for STRONG.", "Targets"),
     Var("tier_moderate_p", "TIER_MODERATE_P", "0.40", _float, "Calibrated P for MODERATE.", "Targets"),
     Var("tier_watch_p", "TIER_WATCH_P", "0.25", _float, "Calibrated P for WATCH; below this a name is not listed.", "Targets"),
     Var("max_uncertainty_strong", "MAX_UNCERTAINTY_STRONG", "0.35", _float,
@@ -173,7 +173,7 @@ VARS: tuple[Var, ...] = (
     Var("http_impersonate", "HTTP_IMPERSONATE", "chrome", _str,
         "Browser profile curl_cffi impersonates: chrome, safari, firefox, edge or a pinned version such as chrome131 "
         "(empty = no impersonation). Proxies: set HTTPS_PROXY in the environment file.", "Providers"),
-    Var("fred_api_key", "FRED_API_KEY", "", _opt_str, "Optional FRED key (enables vintage-aware macro data).", "Providers", True),
+    Var("fred_api_key", "FRED_API_KEY", "", _opt_str, "Optional FRED key: stores vintage-aware macro data for research (no feature reads it yet).", "Providers", True),
     Var("gdelt_enabled", "GDELT_ENABLED", "true", _bool, "Use the GDELT DOC API for global news discovery.", "Providers"),
     Var("news_feeds_file", "NEWS_FEEDS_FILE", "{home}/data/seeds/feeds.json", _path, "RSS/Atom feed registry.", "Providers"),
     Var("news_lookback_hours", "NEWS_LOOKBACK_HOURS", "36", _int, "How far back a collection run looks.", "Providers"),

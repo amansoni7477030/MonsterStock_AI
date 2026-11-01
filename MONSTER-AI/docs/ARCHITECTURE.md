@@ -421,8 +421,8 @@ flowchart TB
   timer that alerts independently of the daemon, a heartbeat that is written to a file as well as to the database (so a
   locked database is distinguishable from a dead daemon), and a self-reported alert when the daemon finds that its previous
   run ended uncleanly.
-- **Resource gates**: heavy jobs are deferred while free disk is below the critical threshold; training checks the disk
-  before it starts.
+- **Resource gates**: heavy jobs are deferred while free disk is below the critical threshold or RAM is low, and the light jobs
+  behind them still run; training checks the disk before it starts.
 - **Health** (`automation/health.py`): data freshness, missing sessions, model age and status, source failures,
   backup age, disk and RAM, storage budget and retention, calendar coverage, delivery failures, performance drift. Alerts are
   de-duplicated and queued until Telegram works again.
@@ -748,6 +748,8 @@ flowchart LR
 | RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
 | LLM unavailable / unconfigured | rule-based extraction only |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
+| A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
+| gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
 | Telegram down | reports and alerts are queued in the ledger and flushed when it returns; late final reports are withheld |
 | Process killed / reboot | systemd restarts the daemon; the ledger resumes; SQLite WAL recovery; `daemon_restarted` alert |
 | Database locked while the daemon lives | the heartbeat file proves liveness; `heartbeat_db_stale` warns instead of a false "daemon dead" |

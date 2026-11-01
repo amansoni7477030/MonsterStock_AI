@@ -199,7 +199,7 @@ def _predictions_section(page: Mapping[str, Any]) -> str:
             continue
         label = "Final scan" if stage == "final" else "Pre-scan"
         out.append(f"<h3>{label} - top {len(subset)}</h3>")
-        headers = ["#", "Symbol", "Tier", f"P(range >= {primary:g}%)", "P(unusual)", "Range q50 %", "Range q90 %",
+        headers = ["#", "Symbol", "Tier", f"P(range > {primary:g}%)", "P(unusual)", "Range q50 %", "Range q90 %",
                    "Uncertainty", "Data", "Model", "Catalyst"]
         out.append(table(headers, _prediction_rows(subset, primary)))
     return "".join(out)
