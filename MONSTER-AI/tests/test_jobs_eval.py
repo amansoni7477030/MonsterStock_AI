@@ -142,7 +142,7 @@ def test_evaluate_job_scores_persists_metrics_and_sends_one_evening_report(env):
     names = {m["name"] for m in env.store.latest_metrics("daily")}
     assert {"topn_hit_rate", "topn_mean_range_pct", "baseline_atr_hit_rate"} <= names
     sent = len(eval_ctx.telegram.sent)
-    assert sent >= 1 and any("2026-11-02" in text for _, text in eval_ctx.telegram.sent)
+    assert sent >= 1 and any("Mon 02 Nov 2026" in text for _, text in eval_ctx.telegram.sent)
     again = jobs.evaluate(make_job_context(env.settings, env.store, env.clock))
     assert again.status == "success"
     del ctx
