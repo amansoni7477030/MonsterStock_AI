@@ -13,7 +13,8 @@ Generated from `ingestion/registry.py` (run `python scripts/generate_docs.py`). 
 | `nse_announcements` | important | NSE corporate announcements API | rss_news |
 | `rss_news` | important | Publisher RSS/Atom feeds (data/seeds/feeds.json) | gdelt |
 | `gdelt` | optional | GDELT Project DOC 2.0 API | rss_news |
-| `llm_extraction` | optional | Configured OpenAI-compatible LLM API | rules |
+| `llm_extraction` | optional | Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API | rules |
+| `jev_judgment` | optional | TypeSafe AI - Jev (System One decision model) | rules |
 
 ## Transport and request strategy
 
@@ -24,7 +25,7 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Retries:** statuses 408, 425, 429, 500, 502, 503, 504 retry with exponential back-off and jitter (or `Retry-After`, at most 60 s), at most `HTTP_MAX_ATTEMPTS` attempts; no attempt starts after the caller's deadline.
 - **Safety:** HTTPS only; responses larger than `HTTP_MAX_RESPONSE_MB` are refused; logs and errors carry host and path only, never the query string.
 - **Traceability:** per-source counters (requests, retries, 429s, 304s, bytes) are logged as a `network:` line after every job.
-- Official, authenticated APIs (Telegram, S3-compatible storage, the optional LLM) use their own `requests` sessions and retry rules.
+- Official, authenticated APIs (Telegram, S3-compatible storage, the optional Groq LLM and Jev) use their own `requests` sessions and retry rules.
 
 ## `yahoo_daily` - Yahoo Finance (unofficial chart API)
 
@@ -143,15 +144,28 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Failure behaviour:** Backoff on 429; skipped queries recorded as coverage gap
 - **Backup source:** rss_news
 
-## `llm_extraction` - Configured OpenAI-compatible LLM API
+## `llm_extraction` - Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API
 
-- **Endpoint:** `LLM_API_BASE/chat/completions`
-- **Coverage:** Structured event extraction from news text
+- **Endpoint:** `https://api.groq.com/openai/v1/chat/completions (GROQ_API_KEY) or LLM_API_BASE/chat/completions`
+- **Coverage:** Structured event extraction from news text: event type, entities with their direction, severity, horizon, event time and a verbatim evidence quote
 - **Timestamp meaning:** n/a
-- **Update frequency:** On demand (cost-capped)
+- **Update frequency:** On demand (cost-capped: per-run call and time budgets, 14-day result cache)
 - **History depth:** n/a
-- **Rate limits:** Provider specific; per-run article budget
-- **Transport and request strategy:** not scraped: the configured provider's own API through a `requests` session with its own timeout and retry rules and a per-run article budget.
-- **Licensing:** Governed by the chosen provider's terms; no secrets/PII are sent.
-- **Failure behaviour:** Deterministic rule-based extraction; report states reduced coverage
+- **Rate limits:** Groq free tier: ~30 requests and ~8k tokens per minute per model (tokens bind first); a long Retry-After starts a cooldown that survives between runs
+- **Transport and request strategy:** not scraped: the provider's own API through a `requests` session. `GROQ_API_KEY` selects Groq (`openai/gpt-oss-120b`, then `openai/gpt-oss-20b` when the first is rate-limited or retired; strict JSON-schema output with a per-model capability ladder); `LLM_API_BASE` + `LLM_MODEL` select any other OpenAI-compatible provider. Per-run call and time budgets, a 14-day result cache keyed by the article text, bounded retries that honour `Retry-After` (up to 30 s; a longer wait is a quota and starts a cooldown of at most 6 h that survives between runs).
+- **Licensing:** Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.
+- **Failure behaviour:** Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health
+- **Backup source:** rules
+
+## `jev_judgment` - TypeSafe AI - Jev (System One decision model)
+
+- **Endpoint:** `https://api.typesafe.ai/v1/systemone`
+- **Coverage:** Calibrated judgments on one news item: event type, rumour, denial, severity and the direction for the company in focus
+- **Timestamp meaning:** n/a
+- **Update frequency:** On demand (cost-capped: per-run item budget, 14-day result cache)
+- **History depth:** n/a
+- **Rate limits:** HTTP 429 / 529 with Retry-After; a wait above 30 s starts a cooldown that survives between runs
+- **Transport and request strategy:** not scraped: `POST https://api.typesafe.ai/v1/systemone` with the pinned model `JEV_MODEL` (Bearer key `TYPESAFE_API_KEY`). The article is the typed `state` and the atomic questions (event type, rumour, denial, severity, direction) are answered in ONE request, so an item costs one call. Same budgets, cache, retries and cooldown as the LLM.
+- **Licensing:** Governed by TypeSafe AI's terms (customer data is not used for training; zero data retention is an enterprise option); only public news text is sent - never keys, positions or other data.
+- **Failure behaviour:** The deterministic rules decide alone; report states reduced coverage; repeated failures appear in source health
 - **Backup source:** rules

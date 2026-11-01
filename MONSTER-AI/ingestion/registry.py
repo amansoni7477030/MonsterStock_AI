@@ -109,10 +109,25 @@ SOURCES: tuple[dict[str, Any], ...] = (
         failure_behavior="Backoff on 429; skipped queries recorded as coverage gap", backup_source="rss_news", criticality="optional",
     ),
     dict(
-        source_id="llm_extraction", provider="Configured OpenAI-compatible LLM API", endpoint="LLM_API_BASE/chat/completions",
-        coverage="Structured event extraction from news text", timestamp_meaning="n/a", update_frequency="On demand (cost-capped)",
-        history_depth="n/a", rate_limits="Provider specific; per-run article budget", license_notes="Governed by the chosen provider's terms; no secrets/PII are sent.",
-        failure_behavior="Deterministic rule-based extraction; report states reduced coverage", backup_source="rules", criticality="optional",
+        source_id="llm_extraction", provider="Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API",
+        endpoint="https://api.groq.com/openai/v1/chat/completions (GROQ_API_KEY) or LLM_API_BASE/chat/completions",
+        coverage="Structured event extraction from news text: event type, entities with their direction, severity, horizon, event time and a verbatim evidence quote",
+        timestamp_meaning="n/a", update_frequency="On demand (cost-capped: per-run call and time budgets, 14-day result cache)",
+        history_depth="n/a",
+        rate_limits="Groq free tier: ~30 requests and ~8k tokens per minute per model (tokens bind first); a long Retry-After starts a cooldown that survives between runs",
+        license_notes="Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.",
+        failure_behavior="Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health",
+        backup_source="rules", criticality="optional",
+    ),
+    dict(
+        source_id="jev_judgment", provider="TypeSafe AI - Jev (System One decision model)",
+        endpoint="https://api.typesafe.ai/v1/systemone",
+        coverage="Calibrated judgments on one news item: event type, rumour, denial, severity and the direction for the company in focus",
+        timestamp_meaning="n/a", update_frequency="On demand (cost-capped: per-run item budget, 14-day result cache)",
+        history_depth="n/a", rate_limits="HTTP 429 / 529 with Retry-After; a wait above 30 s starts a cooldown that survives between runs",
+        license_notes="Governed by TypeSafe AI's terms (customer data is not used for training; zero data retention is an enterprise option); only public news text is sent - never keys, positions or other data.",
+        failure_behavior="The deterministic rules decide alone; report states reduced coverage; repeated failures appear in source health",
+        backup_source="rules", criticality="optional",
     ),
 )
 
@@ -126,9 +141,12 @@ def register_all(store: Any) -> int:
 def _fetch_strategy() -> dict[str, str]:
     """How each source is requested (transport, spacing, batching), phrased from the code's own constants (lazy imports keep this
     module light for the callers that only need ``tracked``)."""
+    from app.config import GROQ_FALLBACK_MODEL, GROQ_MODEL
     from ingestion.news_sources import FEED_DISABLE_AFTER, FEED_DISABLE_HOURS, FEED_FULL_REFRESH_HOURS
     from ingestion.pipeline import PROBE_MAX_AGE
     from ingestion.yahoo import SPARK_MAX_SYMBOLS
+    from news_intelligence.jev import JEV_BASE_URL, JEV_PATH
+    from news_intelligence.remote import COOLDOWN_MAX_SEC, RETRY_AFTER_CAP_SEC
 
     probe_hours = int(PROBE_MAX_AGE.total_seconds() // 3600)
     nse_client = ("curl_cffi with browser headers, spacing `NSE_MIN_INTERVAL_SEC`; 403 / 404 are soft statuses meaning "
@@ -164,8 +182,16 @@ def _fetch_strategy() -> dict[str, str]:
             f"row is parked for {FEED_DISABLE_HOURS} h; collection is deadline-bounded."),
         "gdelt": "client `gdelt`: one request per configured query, 6 s apart, back-off on 429.",
         "llm_extraction": (
-            "not scraped: the configured provider's own API through a `requests` session with its own timeout and retry rules "
-            "and a per-run article budget."),
+            "not scraped: the provider's own API through a `requests` session. `GROQ_API_KEY` selects Groq "
+            f"(`{GROQ_MODEL}`, then `{GROQ_FALLBACK_MODEL}` when the first is rate-limited or retired; strict JSON-schema output with "
+            "a per-model capability ladder); `LLM_API_BASE` + `LLM_MODEL` select any other OpenAI-compatible provider. Per-run call "
+            f"and time budgets, a 14-day result cache keyed by the article text, bounded retries that honour `Retry-After` (up to "
+            f"{int(RETRY_AFTER_CAP_SEC)} s; a longer wait is a quota and starts a cooldown of at most {int(COOLDOWN_MAX_SEC // 3600)} h "
+            "that survives between runs)."),
+        "jev_judgment": (
+            f"not scraped: `POST {JEV_BASE_URL}{JEV_PATH}` with the pinned model `JEV_MODEL` (Bearer key `TYPESAFE_API_KEY`). The "
+            "article is the typed `state` and the atomic questions (event type, rumour, denial, severity, direction) are answered "
+            "in ONE request, so an item costs one call. Same budgets, cache, retries and cooldown as the LLM."),
     }
 
 
@@ -185,8 +211,8 @@ def _transport_section() -> list[str]:
         "- **Safety:** HTTPS only; responses larger than `HTTP_MAX_RESPONSE_MB` are refused; logs and errors carry host and path only, "
         "never the query string.",
         "- **Traceability:** per-source counters (requests, retries, 429s, 304s, bytes) are logged as a `network:` line after every job.",
-        "- Official, authenticated APIs (Telegram, S3-compatible storage, the optional LLM) use their own `requests` sessions and "
-        "retry rules.",
+        "- Official, authenticated APIs (Telegram, S3-compatible storage, the optional Groq LLM and Jev) use their own `requests` "
+        "sessions and retry rules.",
     ]
 
 

@@ -24,10 +24,10 @@ from typing import Any
 
 import requests
 
-from app import __version__, jsonutil
+from app import jsonutil
 from app.clock import Clock, iso, parse_ts
 from app.config import Settings
-from app.logging_setup import redact, register_secret
+from app.logging_setup import register_secret
 from news_intelligence.entities import Entity, EntityResolver
 from news_intelligence.events import EVENT_TYPES, HORIZONS
 from news_intelligence.remote import (
@@ -157,6 +157,7 @@ class LLMExtractor(RemoteJudge):
 
     CACHE_PREFIX = CACHE_PREFIX
     COUNTER = "llm"
+    SOURCE_ID = "llm_extraction"
     CACHE_TTL_DAYS = CACHE_TTL_DAYS
 
     def __init__(
@@ -172,10 +173,9 @@ class LLMExtractor(RemoteJudge):
         backoff_cap: float = 8.0,
         max_consecutive_failures: int = 5,
     ) -> None:
-        super().__init__(clock=clock, store=store, resolver=resolver, max_consecutive_failures=max_consecutive_failures,
-                         max_seconds=float(settings.llm_max_seconds_per_run))
+        super().__init__(clock=clock, store=store, resolver=resolver, session=session,
+                         max_consecutive_failures=max_consecutive_failures, max_seconds=float(settings.llm_max_seconds_per_run))
         self.settings = settings
-        self.session = session
         self.max_attempts = max(1, max_attempts)
         self.backoff_base = backoff_base
         self.backoff_cap = backoff_cap
@@ -184,6 +184,7 @@ class LLMExtractor(RemoteJudge):
         self._caps_by_model: dict[str, dict[str, Any]] = {}
         self._model_idx = 0
         self._unavailable: set[str] = set()
+        self.last_model: str | None = None  # the model that gave the latest answer (the fallback when the first was limited)
         if settings.llm_key:
             register_secret(settings.llm_key)
 
@@ -305,19 +306,6 @@ class LLMExtractor(RemoteJudge):
         base = (self.settings.llm_base_url or "").rstrip("/")
         return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
-    def _post_once(self, body: dict[str, Any]) -> tuple[int, Any, str, dict[str, str]]:
-        if self.session is None:
-            self.session = requests.Session()
-        headers = {"Content-Type": "application/json", "User-Agent": f"monster-ai/{__version__}"}
-        if self.settings.llm_key:
-            headers["Authorization"] = "Bearer " + self.settings.llm_key
-        response = self.session.post(self._url(), headers=headers, json=body, timeout=float(self.settings.llm_timeout_sec))
-        try:
-            payload = response.json()
-        except (ValueError, AttributeError):
-            payload = None
-        return int(response.status_code), payload, str(getattr(response, "text", "") or "")[:500], dict(getattr(response, "headers", {}) or {})
-
     def _request(self, title: str, text: str) -> str:
         """POST with bounded retries; returns the reply content or raises ``Fatal`` / ``Quota`` / ``OutOfTime`` /
         ``RuntimeError``. A rate-limited model hands over to the other one at once (Groq's limits are per model); a 400 that
@@ -330,7 +318,10 @@ class LLMExtractor(RemoteJudge):
                 raise OutOfTime()
             model = self._active_model()
             try:
-                status, payload, snippet, headers = self._post_once(self._build_body(title, text, model))
+                status, payload, snippet, headers = self.send(
+                    "POST", self._url(), self.settings.llm_key, float(self.settings.llm_timeout_sec),
+                    self._build_body(title, text, model),
+                )
             except (requests.RequestException, OSError) as exc:
                 last = f"transport error {type(exc).__name__}"
                 status, payload, snippet, headers = -1, None, "", {}
@@ -341,6 +332,7 @@ class LLMExtractor(RemoteJudge):
                 usage = payload.get("usage") if isinstance(payload, dict) else None
                 if isinstance(usage, dict):
                     self._count_tokens(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+                self.last_model = model
                 return content
             complaint = (snippet.lower() + json.dumps(payload, default=str).lower()[:600]) if status == 400 else ""
             if status == 404 or (status == 400 and any(word in complaint for word in _MODEL_GONE)):
@@ -473,37 +465,16 @@ class LLMExtractor(RemoteJudge):
         if cached is not None:
             self.run_cache_hits += 1
             return cached
-        if self.tripped:
+        if not self._admit(int(self.settings.llm_max_articles_per_run)):
             return None
-        if self.cooldown_active():
-            self.tripped = True  # the provider asked us to stay away: no request at all until its cooldown ends
-            return None
-        if self.run_calls >= int(self.settings.llm_max_articles_per_run) or self.out_of_time:
-            self.run_budget_skipped += 1
-            return None
-        self.run_calls += 1
-        self._bump("llm.calls")
-        try:
-            content = self._request(title, text)
-            raw = parse_reply_json(content)
+
+        def ask() -> LLMResult:
+            raw = parse_reply_json(self._request(title, text))
             if raw is None:
                 raise RuntimeError("reply is not a JSON object")
-            result = self._validate(raw, f"{title}\n{text}")
-        except Fatal as exc:
-            self._failed(f"fatal: {exc}", trip=True)
-            return None
-        except Quota as exc:
-            self._failed(f"rate limit: {exc}", trip=True)
-            self.start_cooldown(exc.seconds)
-            return None
-        except OutOfTime:
-            self.run_calls -= 1  # not a failure and not a use: the run's time ran out before the answer
-            self.run_budget_skipped += 1
-            self.tripped = True
-            return None
-        except Exception as exc:  # the LLM path must never lose an item: any failure falls back to the rules
-            self._failed(redact(f"{type(exc).__name__}: {exc}"))
-            return None
-        self.consecutive_failures = 0
-        self._cache_put(key, result)
+            return self._validate(raw, f"{title}\n{text}")
+
+        result = self._attempt(ask)
+        if result is not None:
+            self._cache_put(key, result)
         return result

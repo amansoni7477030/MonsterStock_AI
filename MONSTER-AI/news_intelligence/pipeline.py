@@ -47,11 +47,18 @@ from news_intelligence.dedup import (
     event_confidence,
 )
 from news_intelligence.entities import Entity, EntityResolver
-from news_intelligence.events import EVENT_TYPES, EventDraft, assign_polarity, classify_rules, extract_moves, primary_company
+from news_intelligence.events import (
+    EVENT_TYPES,
+    EventDraft,
+    assign_polarity,
+    classify_rules,
+    extract_moves,
+    primary_company,
+)
 from news_intelligence.jev import JevJudge, merge_jev, prune_jev_cache
 from news_intelligence.llm import LLMExtractor, LLMResult, prune_llm_cache
-from news_intelligence.remote import RemoteJudge
 from news_intelligence.priced_in import assess_reaction
+from news_intelligence.remote import RemoteJudge
 from news_intelligence.source_quality import get_registry, source_class_of, split_publisher_suffix
 from news_intelligence.text import clean_text, domain_of, is_probably_english, lead, url_hash
 from ranking.types import Catalyst

@@ -21,7 +21,9 @@ from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any, TypeVar
 
-from app import jsonutil
+import requests
+
+from app import __version__, jsonutil
 from app.clock import Clock, get_clock, iso, parse_ts
 from app.logging_setup import redact
 
@@ -95,18 +97,20 @@ class RemoteJudge:
     CACHE_TTL_DAYS = 14
 
     def __init__(
-        self, *, clock: Clock | None = None, store: Any = None, resolver: Any = None, max_consecutive_failures: int = 5,
-        max_seconds: float = 0.0,
+        self, *, clock: Clock | None = None, store: Any = None, resolver: Any = None, session: Any = None,
+        max_consecutive_failures: int = 5, max_seconds: float = 0.0,
     ) -> None:
         self.clock = clock or get_clock()
         self.store = store
         self.resolver = resolver
+        self.session = session  # created on first use (a ``requests.Session``) unless one is injected
         self.max_consecutive_failures = max_consecutive_failures
         self.max_seconds = float(max_seconds)
         self.run_calls = self.run_failures = self.run_cache_hits = self.run_budget_skipped = 0
         self.run_tokens_in = self.run_tokens_out = 0
         self.consecutive_failures = 0
         self.tripped = False
+        self.last_error: str | None = None  # why the latest request failed (``monster-ai ai-test`` prints it)
         self._run_started: float | None = None  # set by start_run(): without a run there is no wall-clock budget
 
     # ------------------------------------------------------------------------------------- run state
@@ -153,6 +157,7 @@ class RemoteJudge:
     def _failed(self, reason: str, *, trip: bool = False) -> None:
         self.run_failures += 1
         self.consecutive_failures += 1
+        self.last_error = reason
         self._bump(f"{self.COUNTER}.failures")
         self._record_health(False, error=reason)
         if trip or self.consecutive_failures >= self.max_consecutive_failures:
@@ -169,6 +174,27 @@ class RemoteJudge:
             log.debug("could not record the health of %s", self.SOURCE_ID, exc_info=True)
 
     # ------------------------------------------------------------------------------------------- requests
+    def send(
+        self, method: str, url: str, key: str | None, timeout: float, body: dict[str, Any] | None = None
+    ) -> tuple[int, Any, str, dict[str, str]]:
+        """One HTTP call authenticated with the service's bearer ``key``: ``(status, decoded JSON or None, the first 500
+        characters of the text, response headers)``. Transport errors propagate to the caller's retry loop."""
+        if self.session is None:
+            self.session = requests.Session()
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": f"monster-ai/{__version__}"}
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        if method == "POST":
+            response = self.session.post(url, headers=headers, json=body, timeout=timeout)
+        else:
+            response = self.session.get(url, headers=headers, timeout=timeout)
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            payload = None
+        text = str(getattr(response, "text", "") or "")[:500]
+        return int(response.status_code), payload, text, dict(getattr(response, "headers", {}) or {})
+
     def _admit(self, max_calls: int) -> bool:
         """True when a request may be made now. Otherwise ``False`` (circuit open, provider in cooldown, or this run's call /
         time budget spent) and the caller falls back to the rules. An admitted request counts as a call."""

@@ -19,7 +19,7 @@ JOBS: dict[str, JobSpec] = {
         JobSpec("collect_global", "Global closes, live context, GIFT Nifty", timeout_min=25),
         JobSpec("collect_news", "News/filings collection and event extraction", timeout_min=20),
         JobSpec("collect_india", "Previous-session completeness (official file first)", timeout_min=20),
-        JobSpec("prelim_scan", "08:45 preliminary scan", critical=True, timeout_min=6),
+        JobSpec("prelim_scan", "08:45 preliminary scan (first repairs an incomplete previous session)", critical=True, timeout_min=6),
         JobSpec("refresh_preopen", "Pre-open book collection", critical=True, timeout_min=10),
         JobSpec("final_scan", "09:08 final scan and Telegram report", critical=True, timeout_min=8),
         JobSpec("ingest_eod", "Official end-of-day data", timeout_min=25),

@@ -191,11 +191,11 @@ def test_a_retry_that_fits_before_the_deadline_still_happens(fake_clock):
 
 # --------------------------------------------------------------------------------------------- logs
 def test_retries_and_give_ups_are_logged_with_host_and_path_but_never_the_query(fake_clock, caplog):
-    client = HttpClient("fred", session=FakeSession([FakeResponse(503), FakeResponse(503)]), clock=fake_clock, max_attempts=2)
+    client = HttpClient("keyed_api", session=FakeSession([FakeResponse(503), FakeResponse(503)]), clock=fake_clock, max_attempts=2)
     with caplog.at_level(logging.DEBUG, logger="ingestion.http"), pytest.raises(DataUnavailable):
-        client.get("https://api.example.com/fred/series?api_key=SUPERSECRET123&x=1")
+        client.get("https://api.example.com/v1/series?api_key=SUPERSECRET123&x=1")
     text = caplog.text
-    assert "api.example.com/fred/series" in text and "SUPERSECRET123" not in text and "api_key" not in text
+    assert "api.example.com/v1/series" in text and "SUPERSECRET123" not in text and "api_key" not in text
     assert "retrying in" in text and "giving up after 2 attempts" in text and "HTTP 503" in text
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
@@ -263,7 +263,7 @@ def test_the_browsers_own_headers_are_never_overridden_while_impersonating(fake_
 
 @needs_curl_cffi
 def test_without_impersonation_our_own_user_agent_is_sent(fake_cffi, fake_clock):
-    client = HttpClient("fred", clock=fake_clock, impersonate=None, headers={"User-Agent": "monster-ai"})
+    client = HttpClient("official_api", clock=fake_clock, impersonate=None, headers={"User-Agent": "monster-ai"})
     client.get("https://api.example.com/x", headers={"User-Agent": "monster-ai"})
     assert fake_cffi.instances[0].kwargs == {} and fake_cffi.instances[0].headers == {"User-Agent": "monster-ai"}
     assert fake_cffi.instances[0].calls[0]["headers"] == {"User-Agent": "monster-ai"}

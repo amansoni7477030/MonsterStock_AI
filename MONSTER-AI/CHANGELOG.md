@@ -1,8 +1,9 @@
 # Changelog
 
 All notable changes to MONSTER AI. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
-follow [Semantic Versioning](https://semver.org/). Database migrations are forward-only and additive, so every
-release below can be installed over the previous one (`deployment/install.sh` is idempotent and rolls back by itself).
+follow [Semantic Versioning](https://semver.org/). Database migrations are forward-only (one of them drops two unused tables, see
+*Removed*), so every release below can be installed over the previous one (`deployment/install.sh` is idempotent and rolls back
+by itself).
 
 ## [1.0.0] - 2026-11-01
 
@@ -15,8 +16,11 @@ server with native systemd (no containers).
   with `fv1` are retired automatically and the scans use the labelled heuristic baseline until the next training run has produced
   an `fv2` model. A fresh install trains during the bootstrap; on an existing server run `sudo monster-ai train` (or wait for
   Saturday 02:00 IST).
-- **New migration** `0004_graph_edge_history.sql` (append-only event-graph edge history and event provenance columns); migrations
-  run on start and are additive.
+- **New migrations** `0004_graph_edge_history.sql` (append-only event-graph edge history and event provenance columns) and
+  `0005_drop_unused_macro_tables.sql` (drops the `macro_observations` and `econ_calendar` tables nothing read, and the registry rows of
+  their two sources; it cannot be undone, see *Removed*); migrations run on start.
+- **Settings that no longer exist:** `FRED_API_KEY`, `TRAINING_DOW` and `MIN_NEWS_MODEL_DAYS` are ignored if they are still in
+  `monster.env`; delete them at your leisure.
 - **New settings** (all with safe defaults, see `.env.example`): `HTTP_TRANSPORT`, `HTTP_IMPERSONATE`, `HTTP_MAX_RESPONSE_MB`,
   `DATA_MAX_MB`, `BACKUP_MAX_MB`, `EVENT_RETENTION_DAYS`, `QUOTE_RETENTION_DAYS`, `RECORD_RETENTION_DAYS`, `OPS_RETENTION_DAYS`,
   `LOG_FORMAT`, `LOG_RETENTION_DAYS`, `LOG_MAX_MB`. `MONSTER_TIMEZONE` now selects the zone of **log stamps only** (market logic is
@@ -30,13 +34,13 @@ server with native systemd (no containers).
 
 - **Daily pipeline** (`automation/`): ledger-based scheduler daemon (sd_notify watchdog, one child process per job,
   preemption of non-critical jobs, catch-up, retries) and the full timetable - global and India data collection, news,
-  preflight dry run, 08:45 preliminary scan, 09:00 pre-open book, 09:08:45 final scan with Telegram delivery by 09:12,
+  08:45 preliminary scan, 09:00 pre-open book, 09:08:45 final scan with Telegram delivery by 09:12,
   end-of-day ingestion, evaluation, backup, housekeeping, weekly training / universe / calendar refresh, model sync.
 - **Resumable 12-step bootstrap** that prepares everything on a new server (universe, 10 years of history, official
   bhavcopy, F&O history, board meetings, news, first models, smoke scan, Telegram test) and survives crashes, reboots
   and out-of-memory kills.
-- **Browser-grade, rate-limit-friendly data collection** (`ingestion/http.py`): every scraped source (NSE, Yahoo, RSS, GDELT, FRED, the
-  economic calendar) goes through one **curl_cffi** client with a real browser TLS / HTTP-2 fingerprint, falling back to `requests`
+- **Browser-grade, rate-limit-friendly data collection** (`ingestion/http.py`): every scraped source (NSE, Yahoo, RSS, GDELT) goes
+  through one **curl_cffi** client with a real browser TLS / HTTP-2 fingerprint, falling back to `requests`
   when curl_cffi is unusable. Per-source rate limiting adapts (a 429 doubles the spacing, successes ease it back) with jitter,
   `Retry-After`, exponential back-off, a circuit breaker, caller **deadlines** (the pre-open polls cannot push the report past its
   cutoff), HTTPS-only, a response-size cap, secret-free errors and per-source counters logged after every job. Requests are batched
@@ -139,8 +143,8 @@ server with native systemd (no containers).
   the injected clock; the similar-day validity count joins the meta-model context and each name is judged against the specialist-disagreement
   limit of the model that scored it.
 - **News and event graph.** Append-only edge history (`graph_edge_history`) with point-in-time edges as an opt-in for replays; poison items
-  are parked instead of blocking the queue (`processed = 2`, retry counter `news.retries`); market-reaction ("priced in") handling; the
-  economic calendar is keyed by country, title and date; measured-versus-prior edges are labelled `[expert prior]` / `[measured]` /
+  are parked instead of blocking the queue (`processed = 2`, retry counter `news.retries`); market-reaction ("priced in") handling;
+  measured-versus-prior edges are labelled `[expert prior]` / `[measured]` /
   `[broken]` in the chains; raw news text older than the retention is actually deleted.
 - **Evaluation.** A forced re-scan was counted twice and pre/final snapshots were pooled: only the effective snapshot per (date, stage) is
   scored, once per day; `n_days_30/90` were never persisted, so the calibration-drift and negative-skill health checks could never fire;
@@ -155,10 +159,33 @@ server with native systemd (no containers).
   a heavy job waiting for RAM or disk held back every light job behind it in the queue; a failed gpg run with `BACKUP_PASSPHRASE` set left an
   unencrypted backup that would have been uploaded off-box (it now stays local, `backup_encryption_failed` and a health warning are raised);
   the evening summary's data-quality notes were never filled (now: preliminary-only scoring, provisional outcomes, degraded or late snapshots);
-  the report and the dashboard said "range >=" where labels and evaluation use "range >"; the source catalogue claimed event-day flags from
-  the economic calendar although nothing reads it (FRED and the economic calendar are collected for research only, and now say so);
+  the report and the dashboard said "range >=" where labels and evaluation use "range >";
   `telegram-setup` and `doctor` reported only the exception type ("rejected the token: DataUnavailable") for every Telegram failure, which
   hid whether the cause was a wrong token, a wrong chat or a blocked network (they now print Telegram's own reason, with secrets redacted).
+
+### Removed
+
+Work that cost requests, CPU or disk and fed nothing, and dead code, taken out completely (code, tests, documentation). The saving is
+small in every case except the first; the gain is less to run, maintain and explain.
+
+- **The 08:30 `preflight` job and its `preflight_failed` alert.** It repeated what `collect_global` (06:00) and `collect_india` (08:00)
+  had already done (both retry until their windows close), then dry-ran the whole preliminary scan and threw the result away; the
+  real `prelim_scan` ran the identical scan 15 minutes later. This is the only removal with a measurable saving: one dry-run scan (about
+  11 seconds on the development PC) and a few provider requests every trading morning. Its one useful side effect stays: `prelim_scan` now
+  repairs the previous session once more (bounded to two minutes) when that session is below 90 % coverage, and costs one query when
+  it is complete.
+- **Economic-calendar and FRED collection** (`ingestion/macro.py`, `NewsCollector.collect_econ_calendar`, their retention rules, source
+  entries and `FRED_API_KEY`). Nothing ever read the data: one small request a day (FRED did nothing without a key) and two tables.
+  Migration `0005_drop_unused_macro_tables.sql` drops the `macro_observations` and `econ_calendar` tables and the registry rows of
+  the two sources (a stale failure counter would otherwise keep raising a health warning). It is the first migration that removes
+  data and it cannot be undone; the rows are in any earlier backup.
+- **Readers nothing called:** the live option-chain reader (`NseApi.option_chain_summary`, its parser and fixtures),
+  `YahooClient.fetch_intraday` and `HttpClient.get_bytes`.
+- **Settings nothing read:** `TRAINING_DOW` (the weekly training day is fixed in the timetable, Saturday 02:00 IST, so changing the
+  setting did nothing) and `MIN_NEWS_MODEL_DAYS`.
+- **Dead code:** five unused exception types (`StaleDataError`, `ValidationFailed`, `LeakageError`, `CutoffMissed`, `JobTimeout`),
+  `now_ist`, `set_oom_score_adjust`, `parse_hhmm`, `backfill_fno_history`, `require_integrity`, `finite_mask`, `utc_now_iso`,
+  `sleep_budget`, `spec_for`, `bar_date_range` and `wait_for_preopen` (use `await_preopen(...).share`).
 
 ### Verified on real data
 

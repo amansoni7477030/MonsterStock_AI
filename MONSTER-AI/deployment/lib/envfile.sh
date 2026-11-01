@@ -17,7 +17,7 @@ _MONSTER_ENVFILE_LOADED=1
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 # Secret keys: must equal the entries of app.config.VARS with secret=True (a test enforces this).
-ENV_SECRET_KEYS=(TELEGRAM_BOT_TOKEN LLM_API_KEY MODEL_SIGNING_KEY BACKUP_PASSPHRASE
+ENV_SECRET_KEYS=(TELEGRAM_BOT_TOKEN LLM_API_KEY GROQ_API_KEY TYPESAFE_API_KEY MODEL_SIGNING_KEY BACKUP_PASSPHRASE
   S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY DASHBOARD_TOKEN)
 
 # Keys that describe one machine's file system or runtime: never imported from another machine's file.

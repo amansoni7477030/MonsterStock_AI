@@ -568,6 +568,40 @@ def cmd_telegram_preview(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_ai_test(args: argparse.Namespace) -> int:
+    """Send one made-up news item to Groq and Jev through the production code and say whether each answered (or why not)."""
+    from news_intelligence.ai_check import run_checks
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    store = resolver = None
+    try:  # the entity resolver makes the LLM's companies resolvable; without a database the check still works
+        from news_intelligence.entities import EntityResolver
+
+        store = _open_store(settings)
+        resolver = EntityResolver(store)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ai-test runs without entity resolution: %s", _why(exc))
+    try:
+        checks = run_checks(settings, only=None if args.service == "all" else [args.service], deep=not args.list_only,
+                            resolver=resolver)
+    finally:
+        if store is not None:
+            store.close()
+    if args.json:
+        _print_json([check.to_dict() for check in checks])
+    else:
+        for check in checks:
+            took = "" if check.seconds is None else f" {check.seconds:.1f}s"
+            print(f"{check.label:<22} {check.status.upper():<5}{took}  {check.detail}")
+    active = [check for check in checks if check.status != "off"]
+    if not active:
+        print("nothing to test: add GROQ_API_KEY and/or TYPESAFE_API_KEY to the env file (the AI services are optional)",
+              file=sys.stderr)
+        return EXIT_FAIL
+    return EXIT_OK if all(check.usable for check in active) else EXIT_FAIL
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     settings = _settings(args)
     _logging(settings, "dashboard.log")
@@ -665,6 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", nargs="+", metavar="KIND", help="only these kinds (see --list)")
     p.add_argument("--list", action="store_true", help="list the kinds of sample message and exit")
     p.add_argument("--delay", type=float, default=1.2, help="seconds between messages (default 1.2)")
+    p = add("ai-test", cmd_ai_test, "check the optional Groq / Jev AI keys with one made-up news item")
+    p.add_argument("--service", choices=("all", "llm", "jev"), default="all")
+    p.add_argument("--list-only", action="store_true", help="only list the models the key can use (spends no tokens)")
+    p.add_argument("--json", action="store_true")
     add("dashboard", cmd_dashboard, "run the read-only dashboard")
     return parser
 

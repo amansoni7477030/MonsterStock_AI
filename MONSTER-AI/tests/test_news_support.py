@@ -141,15 +141,24 @@ def jev_response(status=200, *, usage=(210, 14), headers=None, **kw):
 
 
 class FakeSession:
-    """Scripted HTTP session: responses are consumed in order and the last one repeats."""
+    """Scripted HTTP session: responses are consumed in order and the last one repeats (``gets`` script the GET calls)."""
 
-    def __init__(self, *responses: Any) -> None:
+    def __init__(self, *responses: Any, gets: tuple[Any, ...] | list[Any] = ()) -> None:
         self.responses = list(responses)
+        self.gets = list(gets)
         self.calls: list[dict[str, Any]] = []
 
-    def post(self, url: str, headers: Any = None, json: Any = None, timeout: Any = None) -> Any:
-        self.calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        item = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+    @staticmethod
+    def _take(queue: list[Any]) -> Any:
+        item = queue.pop(0) if len(queue) > 1 else queue[0]
         if isinstance(item, Exception):
             raise item
         return item
+
+    def post(self, url: str, headers: Any = None, json: Any = None, timeout: Any = None) -> Any:
+        self.calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return self._take(self.responses)
+
+    def get(self, url: str, headers: Any = None, timeout: Any = None) -> Any:
+        self.calls.append({"url": url, "headers": headers, "json": None, "timeout": timeout, "method": "GET"})
+        return self._take(self.gets)

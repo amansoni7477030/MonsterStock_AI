@@ -54,7 +54,7 @@ CLI_CONTRACT = {
     "version", "env-example", "init", "doctor", "bootstrap", "daemon", "health", "alert-unit",
     "telegram-setup", "telegram-test", "dashboard", "backup",
 }
-CLI_WORKFLOW_EXTRA = {"train", "logs", "diag", "storage"}  # operator commands: documented, never called by units or scripts
+CLI_WORKFLOW_EXTRA = {"train", "logs", "diag", "storage", "ai-test"}  # operator commands: documented, never called by units or scripts
 
 # Names that are not application settings (app.config.VARS) but are set / read by the deployment layer.
 RUNTIME_VARIABLES = {

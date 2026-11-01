@@ -33,10 +33,9 @@ from typing import Any
 
 import requests
 
-from app import __version__
 from app.clock import Clock
 from app.config import Settings
-from app.logging_setup import redact, register_secret
+from app.logging_setup import register_secret
 from news_intelligence.events import EVENT_TYPES, EventDraft
 from news_intelligence.remote import (
     RETRY_AFTER_CAP_SEC,
@@ -310,6 +309,7 @@ class JevJudge(RemoteJudge):
 
     CACHE_PREFIX = CACHE_PREFIX
     COUNTER = "jev"
+    SOURCE_ID = "jev_judgment"
     CACHE_TTL_DAYS = CACHE_TTL_DAYS
 
     def __init__(
@@ -325,10 +325,9 @@ class JevJudge(RemoteJudge):
         backoff_cap: float = 8.0,
         max_consecutive_failures: int = 5,
     ) -> None:
-        super().__init__(clock=clock, store=store, resolver=resolver, max_consecutive_failures=max_consecutive_failures,
-                         max_seconds=MAX_SECONDS_PER_RUN)
+        super().__init__(clock=clock, store=store, resolver=resolver, session=session,
+                         max_consecutive_failures=max_consecutive_failures, max_seconds=MAX_SECONDS_PER_RUN)
         self.settings = settings
-        self.session = session
         self.max_attempts = max(1, max_attempts)
         self.backoff_base = backoff_base
         self.backoff_cap = backoff_cap
@@ -350,19 +349,6 @@ class JevJudge(RemoteJudge):
     def _url(self) -> str:
         return JEV_BASE_URL + JEV_PATH
 
-    def _post_once(self, body: dict[str, Any]) -> tuple[int, Any, dict[str, str]]:
-        if self.session is None:
-            self.session = requests.Session()
-        headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": f"monster-ai/{__version__}"}
-        if self.settings.typesafe_api_key:
-            headers["Authorization"] = "Bearer " + self.settings.typesafe_api_key
-        response = self.session.post(self._url(), headers=headers, json=body, timeout=float(self.settings.jev_timeout_sec))
-        try:
-            payload = response.json()
-        except (ValueError, AttributeError):
-            payload = None
-        return int(response.status_code), payload, dict(getattr(response, "headers", {}) or {})
-
     def _request(self, body: dict[str, Any]) -> Any:
         """POST with bounded retries; returns the decoded response or raises ``Fatal`` / ``Quota`` / ``OutOfTime`` /
         ``RuntimeError``. 429 and 529 are "retry later": a short ``Retry-After`` is slept through, a long one is a quota."""
@@ -372,7 +358,9 @@ class JevJudge(RemoteJudge):
             if self.out_of_time:
                 raise OutOfTime()
             try:
-                status, payload, headers = self._post_once(body)
+                status, payload, _text, headers = self.send(
+                    "POST", self._url(), self.settings.typesafe_api_key, float(self.settings.jev_timeout_sec), body
+                )
             except (requests.RequestException, OSError) as exc:
                 last = f"transport error {type(exc).__name__}"
                 status, payload, headers = -1, None, {}
@@ -410,34 +398,14 @@ class JevJudge(RemoteJudge):
         if cached is not None:
             self.run_cache_hits += 1
             return cached
-        if self.tripped:
+        if not self._admit(int(self.settings.jev_max_items_per_run)):
             return None
-        if self.cooldown_active():
-            self.tripped = True
-            return None
-        if self.run_calls >= int(self.settings.jev_max_items_per_run) or self.out_of_time:
-            self.run_budget_skipped += 1
-            return None
-        self.run_calls += 1
-        self._bump("jev.calls")
-        try:
-            payload = self._request(build_request(str(self.settings.jev_model), title, text, company=company, source_kind=source_kind))
-            judgment = parse_response(payload, company_in_focus=company is not None)
-        except Fatal as exc:
-            self._failed(f"fatal: {exc}", trip=True)
-            return None
-        except Quota as exc:
-            self._failed(f"rate limit: {exc}", trip=True)
-            self.start_cooldown(exc.seconds)
-            return None
-        except OutOfTime:
-            self.run_calls -= 1
-            self.run_budget_skipped += 1
-            self.tripped = True
-            return None
-        except Exception as exc:  # the judge must never lose an item: any failure falls back to the rules
-            self._failed(redact(f"{type(exc).__name__}: {exc}"))
-            return None
-        self.consecutive_failures = 0
-        self._cache_write(key, judgment.to_dict())
+        judgment = self._attempt(
+            lambda: parse_response(
+                self._request(build_request(str(self.settings.jev_model), title, text, company=company, source_kind=source_kind)),
+                company_in_focus=company is not None,
+            )
+        )
+        if judgment is not None:
+            self._cache_write(key, judgment.to_dict())
         return judgment
