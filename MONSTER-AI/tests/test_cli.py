@@ -19,7 +19,7 @@ def cli_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MONSTER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MONSTER_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("MONSTER_ENV_FILE", str(tmp_path / "none.env"))
-    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY", "TYPESAFE_API_KEY", "LLM_API_BASE", "LLM_MODEL", "LLM_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(runner, "_install_sigterm", lambda: None)
     return tmp_path
@@ -53,6 +53,52 @@ def test_doctor_offline_reports_ready_in_a_clean_environment(cli_env, capsys):
     names = {c["name"] for c in payload["checks"]}
     assert {"python", "package numpy", "configuration", "database", "seed data"} <= names
     assert run(["doctor", "--offline"]) == 0 and "READY" in capsys.readouterr().out
+
+
+def test_doctor_reports_the_ai_services_as_optional_and_names_the_ones_that_are_on(cli_env, monkeypatch):
+    import app.doctor as doctor
+    from app.config import load_settings
+
+    report = doctor.DoctorReport()
+    doctor._ai_config(report, load_settings())
+    (row,) = report.checks
+    assert row.name == "ai services" and row.status == "ok" and row.detail.startswith("off (optional)")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_groq_key_1234567890")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts_test_typesafe_key_1234567890")
+    report = doctor.DoctorReport()
+    doctor._ai_config(report, load_settings())
+    detail = report.checks[0].detail
+    assert "LLM via groq (openai/gpt-oss-120b, openai/gpt-oss-20b)" in detail and "Jev (jev-1.14.0)" in detail
+    assert "gsk_test" not in detail and "ts_test" not in detail
+
+
+def test_doctor_probes_only_configured_ai_services_for_free_and_never_fails_the_machine_for_them(cli_env, monkeypatch):
+    import app.doctor as doctor
+    from app.config import load_settings
+    from news_intelligence import ai_check
+    from news_intelligence.ai_check import AiCheck
+
+    seen = []
+
+    def fake(settings, **kwargs):
+        seen.append(kwargs)
+        return [AiCheck("llm", "Groq LLM", "fail", "HTTP 401: the key was rejected, check GROQ_API_KEY"),
+                AiCheck("jev", "Jev (TypeSafe AI)", "off", "not configured")]
+
+    monkeypatch.setattr(ai_check, "run_checks", fake)
+    report = doctor.DoctorReport()
+    doctor._ai_network(report, load_settings())
+    assert seen == [{"deep": False}]  # the doctor spends no tokens
+    (row,) = report.checks  # the service that is off is not listed
+    assert row.name == "ai: Groq LLM" and row.status == "warn" and not report.failed
+
+    def boom(settings, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(ai_check, "run_checks", boom)
+    report = doctor.DoctorReport()
+    doctor._ai_network(report, load_settings())
+    assert report.checks[0].name == "ai check" and report.checks[0].status == "warn" and not report.failed
 
 
 def test_doctor_names_the_reason_when_the_bot_check_fails(cli_env, monkeypatch):
@@ -342,6 +388,64 @@ def test_telegram_preview_reports_the_reason_when_telegram_fails_midway(cli_env,
     assert run(["telegram-preview", "--delay", "0"]) == 1
     err = capsys.readouterr().err
     assert "after 2 message(s)" in err and "HTTP 429: rate limited by Telegram" in err
+
+
+def _ai_checks(monkeypatch, *checks):
+    """``run_checks`` answers with ``checks`` (filtered like the real one) and records how the command called it."""
+    from news_intelligence import ai_check
+
+    calls = []
+
+    def fake(settings, **kwargs):
+        calls.append(kwargs)
+        return [c for c in checks if kwargs.get("only") is None or c.service in kwargs["only"]]
+
+    monkeypatch.setattr(ai_check, "run_checks", fake)
+    return calls
+
+
+def test_ai_test_without_any_key_says_what_to_add_and_fails(cli_env, capsys):
+    assert run(["ai-test"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out.count("OFF") == 2 and "GROQ_API_KEY" in captured.err and "TYPESAFE_API_KEY" in captured.err
+
+
+def test_ai_test_prints_a_line_per_service_and_succeeds_when_every_configured_one_answers(cli_env, monkeypatch, capsys):
+    from news_intelligence.ai_check import AiCheck
+
+    calls = _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "ok", "model m: order_win", 1.5),
+                       AiCheck("jev", "Jev (TypeSafe AI)", "off", "not configured"))
+    assert run(["ai-test"]) == 0
+    out = capsys.readouterr().out
+    assert "Groq LLM" in out and "OK" in out and "1.5s" in out and "OFF" in out
+    assert calls[0]["deep"] is True and calls[0]["resolver"] is not None  # the real database gives the LLM's companies a meaning
+
+
+def test_ai_test_fails_when_a_configured_service_does_not_answer_and_a_warning_still_passes(cli_env, monkeypatch, capsys):
+    from news_intelligence.ai_check import AiCheck
+
+    _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "warn", "model m: order_win; not listed for this key: x", 1.0),
+               AiCheck("jev", "Jev (TypeSafe AI)", "fail", "HTTP 401: the key was rejected", 0.2))
+    assert run(["ai-test"]) == 1 and "FAIL" in capsys.readouterr().out
+    assert run(["ai-test", "--service", "llm"]) == 0  # only the warning remains
+
+
+def test_ai_test_options_json_service_and_list_only(cli_env, monkeypatch, capsys):
+    from news_intelligence.ai_check import AiCheck
+
+    calls = _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "ok", "key accepted"), AiCheck("jev", "Jev (TypeSafe AI)", "ok", "key accepted"))
+    assert run(["ai-test", "--json", "--service", "jev", "--list-only"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["service"] for item in payload] == ["jev"] and payload[0]["status"] == "ok"
+    assert calls[0]["only"] == ["jev"] and calls[0]["deep"] is False
+
+
+def test_ai_test_still_works_when_the_database_cannot_be_opened(cli_env, monkeypatch, capsys):
+    from news_intelligence.ai_check import AiCheck
+
+    calls = _ai_checks(monkeypatch, AiCheck("llm", "Groq LLM", "ok", "fine"))
+    monkeypatch.setattr(cli, "_open_store", lambda settings: (_ for _ in ()).throw(OSError("disk is read-only")))
+    assert run(["ai-test"]) == 0 and calls[0]["resolver"] is None
 
 
 def test_evaluate_and_train_plumbing(cli_env, monkeypatch, capsys):

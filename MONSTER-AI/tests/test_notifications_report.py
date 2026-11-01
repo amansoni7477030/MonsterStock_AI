@@ -885,6 +885,7 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
         "llm_api_key": "sk-fake-llm-key-12345",
         "llm_api_base": "https://llm.example.test/v1",
         "llm_model": "fake-model",
+        "typesafe_api_key": "ts-fake-typesafe-key-12345",
         "s3_bucket": "fake-bucket",
         "s3_access_key_id": "AKIAFAKEFAKEFAKE1234",
         "s3_secret_access_key": "fake/secret/access/key",
@@ -903,12 +904,19 @@ def test_test_message_has_mode_and_config_summary_but_no_secrets(settings):
     assert any(ln.startswith("🎯 <b>Targets:</b> primary range threshold 3% · thresholds 1, 2, 3, 5% · top-N 5 · universe fno_nifty100") for ln in got)
     for line in ("🔹 08:45:00 preliminary scan", "🔹 09:08:45 final scan", "🔹 09:12:00 report cutoff · 09:14:30 delivery deadline"):
         assert line in got, line
-    assert any(ln.startswith("🔌 <b>Integrations:</b> LLM ✅ configured · off-box backup ✅ configured") for ln in got)
+    assert any(ln.startswith("🔌 <b>Integrations:</b> LLM ✅ configured · Jev ✅ configured · off-box backup ✅ configured") for ln in got)
     for secret in (*secrets.values(), "1001", "2002"):
         assert secret not in text
     bare = "\n".join(lines([render_test_message(settings)]))
     assert "Report chat: ❌ NOT configured" in bare and "Alerts go to: the same chat" in bare
-    assert "LLM ⚪ off · off-box backup ⚪ off" in bare
+    assert "LLM ⚪ off · Jev ⚪ off · off-box backup ⚪ off" in bare
+
+
+def test_test_message_shows_each_ai_service_by_its_own_key(settings):
+    groq_only = render_test_message(dataclasses.replace(settings, groq_api_key="gsk_fake_groq_key_1234567890"))
+    assert "LLM ✅ configured · Jev ⚪ off" in groq_only and "gsk_fake" not in groq_only
+    jev_only = render_test_message(dataclasses.replace(settings, typesafe_api_key="ts-fake-typesafe-key-12345"))
+    assert "LLM ⚪ off · Jev ✅ configured" in jev_only
 
 
 def test_test_message_tolerates_partial_settings_objects():

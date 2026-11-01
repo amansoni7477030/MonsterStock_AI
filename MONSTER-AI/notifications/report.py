@@ -810,7 +810,8 @@ def render_test_message(settings: Any) -> str:
         f"{style.BULLET} {_txt(cfg('final_scan_time'), 10)} final scan",
         f"{style.BULLET} {_txt(cfg('report_cutoff_time'), 10)} report cutoff · "
         f"{_txt(cfg('report_deadline_time'), 10)} delivery deadline",
-        f"🔌 <b>Integrations:</b> LLM {state(cfg('llm_api_base', ''))} · "
+        f"🔌 <b>Integrations:</b> LLM {state(getattr(settings, 'llm_configured', False))} · "
+        f"Jev {state(getattr(settings, 'jev_configured', False))} · "
         f"off-box backup {state(cfg('s3_bucket', ''))} · dashboard {flag(cfg('dashboard_enabled', False))} · "
         f"training {_txt(cfg('training_mode'), 20)}",
         "",

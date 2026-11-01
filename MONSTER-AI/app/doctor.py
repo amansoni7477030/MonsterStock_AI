@@ -163,6 +163,31 @@ def _telegram_config(report: DoctorReport, s: Settings) -> None:
         report.add("telegram settings", "warn", "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; reports cannot be delivered")
 
 
+def _ai_config(report: DoctorReport, s: Settings) -> None:
+    """The AI services are optional enrichment: being off is fine (a half-set configuration is caught by ``validate``)."""
+    on = []
+    if s.llm_configured:
+        on.append(f"LLM via {s.llm_provider} ({', '.join(m for m in (s.llm_model_name, s.llm_fallback_name) if m)})")
+    if s.jev_configured:
+        on.append(f"Jev ({s.jev_model})")
+    report.add("ai services", "ok", " + ".join(on) or "off (optional): GROQ_API_KEY / TYPESAFE_API_KEY not set, the rules run alone")
+
+
+def _ai_network(report: DoctorReport, s: Settings) -> None:
+    """Free model-list calls prove each configured key without spending tokens (``ai-test`` sends a real sample). An optional
+    service that fails is a warning, never a reason to call the machine not ready."""
+    try:
+        from news_intelligence.ai_check import run_checks
+
+        checks = run_checks(s, deep=False)
+    except Exception as exc:  # noqa: BLE001
+        report.add("ai check", "warn", f"{type(exc).__name__}: {redact(str(exc))[:120]}")
+        return
+    for check in checks:
+        if check.status != "off":
+            report.add(f"ai: {check.label}", "ok" if check.status == "ok" else "warn", check.detail)
+
+
 def _network(report: DoctorReport, s: Settings) -> None:
     from app.errors import DataUnavailable
     from ingestion.http import HttpClient
@@ -218,8 +243,10 @@ def run_doctor(*, offline: bool = False, env_file: str | None = None) -> DoctorR
         _resources(report, settings)
         _http_transport(report, settings)
         _telegram_config(report, settings)
+        _ai_config(report, settings)
         if not offline:
             _network(report, settings)
+            _ai_network(report, settings)
     return report
 
 
