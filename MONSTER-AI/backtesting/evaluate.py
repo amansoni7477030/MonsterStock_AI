@@ -1,9 +1,15 @@
 """Outcome collection and evaluation (blueprint sections 15, 19): attach realised outcomes to frozen predictions WITHOUT
-editing them, then score the model against same-day baselines with intervals and sample sizes."""
+editing them, then score the model against same-day baselines with intervals and sample sizes.
+
+Only the EFFECTIVE snapshot of a (trade date, stage) is ever scored (see ``Store.effective_snapshot``) and every day is scored
+on a single stage, so a forced re-scan or a preliminary snapshot never counts a pick twice. The rolling-window range-forecast,
+ranking and slice metrics live in ``backtesting.live_record``. Nothing here claims a trading strategy: the outcomes measure
+how far a session moved, not what a trade would have earned."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import date, timedelta
 from typing import Any
 
@@ -12,6 +18,7 @@ import pandas as pd
 
 from app import jsonutil
 from app.config import Settings
+from backtesting import live_record
 from backtesting import metrics as M
 from database.store import Store
 from features.labels import threshold_name
@@ -19,21 +26,40 @@ from ranking.types import EveningRow, EveningSummary
 
 log = logging.getLogger(__name__)
 
+# "gap" ranks on the opening gap in the final stage, but on yesterday's range in the preliminary stage (the pre-open price is
+# not known yet): ranking.ranker.baseline_picks still files both under "gap".
 BASELINES = ("atr", "range20", "volume", "gap", "random")
+SCORING_ORDER = ("final", "pre")  # a day is scored on its final snapshot, else on its preliminary one
 
 
 def outcome_metrics(o: float, h: float, low: float, c: float) -> dict[str, float]:
-    """Appendix A definitions. mfe/mae: favourable = the larger excursion, adverse = the smaller one (direction-agnostic)."""
+    """Excursions of one session from its open, in % of the open (Appendix A).
+
+    ``mfe_pct`` / ``mae_pct`` describe a HYPOTHETICAL entry at the open taken on the side that turned out favourable, which is
+    only known with hindsight: for a long MFE = (high - open) / open and MAE = (open - low) / open, a short is the mirror
+    image; so MFE = max(up, down) and MAE = min(up, down). They show how lopsided the range was, NOT the result of a trading
+    strategy: no entry rule, stop, cost or slippage is modelled and none is claimed."""
     up, down = (h - o) / o * 100.0, (o - low) / o * 100.0
     return {"range_pct": (h - low) / o * 100.0, "exc_pct": max(up, down), "dir_ret_pct": (c - o) / o * 100.0,
             "mfe_pct": max(up, down), "mae_pct": min(up, down)}
 
 
+def scored_stages(store: Store, *, since: str | None = None, until: str | None = None) -> dict[str, str]:
+    """trade date -> the stage whose effective snapshot scores that day (final if it exists, else preliminary)."""
+    stages: dict[str, str] = {}
+    for snap in store.effective_snapshots(since=since, until=until):
+        day, stage = snap["trade_date"], snap["stage"]
+        if stage in SCORING_ORDER and (day not in stages or SCORING_ORDER.index(stage) < SCORING_ORDER.index(stages[day])):
+            stages[day] = stage
+    return stages
+
+
 def collect_outcomes(store: Store, settings: Settings, trade_date: str) -> dict[str, int]:
-    """Attach realised outcomes (official bhavcopy when available, otherwise vendor bars flagged unvalidated)."""
+    """Attach realised outcomes (official bhavcopy when available, otherwise vendor bars flagged unvalidated) to the
+    effective predictions of ``trade_date``."""
     pending = store.predictions_without_validated_outcome(trade_date)
     counts = {"attached": 0, "validated": 0, "missing": 0}
-    snapshots: dict[str, dict[str, Any]] = {}
+    frozen_features: dict[int, Mapping[str, Any] | None] = {}  # snapshot_id -> its feature payload, decompressed once
     for pred in pending:
         iid = store.instrument_id(pred["symbol"])
         bars = store.get_bars(iid, trade_date, trade_date) if iid is not None else pd.DataFrame()
@@ -47,8 +73,10 @@ def collect_outcomes(store: Store, settings: Settings, trade_date: str) -> dict[
             continue
         m = outcome_metrics(o, h, low, c)
         hits = {f"hit_{threshold_name(t)}": bool(m["range_pct"] > t) for t in settings.range_thresholds}
-        snap = snapshots.setdefault(pred["stage"], store.latest_snapshot(trade_date, pred["stage"]) or {})
-        baseline_range = feature_value((snap.get("payload") or {}).get("features"), pred["symbol"], "t_range_mean20")
+        snapshot_id = int(pred["snapshot_id"])
+        if snapshot_id not in frozen_features:
+            frozen_features[snapshot_id] = ((store.get_snapshot(snapshot_id) or {}).get("payload") or {}).get("features")
+        baseline_range = feature_value(frozen_features[snapshot_id], pred["symbol"], "t_range_mean20")
         if baseline_range:
             hits["unusual"] = bool(m["range_pct"] > settings.unusual_k * float(baseline_range))
         validated = int(bar["source_rank"]) >= 2
@@ -66,7 +94,9 @@ def _day_rows(store: Store, trade_date: str, stage: str) -> pd.DataFrame:
 
 def evaluate_day(store: Store, settings: Settings, trade_date: str) -> EveningSummary | None:
     """Per-day summary of the model's frozen top-N versus same-day baseline picks."""
-    stage = "final" if store.predictions_for(trade_date, stage="final", baselines=None) else "pre"
+    stage = scored_stages(store, since=trade_date, until=trade_date).get(trade_date)
+    if stage is None:
+        return None
     frame = _day_rows(store, trade_date, stage)
     if frame.empty:
         return None
@@ -105,7 +135,18 @@ def evaluate_day(store: Store, settings: Settings, trade_date: str) -> EveningSu
         baseline_hit_rates=baseline_rates, mean_range_pct=float(model["range_pct"].mean()),
         baseline_mean_range_pct=baseline_range, rolling=rolling,
         calibration_note=_calibration_note(rolling), provisional=not validated, missing_symbols=missing + meta_missing,
+        live_record=_live_record(store, settings, trade_date),
     )
+
+
+def _live_record(store: Store, settings: Settings, trade_date: str) -> dict[str, list[dict[str, Any]]]:
+    """The rolling range-forecast / ranking / slice record. It enriches the evening report, so a failure in it is logged and
+    must never cost the report itself."""
+    try:
+        return live_record.build(store, settings, trade_date, scored_stages(store, until=trade_date))
+    except Exception:  # noqa: BLE001
+        log.warning("live record for %s failed; the evening evaluation goes out without it", trade_date, exc_info=True)
+        return {}
 
 
 def _calibration_note(rolling: dict[str, float | None]) -> str:
@@ -122,9 +163,11 @@ def _calibration_note(rolling: dict[str, float | None]) -> str:
 
 
 def rolling_summary(store: Store, settings: Settings, trade_date: str, windows: tuple[int, ...] = (30, 90)) -> dict[str, float | None]:
-    """Pooled top-N hit rates and calibration over the last evaluated days (final-stage predictions only)."""
+    """Pooled top-N hit rates and calibration over the last evaluated days. Every day counts once: its final-stage
+    predictions, or its preliminary ones when no final snapshot exists, from the effective snapshot only."""
     start = (date.fromisoformat(trade_date) - timedelta(days=int(max(windows) * 1.6))).isoformat()
-    rows = [r for r in store.evaluated_rows(since=start, until=trade_date) if r["stage"] == "final" or r["stage"] == "pre"]
+    stages = scored_stages(store, since=start, until=trade_date)
+    rows = [r for r in store.evaluated_rows(since=start, until=trade_date) if stages.get(r["trade_date"]) == r["stage"]]
     out: dict[str, float | None] = {}
     if not rows:
         return out
@@ -147,20 +190,16 @@ def rolling_summary(store: Store, settings: Settings, trade_date: str, windows: 
 
 
 def calibration_from_snapshots(store: Store, settings: Settings, days: list[str]) -> dict[str, float | None]:
-    """Brier / ECE of the frozen primary probability for ALL eligible names (not only the picks) versus realised outcomes."""
+    """Brier / ECE of the frozen primary probability for ALL eligible names (not only the picks) versus realised outcomes,
+    read from the effective snapshot that scores each day."""
     ps: list[float] = []
     ys: list[float] = []
+    realised_by_day = store.realised_ranges(min(days), max(days)) if days else {}
+    stages = scored_stages(store, since=min(days), until=max(days)) if days else {}
     for day in days:
-        snap = store.latest_snapshot(day, "final") or store.latest_snapshot(day, "pre")
-        if not snap:
-            continue
-        table = (snap.get("payload") or {}).get("table") or {}
-        if not table:
-            continue
-        bars = store.conn.execute(
-            "SELECT i.symbol AS symbol, b.open AS o, b.high AS h, b.low AS l FROM bars_daily b JOIN instruments i USING (instrument_id) "
-            "WHERE b.trade_date = ? AND i.kind = 'equity'", (day,)).fetchall()
-        realised = {r["symbol"]: (r["h"] - r["l"]) / r["o"] * 100.0 for r in bars if r["o"] and r["h"] and r["l"]}
+        snap = store.effective_snapshot(day, stages[day]) if day in stages else None
+        table = ((snap or {}).get("payload") or {}).get("table") or {}
+        realised = realised_by_day.get(day) or {}
         for symbol, p in table.items():
             if symbol in realised and p is not None:
                 ps.append(float(p))
@@ -171,17 +210,30 @@ def calibration_from_snapshots(store: Store, settings: Settings, days: list[str]
     return {"brier": M.brier(p, y), "ece": M.ece(p, y), "brier_skill": M.brier_skill(p, y)}
 
 
+def _rolling_rows(rolling: Mapping[str, float | None]) -> list[dict[str, Any]]:
+    """``eval_metrics`` rows of the pooled rolling numbers. ``n`` is the number of days of the window; the ``n_days_<w>``
+    rows themselves are kept because the health check reads them to decide whether calibration can be judged yet."""
+    rows = []
+    for name, value in rolling.items():
+        if value is None:
+            continue
+        days = value if name.startswith("n_days_") else rolling.get(f"n_days_{name.rsplit('_', 1)[-1].rstrip('d')}")
+        rows.append({"name": name, "value": value, "n": int(days or 0)})
+    return rows
+
+
 def persist_metrics(store: Store, summary: EveningSummary) -> int:
-    """Write the day's and rolling numbers to ``eval_metrics`` (append-only history, never edits predictions)."""
+    """Write the day's, the pooled rolling and the live-record numbers to ``eval_metrics``: one history entry per as-of date,
+    idempotent per metric, never touching a prediction."""
     daily = [{"name": "topn_hit_rate", "value": summary.model_hit_rate, "n": summary.n,
               "ci_low": (summary.model_hit_ci or (None, None))[0], "ci_high": (summary.model_hit_ci or (None, None))[1]},
              {"name": "topn_mean_range_pct", "value": summary.mean_range_pct, "n": summary.n}]
     for name, value in summary.baseline_hit_rates.items():
         daily.append({"name": f"baseline_{name}_hit_rate", "value": value, "n": summary.n})
     written = store.insert_metrics(summary.trade_date, "daily", daily)
-    rolling = [{"name": k, "value": v, "n": int(summary.rolling.get(f"n_days_{k.rsplit('_', 1)[-1].rstrip('d')}") or 0)}
-               for k, v in summary.rolling.items() if v is not None and not k.startswith("n_days")]
-    written += store.insert_metrics(summary.trade_date, "rolling", rolling)
+    written += store.insert_metrics(summary.trade_date, "rolling", _rolling_rows(summary.rolling))
+    for window, rows in summary.live_record.items():
+        written += store.insert_metrics(summary.trade_date, f"rolling_{window}", rows)
     store.kv_set_json(f"evaluation:{summary.trade_date}", {"hit_rate": summary.model_hit_rate, "n": summary.n,
                                                         "provisional": summary.provisional})
     return written
@@ -208,6 +260,21 @@ def feature_value(payload: dict[str, Any] | None, symbol: str, column: str) -> f
         return payload["rows"][symbol][payload["columns"].index(column)]
     except (KeyError, ValueError, IndexError):
         return None
+
+
+def features_hash(payload: Mapping[str, Any] | None, symbol: str) -> str | None:
+    """SHA-256 of exactly what a snapshot stores for ``symbol`` (column -> rounded value, see ``feature_payload``), or ``None``
+    when the symbol is not in it. A prediction's ``features_hash`` is this value, so it can be re-verified from the
+    snapshot alone; hashing the unrounded inputs instead could never be reproduced from what is stored."""
+    columns, row = (payload or {}).get("columns"), ((payload or {}).get("rows") or {}).get(symbol)
+    if columns is None or row is None or len(columns) != len(row):
+        return None
+    return jsonutil.content_hash(dict(zip(columns, row, strict=True)))
+
+
+def verify_features_hash(payload: Mapping[str, Any] | None, symbol: str, expected: str | None) -> bool:
+    """True when the snapshot's stored features of ``symbol`` hash to ``expected`` (a prediction's ``features_hash``)."""
+    return expected is not None and features_hash(payload, symbol) == expected
 
 
 def dumps(payload: Any) -> str:  # pragma: no cover - convenience for debugging

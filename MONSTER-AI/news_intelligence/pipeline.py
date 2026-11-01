@@ -2,10 +2,17 @@
 
 ``process_pending`` turns unprocessed ``news_raw`` rows and ``filings`` into ``events`` / ``event_articles`` (rules first,
 optional validated LLM enrichment), marking each row processed in the same transaction as its event write, so it is
-idempotent and crash-safe. The read side (``event_features``, ``catalysts_for`` ...) only uses data known at ``as_of``.
+idempotent and crash-safe. An item that raises is never silently lost: it stays unprocessed and is retried on the next runs,
+and only after ``MAX_ATTEMPTS`` failed attempts is it flagged (``processed = 2``) and logged at ERROR. The read side
+(``event_features``, ``catalysts_for`` ...) only uses data known at ``as_of``.
 
 kv keys used: ``news.sig:<event_id>`` (clustering signatures, pruned with the lookup window), ``news.last_run`` (stats),
-``news.reduced_coverage`` ('1' while the configured LLM is failing), ``llm:<hash>`` / ``llm.calls`` / ``llm.failures``.
+``news.reduced_coverage`` ('1' while the configured LLM is failing), ``news.retries`` (failed attempts of the items still
+waiting for a retry), ``llm:<hash>`` / ``llm.calls`` / ``llm.failures``.
+
+Evidence entries (one per distinct origin, ``events.evidence_json``) carry what a point-in-time reader needs: ``sc`` source
+class, ``rum`` / ``den`` when the report is a rumour / a denial, and ``event_time_bound`` (the publication time, an upper bound)
+while the event time itself is unknown.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from app.config import Settings
 from database.store import Store
 from event_graph.propagation import GraphImpactEngine, StockImpact
 from event_graph.repository import GraphRepository
+from ingestion.adjust import adjusted_bars
 from news_intelligence import features as feat
 from news_intelligence.dedup import (
     MAX_ORIGINS,
@@ -42,7 +50,7 @@ from news_intelligence.entities import Entity, EntityResolver
 from news_intelligence.events import EVENT_TYPES, EventDraft, assign_polarity, classify_rules, extract_moves
 from news_intelligence.llm import LLMExtractor, LLMResult, prune_llm_cache
 from news_intelligence.priced_in import assess_reaction
-from news_intelligence.source_quality import get_registry, split_publisher_suffix
+from news_intelligence.source_quality import get_registry, source_class_of, split_publisher_suffix
 from news_intelligence.text import clean_text, domain_of, is_probably_english, lead, url_hash
 from ranking.types import Catalyst
 
@@ -52,6 +60,9 @@ BATCH_SIZE = 100
 LOOKUP_DAYS = 14
 REACTION_DAYS = 5
 SIG_PREFIX = "news.sig:"
+RETRY_KEY = "news.retries"
+MAX_ATTEMPTS = 3  # an item that fails this many times is flagged as failed instead of being retried for ever
+GAVE_UP = 2  # the ``processed`` value of such an item (0 = pending, 1 = processed)
 MAX_ENTITIES = 24
 MAX_CONTRADICTIONS = 8
 ENGLISH_CODES = frozenset({"", "en", "eng", "english"})
@@ -75,6 +86,7 @@ class ProcessStats:
     skipped_irrelevant: int = 0
     skipped_already_linked: int = 0
     errors: int = 0
+    gave_up: int = 0  # items abandoned after MAX_ATTEMPTS failed attempts
     elapsed_sec: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -129,7 +141,10 @@ class NewsPipeline:
         clock: Clock | None = None,
         llm: LLMExtractor | None = None,
         resolver: EntityResolver | None = None,
+        point_in_time_edges: bool = False,
     ) -> None:
+        """``point_in_time_edges``: for replays, propagate events over the graph edges valid at each ``as_of`` (the edge
+        history) instead of today's edges."""
         self.store = store
         self.settings = settings
         self.clock = clock or get_clock()
@@ -137,25 +152,31 @@ class NewsPipeline:
         self.llm = llm if llm is not None else (LLMExtractor(settings, clock=self.clock) if settings.llm_configured else None)
         if self.llm is not None:
             self.llm.bind(store=store, resolver=self.resolver)
+        self.point_in_time_edges = point_in_time_edges
         self._engine: GraphImpactEngine | None = None
         self._graph_repo = GraphRepository(store)
         self._cache: dict[tuple, Any] = {}
+        self._retries: dict[str, int] = {}
 
     # ================================================================================== processing
     def process_pending(self, max_items: int = 600) -> ProcessStats:
-        """Cluster unprocessed filings and articles into events; returns counts. Never duplicates events on re-run."""
+        """Cluster unprocessed filings and articles into events; returns counts. Never duplicates events on re-run. An item
+        that raises stays unprocessed for the next run (an item is attempted once per run) until ``MAX_ATTEMPTS`` is reached."""
         started = self.clock.monotonic()
         stats = ProcessStats()
         if self.llm is not None:
             self.llm.start_run()
         now = self.clock.now()
         clusterer = self._load_clusterer(now)
+        self._retries = self._load_retries()
         remaining = max(0, int(max_items))
         for kind in ("filing", "article"):
+            after: tuple[str, int] | None = None  # keyset paging: a failed item is not fetched again by this run
             while remaining > 0:
-                rows = self._fetch_batch(kind, min(BATCH_SIZE, remaining))
+                rows = self._fetch_batch(kind, min(BATCH_SIZE, remaining), after)
                 if not rows:
                     break
+                after = (str(rows[-1]["first_seen_at"]), int(rows[-1][0]))
                 linked = self._linked_ids(kind, [int(r[0]) for r in rows])
                 for row in rows:
                     remaining -= 1
@@ -171,10 +192,64 @@ class NewsPipeline:
                         return self._finish(stats, started, now)
                     except Exception:
                         stats.errors += 1
-                        log.exception("failed to process %s %s; marking it processed to avoid a retry loop", kind, row[0])
-                        self._mark_processed(kind, int(row[0]))
+                        self._item_failed(kind, int(row[0]), stats)
                         clusterer = self._load_clusterer(now)
+                    else:
+                        self._item_done(kind, int(row[0]))
         return self._finish(stats, started, now)
+
+    # ------------------------------------------------------------------------------- failed items
+    def _load_retries(self) -> dict[str, int]:
+        raw = self.store.kv_get_json(RETRY_KEY, {})
+        if not isinstance(raw, dict):
+            return {}
+        return {str(ref): int(n) for ref, n in raw.items() if isinstance(n, int) and not isinstance(n, bool)}
+
+    def _save_retries(self) -> None:
+        try:
+            if self._retries:
+                self.store.kv_set_json(RETRY_KEY, self._retries)
+            else:
+                self.store.kv_delete(RETRY_KEY)
+        except sqlite3.Error:
+            log.exception("could not save the retry counters of failed news items")
+
+    def _item_failed(self, kind: str, row_id: int, stats: ProcessStats) -> None:
+        """Called from the ``except`` block of a failed item: it stays unprocessed for another attempt, until the last one."""
+        ref = f"{kind[0]}:{row_id}"
+        attempts = self._retries.get(ref, 0) + 1
+        if attempts >= MAX_ATTEMPTS:
+            self._retries.pop(ref, None)
+            stats.gave_up += 1
+            log.exception(
+                "giving up on %s %s after %d failed attempts; marking it processed with an error flag", kind, row_id, attempts
+            )
+            self._mark_processed(kind, row_id, GAVE_UP)
+        else:
+            self._retries[ref] = attempts
+            log.exception(
+                "failed to process %s %s (attempt %d of %d); it stays unprocessed and is retried on the next run",
+                kind, row_id, attempts, MAX_ATTEMPTS,
+            )
+        self._save_retries()
+
+    def _item_done(self, kind: str, row_id: int) -> None:
+        if self._retries.pop(f"{kind[0]}:{row_id}", None) is not None:
+            self._save_retries()
+
+    def _forget_missing_retries(self) -> None:
+        """Drop the retry counters of items that no longer exist (retention removed them before they were retried)."""
+        kept: dict[str, int] = {}
+        for ref, attempts in self._load_retries().items():
+            table, column = ("filings", "filing_id") if ref.startswith("f:") else ("news_raw", "article_id")
+            try:
+                row_id = int(ref[2:])
+            except ValueError:
+                continue
+            if self.store.conn.execute(f"SELECT 1 FROM {table} WHERE {column} = ?", (row_id,)).fetchone() is not None:
+                kept[ref] = attempts
+        self._retries = kept
+        self._save_retries()
 
     def _finish(self, stats: ProcessStats, started: float, now: datetime) -> ProcessStats:
         if self.llm is not None:
@@ -192,24 +267,30 @@ class NewsPipeline:
         return stats
 
     # ------------------------------------------------------------------------------------ fetching
-    def _fetch_batch(self, kind: str, limit: int) -> list[sqlite3.Row]:
+    def _fetch_batch(self, kind: str, limit: int, after: tuple[str, int] | None = None) -> list[sqlite3.Row]:
+        """Pending rows oldest first; ``after`` = (first_seen_at, id) of the last row of the previous batch of this run."""
         if kind == "filing":
-            sql = (
+            select = (
                 "SELECT filing_id, exchange, symbol, isin, company, category, subject, substr(text, 1, 2000) AS text, "
-                "attachment_url, disseminated_at, first_seen_at, source_ref FROM filings WHERE processed = 0 "
-                "ORDER BY first_seen_at, filing_id LIMIT ?"
+                "attachment_url, disseminated_at, first_seen_at, source_ref FROM filings WHERE processed = 0"
             )
+            column = "filing_id"
         else:
-            sql = (
+            select = (
                 "SELECT article_id, source, feed, url, title, summary, substr(text, 1, 12000) AS text, language, published_at, "
-                "first_seen_at, region, category FROM news_raw WHERE processed = 0 ORDER BY first_seen_at, article_id LIMIT ?"
+                "first_seen_at, region, category FROM news_raw WHERE processed = 0"
             )
-        return self.store.conn.execute(sql, (limit,)).fetchall()
+            column = "article_id"
+        params: list[Any] = []
+        if after is not None:
+            select += f" AND (first_seen_at > ? OR (first_seen_at = ? AND {column} > ?))"
+            params += [after[0], after[0], after[1]]
+        return self.store.conn.execute(f"{select} ORDER BY first_seen_at, {column} LIMIT ?", [*params, limit]).fetchall()
 
-    def _mark_processed(self, kind: str, row_id: int) -> None:
+    def _mark_processed(self, kind: str, row_id: int, status: int = 1) -> None:
         table, column = ("filings", "filing_id") if kind == "filing" else ("news_raw", "article_id")
         try:
-            self.store.conn.execute(f"UPDATE {table} SET processed = 1 WHERE {column} = ?", (row_id,))
+            self.store.conn.execute(f"UPDATE {table} SET processed = ? WHERE {column} = ?", (status, row_id))
         except sqlite3.Error:
             log.exception("could not mark %s %s processed", kind, row_id)
 
@@ -355,7 +436,8 @@ class NewsPipeline:
     def _merge_llm(
         draft: EventDraft, entities: list[Entity], result: LLMResult, scan: str, llm_polarity: dict[str, float]
     ) -> tuple[str | None, str | None]:
-        """Fold a validated LLM result into the rule draft; returns ``(verified quote, event time)``."""
+        """Fold a validated LLM result into the rule draft; returns ``(verified quote, event time)``. Everything the LLM
+        derived that its supporting quote does not back is dropped, the event time included (it must not fabricate evidence)."""
         verified = result.quote_verified
         if (
             result.event_type != "other"
@@ -381,7 +463,7 @@ class NewsPipeline:
                 present.add(entity.id)
             if verified and entity.polarity:
                 llm_polarity[entity.id] = entity.polarity
-        return (result.evidence_quote if verified else None), result.event_time
+        return (result.evidence_quote, result.event_time) if verified else (None, None)
 
     @staticmethod
     def _scope_for(draft: EventDraft, entities: Sequence[Entity]) -> str:
@@ -489,7 +571,10 @@ class NewsPipeline:
             "kind": p.kind, "ref": p.item.ref, "t": p.seen_iso, "owner": p.item.owner, "domains": [p.item.domain], "n": 1,
             "q": round(p.quality, 3), "conf": round(p.draft.confidence, 3), "pol": round(p.item.polarity, 3),
             "title": p.title[:200], "url": p.url, "published_at": p.published_iso, "quote": p.quote,
-            "fkey": p.item.filing_key,
+            "fkey": p.item.filing_key, "sc": source_class_of(p.source_kind),
+            "rum": True if p.item.is_rumour else None, "den": True if p.item.is_denial else None,
+            # the event time is unknown (rules only, or an unverified LLM claim): the publication time is an upper bound
+            "event_time_bound": p.published_iso if p.event_time_iso is None else None,
         }
         return {k: v for k, v in entry.items() if v is not None}
 
@@ -500,19 +585,29 @@ class NewsPipeline:
             "source": record.source, "pol": round(record.polarity, 3), "against": round(record.against, 3),
         }
 
+    @staticmethod
+    def _novelty_class(item: Item, decision: Decision) -> str:
+        """How the event began: a rumour, a story resurfacing after a week, a follow-up to a recent event, or new."""
+        if item.is_rumour:
+            return "rumour"
+        if decision.resurfaced_of is not None:
+            return "resurfaced"
+        return "follow_up" if decision.followup_of is not None else "new"
+
     def _insert_event(self, conn: sqlite3.Connection, p: _Prepared, decision: Decision, key: str) -> int:
         contradictions = [self._contradiction_json(c) for c in decision.own_contradictions][:MAX_CONTRADICTIONS]
         confidence = event_confidence(p.draft.confidence, p.quality, 1, len(contradictions))
         cursor = conn.execute(
             "INSERT INTO events (cluster_key, event_type, headline, summary, region, scope, entities_json, source_quality, "
             "confidence, novelty, severity, horizon, event_time, published_at, first_seen_at, last_updated_at, n_articles, "
-            "n_independent_sources, evidence_json, contradictions_json, extraction_method) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
+            "n_independent_sources, evidence_json, contradictions_json, extraction_method, novelty_class, rumour, source_class, "
+            "n_conflicts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key, p.draft.event_type, (p.title or p.body)[:300], lead(p.body, 500) or None, p.region, p.scope,
                 jsonutil.dumps([_entity_json(e) for e in p.entities]), round(p.quality, 3), confidence,
                 round(decision.novelty, 4), p.draft.severity, p.draft.horizon, p.event_time_iso, p.published_iso, p.seen_iso,
                 p.seen_iso, jsonutil.dumps([self._evidence_entry(p)]), jsonutil.dumps(contradictions), p.method,
+                self._novelty_class(p.item, decision), int(p.item.is_rumour), source_class_of(p.source_kind), len(contradictions),
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -520,7 +615,7 @@ class NewsPipeline:
     def _update_event(self, conn: sqlite3.Connection, event: ClusterEvent, p: _Prepared, decision: Decision) -> None:
         row = conn.execute(
             "SELECT headline, entities_json, source_quality, published_at, first_seen_at, last_updated_at, evidence_json, "
-            "contradictions_json FROM events WHERE event_id = ?",
+            "contradictions_json, rumour, source_class FROM events WHERE event_id = ?",
             (event.event_id,),
         ).fetchone()
         if row is None:
@@ -531,8 +626,11 @@ class NewsPipeline:
             index = next((i for i, o in enumerate(event.origins) if o is decision.origin), None)
             if index is not None and index < len(evidence):
                 entry = evidence[index]
+                before = float(entry.get("q", 0.0))
                 entry["n"] = decision.origin.n
-                entry["q"] = round(max(float(entry.get("q", 0.0)), p.quality), 3)
+                entry["q"] = round(max(before, p.quality), 3)
+                if "sc" in entry and p.quality > before:
+                    entry["sc"] = source_class_of(p.source_kind)
                 domains = list(entry.get("domains") or [])
                 if p.item.domain and p.item.domain not in domains and len(domains) < 8:
                     domains.append(p.item.domain)
@@ -547,20 +645,24 @@ class NewsPipeline:
                 data = _entity_json(entity)
                 data["t"] = p.seen_iso
                 entities.append(data)
-        quality = max(float(row["source_quality"] or 0.0), p.quality)
+        before_quality = float(row["source_quality"] or 0.0)
+        quality = max(before_quality, p.quality)
         headline = row["headline"]
-        if p.quality >= quality and p.quality - float(row["source_quality"] or 0.0) >= 0.3 and p.title:
+        if p.quality >= quality and p.quality - before_quality >= 0.3 and p.title:
             headline = p.title[:300]
         published = min((x for x in (row["published_at"], p.published_iso) if x), default=None)
         confidence = self._confidence_from(evidence, event.n_independent, len(contradictions))
+        source_class = source_class_of(p.source_kind) if p.quality > before_quality else row["source_class"]  # the best source's
+        rumour = 0 if row["rumour"] == 1 and not p.item.is_rumour and not p.item.is_denial else row["rumour"]  # confirmed
         conn.execute(
             "UPDATE events SET headline = ?, entities_json = ?, source_quality = ?, confidence = ?, published_at = ?, "
             "first_seen_at = ?, last_updated_at = ?, n_articles = ?, n_independent_sources = ?, evidence_json = ?, "
-            "contradictions_json = ? WHERE event_id = ?",
+            "contradictions_json = ?, rumour = ?, source_class = ?, n_conflicts = ? WHERE event_id = ?",
             (
                 headline, jsonutil.dumps(entities), round(quality, 3), confidence, published,
                 min(row["first_seen_at"], p.seen_iso), max(row["last_updated_at"], p.seen_iso), event.n_articles,
-                event.n_independent, jsonutil.dumps(evidence), jsonutil.dumps(contradictions), event.event_id,
+                event.n_independent, jsonutil.dumps(evidence), jsonutil.dumps(contradictions), rumour, source_class,
+                len(contradictions), event.event_id,
             ),
         )
 
@@ -584,19 +686,20 @@ class NewsPipeline:
         confidence = self._confidence_from(evidence, event.n_independent, len(contradictions))
         stamp = iso(datetime.fromtimestamp(record.seen, tz=UTC)) or row["last_updated_at"]
         conn.execute(
-            "UPDATE events SET contradictions_json = ?, confidence = ?, last_updated_at = ? WHERE event_id = ?",
-            (jsonutil.dumps(contradictions), confidence, max(row["last_updated_at"], stamp), event.event_id),
+            "UPDATE events SET contradictions_json = ?, n_conflicts = ?, confidence = ?, last_updated_at = ? WHERE event_id = ?",
+            (jsonutil.dumps(contradictions), len(contradictions), confidence, max(row["last_updated_at"], stamp), event.event_id),
         )
 
     # ============================================================================= market reaction
     def refresh_reactions(self, as_of: Any, bars_provider: BarsProvider | None = None) -> int:
-        """Fill ``market_reacted`` / ``reaction_json`` for recent company events from daily bars (point-in-time)."""
+        """Fill ``market_reacted`` / ``reaction_json`` for recent company events from daily bars (point-in-time). A reaction
+        that is already known is never replaced by "unknown" (missing bars), only by a newer known assessment."""
         as_of_dt, as_of_iso = self._as_of(as_of)
         since = iso(as_of_dt - timedelta(days=REACTION_DAYS))
         rows = self.store.conn.execute(
-            "SELECT event_id, event_type, first_seen_at, event_time, published_at, entities_json, reaction_json FROM events "
-            "WHERE first_seen_at > ? AND first_seen_at <= ? AND event_type <> 'other' AND scope IN ('company', 'global') "
-            "ORDER BY event_id",
+            "SELECT event_id, event_type, first_seen_at, event_time, published_at, entities_json, reaction_json, market_reacted "
+            "FROM events WHERE first_seen_at > ? AND first_seen_at <= ? AND event_type <> 'other' "
+            "AND scope IN ('company', 'global') ORDER BY event_id",
             (since, as_of_iso),
         ).fetchall()
         provider = bars_provider or self._default_bars
@@ -613,19 +716,22 @@ class NewsPipeline:
             if symbol:
                 by_symbol.setdefault(symbol, []).append(row)
         updated = 0
+        unavailable: dict[str, Exception] = {}
         for symbol in sorted(by_symbol):
             earliest = min(r["first_seen_at"] for r in by_symbol[symbol])
             start = (parse_ts(earliest) - timedelta(days=90)).date().isoformat() if parse_ts(earliest) else None
             try:
                 bars = provider(symbol, start, as_of_dt.astimezone(IST).date().isoformat())
-            except Exception:
-                log.debug("bars unavailable for %s", symbol, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - one vendor failure must not stop the other symbols
+                unavailable[symbol] = exc
                 continue
             for row in by_symbol[symbol]:
                 published = row["published_at"] if row["published_at"] and row["published_at"] <= row["first_seen_at"] else None
                 reaction = assess_reaction(
                     row["first_seen_at"], row["event_time"] or published, bars, as_of_dt, preopen.get(symbol), None
                 )
+                if reaction.reacted is None and row["market_reacted"] is not None:
+                    continue  # never downgrade what is known to "unknown": missing bars today do not undo an earlier finding
                 payload = {**reaction.to_dict(), "as_of": as_of_iso, "symbol": symbol}
                 flag = None if reaction.reacted is None else int(reaction.reacted)
                 with self.store.tx():
@@ -634,6 +740,12 @@ class NewsPipeline:
                         (flag, jsonutil.dumps(payload), row["event_id"]),
                     )
                 updated += 1
+        if unavailable:
+            first = next(iter(unavailable.values()))
+            log.warning(
+                "bars unavailable for %d symbol(s) (%s); their events keep their previous reaction status (%s: %s)",
+                len(unavailable), ", ".join(list(unavailable)[:10]), type(first).__name__, first,
+            )
         return updated
 
     @staticmethod
@@ -648,10 +760,9 @@ class NewsPipeline:
         return best[1] if best else None
 
     def _default_bars(self, symbol: str, start: str | None, end: str | None) -> pd.DataFrame:
-        instrument_id = self.store.instrument_id(symbol)
-        if instrument_id is None:
+        if self.store.instrument_id(symbol) is None:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        return self.store.get_bars(instrument_id, start, end)
+        return adjusted_bars(self.store, symbol, start, end)  # on the post-split basis: a split is not a market reaction
 
     # ===================================================================================== pruning
     @contextmanager
@@ -675,7 +786,7 @@ class NewsPipeline:
         now = self.clock.now()
         cutoff = iso(now - timedelta(days=days))
         out = {"news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0}
-        for table, column, extra in (("news_raw", "article_id", ""), ("filings", "filing_id", " AND processed = 1")):
+        for table, column, extra in (("news_raw", "article_id", ""), ("filings", "filing_id", " AND processed <> 0")):
             with self._bulk_delete():
                 while True:
                     with self.store.tx() as conn:
@@ -693,6 +804,7 @@ class NewsPipeline:
                         out["event_articles_detached"] += max(detached.rowcount, 0)
                         deleted = conn.execute(f"DELETE FROM {table} WHERE {column} IN ({marks})", ids)
                         out[table] += max(deleted.rowcount, 0)
+        self._forget_missing_retries()
         window = iso(now - timedelta(days=LOOKUP_DAYS))
         with self.store.tx() as conn:
             removed = conn.execute(
@@ -732,7 +844,7 @@ class NewsPipeline:
 
     def _engine_impacts(self, views: Sequence[feat.EventView], as_of_iso: str, tag: str) -> dict[str, StockImpact]:
         if self._engine is None:
-            self._engine = GraphImpactEngine(self.store)
+            self._engine = GraphImpactEngine(self.store, point_in_time_edges=self.point_in_time_edges)
         engine = self._engine
         return self._remember(
             ("impacts", as_of_iso, tag, tuple(v.event_id for v in views)),
@@ -763,10 +875,7 @@ class NewsPipeline:
             if view.event_type == "other":
                 continue
             for entity in view.entities:
-                if (
-                    entity["type"] == "company" and entity["id"] in pairs
-                    and entity["confidence"] >= feat.MIN_ENTITY_CONFIDENCE and feat.is_subject(entity)
-                ):
+                if entity["id"] in pairs and feat.is_company_subject(entity):
                     pairs[entity["id"]].append((view, float(entity["polarity"])))
         broad = max((v.impact for v in macro_views if v.event_type in feat.BROAD_TYPES), default=0.0)
         reach = self._engine_impacts(macro_views, as_of_iso, "macro") if macro_views else {}
@@ -805,14 +914,7 @@ class NewsPipeline:
             if view.event_type == "other" and view.severity < 0.2:
                 continue
             damp = 0.6 if view.market_reacted else 1.0
-            own = next(
-                (
-                    e for e in view.entities
-                    if e["type"] == "company" and e["id"] == symbol and e["confidence"] >= feat.MIN_ENTITY_CONFIDENCE
-                    and feat.is_subject(e)
-                ),
-                None,
-            )
+            own = next((e for e in view.entities if e["id"] == symbol and feat.is_company_subject(e)), None)
             if own is not None:
                 candidates.append((view.impact * view.novelty * damp, view.event_id, view, float(own["polarity"])))
                 continue
@@ -825,11 +927,14 @@ class NewsPipeline:
                     (view.impact * view.novelty * damp * 0.7, view.event_id, view, float((effect > 0) - (effect < 0)))
                 )
         candidates.sort(key=lambda c: (-c[0], -c[1]))
+        # built through from_dict: the metadata fields are optional on Catalyst and unknown keys are ignored
         return [
-            Catalyst(
-                headline=view.headline, event_type=view.event_type, source=view.source, url=view.url,
-                published_at=view.published_at or view.first_seen_at, novelty=round(view.novelty, 3),
-                confidence=round(view.confidence, 3), severity=round(view.severity, 3), polarity=round(pol, 3),
-            )
+            Catalyst.from_dict({
+                "headline": view.headline, "event_type": view.event_type, "source": view.source, "url": view.url,
+                "published_at": view.published_at or view.first_seen_at, "novelty": round(view.novelty, 3),
+                "confidence": round(view.confidence, 3), "severity": round(view.severity, 3), "polarity": round(pol, 3),
+                "event_id": view.event_id, "novelty_class": view.novelty_class, "rumour": view.rumour,
+                "source_class": view.source_class, "n_independent": view.n_independent, "n_conflicts": view.n_conflicts,
+            })
             for _score, _eid, view, pol in candidates[: max(0, int(limit))]
         ]

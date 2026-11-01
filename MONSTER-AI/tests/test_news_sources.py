@@ -4,6 +4,7 @@ meetings, the economic calendar and raw-news retention (all against scripted HTT
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -282,6 +283,115 @@ def test_an_economic_calendar_outage_is_recorded_not_raised(collector, store, fa
     assert source_row(store, "econ_calendar")["consecutive_failures"] == 1
 
 
+def calendar_item(date_text="2026-11-04T14:00:00-05:00", **over):
+    return {"date": date_text, "country": "USD", "title": "FOMC Statement", "impact": "High", "forecast": "", "previous": "4.00%",
+            **over}
+
+
+def calendar_rows(store):
+    return [dict(r) for r in store.conn.execute("SELECT * FROM econ_calendar ORDER BY scheduled_at, title").fetchall()]
+
+
+def test_a_rescheduled_release_updates_its_row_instead_of_adding_a_duplicate(collector, store, fake_clock, monkeypatch):
+    payload = [calendar_item()]
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    assert collector.collect_econ_calendar() == 1
+    (first,) = calendar_rows(store)
+    fake_clock.advance(3600)
+    payload[0].update(date="2026-11-04T14:30:00-05:00", impact="Medium", forecast="4.25%")  # the same release, half an hour later
+    assert collector.collect_econ_calendar() == 1
+    (row,) = calendar_rows(store)
+    assert row["event_key"] == first["event_key"] and row["scheduled_at"].startswith("2026-11-04T19:30:00")
+    assert row["impact"] == "Medium" and row["forecast"] == "4.25%"
+    assert row["first_seen_at"] == first["first_seen_at"] and row["updated_at"] > first["updated_at"]
+
+
+def test_the_release_date_is_the_feeds_own_date_so_an_evening_release_moved_by_an_hour_stays_one_row(collector, store, fake_clock,
+                                                                                                  monkeypatch):
+    payload = [calendar_item("2026-11-04T19:30:00-05:00", title="Fed Chair Speaks")]  # 00:30 UTC on the 5th
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    collector.collect_econ_calendar()
+    payload[0]["date"] = "2026-11-04T18:30:00-05:00"  # 23:30 UTC on the 4th: the UTC date moved, the release date did not
+    collector.collect_econ_calendar()
+    (row,) = calendar_rows(store)
+    assert row["scheduled_at"].startswith("2026-11-04T23:30:00")
+
+
+def test_the_same_title_on_another_date_or_in_another_country_is_a_different_release(collector, store, fake_clock, monkeypatch):
+    payload = [calendar_item("2026-11-05T08:30:00-05:00", title="Unemployment Claims", impact="Low"),
+               calendar_item("2026-11-12T08:30:00-05:00", title="Unemployment Claims", impact="Low"),
+               calendar_item("2026-11-05T08:30:00-05:00", title="Unemployment Claims", impact="Low", country="CAD")]
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    assert collector.collect_econ_calendar() == 3
+    assert collector.collect_econ_calendar() == 3
+    assert len(calendar_rows(store)) == 3
+
+
+def test_two_same_titled_releases_on_one_date_keep_the_earlier_time_whatever_the_feed_order(collector, store, fake_clock, monkeypatch):
+    later, earlier = (calendar_item("2026-11-04T15:00:00-05:00", title="FOMC Member Speaks"),
+                      calendar_item("2026-11-04T09:00:00-05:00", title="FOMC Member Speaks"))
+    payload = [later, earlier]
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    assert collector.collect_econ_calendar() == 1
+    payload[:] = [earlier, later]
+    assert collector.collect_econ_calendar() == 1
+    (row,) = calendar_rows(store)
+    assert row["scheduled_at"].startswith("2026-11-04T14:00:00")  # 09:00 ET, deterministic
+
+
+def test_rows_written_with_the_old_time_based_key_are_converted_not_duplicated(collector, store, fake_clock, monkeypatch):
+    when = datetime(2026, 11, 4, 19, 0, tzinfo=timezone.utc)
+    old_key = ns._hash(f"{ns.iso(when)}|USD|FOMC Statement")  # what a release of this time was keyed on before
+    store.conn.execute(
+        "INSERT INTO econ_calendar (event_key, country, title, impact, scheduled_at, forecast, previous, source, first_seen_at, "
+        "updated_at) VALUES (?, 'USD', 'FOMC Statement', 'High', '2026-11-04T19:00:00Z', '', '4.00%', 'faireconomy', "
+        "'2026-10-30T00:00:00Z', '2026-10-30T00:00:00Z')", (old_key,))
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, [calendar_item()]))
+    assert collector.collect_econ_calendar() == 1
+    (row,) = calendar_rows(store)
+    assert row["event_key"] != old_key and row["first_seen_at"] == "2026-10-30T00:00:00Z"  # history kept, key migrated
+    assert collector.collect_econ_calendar() == 1 and len(calendar_rows(store)) == 1
+
+
+def test_a_calendar_item_whose_date_text_is_not_iso_falls_back_to_the_utc_date(collector, store, fake_clock, monkeypatch):
+    payload = [calendar_item("04-11-2026 19:00:00")]  # parsed by parse_ts (as UTC) but not an ISO date: the UTC date is the key's
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    assert collector.collect_econ_calendar() == 1
+    payload[0]["date"] = "04-11-2026 20:00:00"  # rescheduled the same day
+    assert collector.collect_econ_calendar() == 1
+    (row,) = calendar_rows(store)
+    assert row["scheduled_at"] == "2026-11-04T20:00:00Z"
+
+
+def test_a_calendar_payload_that_cannot_be_used_is_a_failure_not_a_quiet_week(collector, store, fake_clock, monkeypatch, caplog):
+    payload: list | dict = {"error": "rate limited"}  # an error object answered with HTTP 200
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, payload))
+    with caplog.at_level(logging.WARNING, logger="ingestion.news_sources"):
+        assert collector.collect_econ_calendar() == 0
+        assert source_row(store, "econ_calendar")["consecutive_failures"] == 1
+        payload = [{"date": "garbage", "title": "Broken date"}, "not a mapping", {"date": "2026-11-04T14:00:00-05:00", "title": ""}]
+        assert collector.collect_econ_calendar() == 0  # something was sent, none of it readable: the format must have changed
+        assert source_row(store, "econ_calendar")["consecutive_failures"] == 2
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and r.name == "ingestion.news_sources"]
+    assert any("unexpected payload (dict)" in m for m in warned) and any("none of the 3 items" in m for m in warned)
+    payload = []  # a genuinely empty calendar is fine
+    assert collector.collect_econ_calendar() == 0 and source_row(store, "econ_calendar")["consecutive_failures"] == 0
+    assert calendar_rows(store) == []
+
+
+def test_swallowed_collection_failures_are_logged_as_warnings_without_urls(collector, store, fake_clock, monkeypatch, caplog):
+    patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(503, b"down"))
+    with caplog.at_level(logging.WARNING, logger="ingestion.news_sources"):
+        assert collector.collect_econ_calendar() == 0
+        assert collector.collect_board_meetings(FakeNse(fail=True), date(2026, 11, 1), date(2026, 11, 2), set()) == 0
+        assert collector.collect_filings(FakeNse(fail=True), date(2026, 11, 1), date(2026, 11, 2), set()) == 0
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and r.name == "ingestion.news_sources"]
+    assert len(warned) == 3
+    assert any("economic calendar" in m for m in warned) and any("board-meeting" in m for m in warned)
+    assert any("filings" in m for m in warned)
+    assert not any("?" in m or "://" in m for m in warned)  # never a URL, let alone its query string
+
+
 def test_raw_news_retention_only_removes_old_processed_rows(collector, store, fake_clock):
     with_session(collector, fake_clock, [FakeResponse(200, GOOD)])
     collector.collect_rss([FEED])
@@ -291,3 +401,5 @@ def test_raw_news_retention_only_removes_old_processed_rows(collector, store, fa
     assert collector.prune_raw() == 1  # the unprocessed old row stays until the pipeline has seen it
     assert [r["article_id"] for r in stored(store)] == [2, 3, 4]
     assert collector.prune_raw(retention_days=0) == 0  # 0 falls back to the configured retention
+    store.conn.execute("UPDATE news_raw SET processed = 2 WHERE article_id = 2")  # the pipeline gave up on it: no reason to keep it
+    assert collector.prune_raw() == 1 and [r["article_id"] for r in stored(store)] == [3, 4]

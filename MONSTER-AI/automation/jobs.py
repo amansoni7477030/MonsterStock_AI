@@ -15,7 +15,8 @@ from typing import Any
 from app.clock import at_ist
 from app.errors import DataUnavailable
 from app.logging_setup import redact
-from app.resources import check_resources, emergency_cleanup, memory_info, prune_directory, release_memory
+from app.release import release_id
+from app.resources import check_resources, disk_info, emergency_cleanup, memory_info, release_memory
 from automation import scan
 from automation.calendar import infer_holidays_from_bars, refresh_calendar, trading_days_before
 from automation.context import JobContext, JobResult
@@ -38,6 +39,7 @@ log = logging.getLogger(__name__)
 MIN_OFFICIAL_COVERAGE = 0.90
 FNO_HISTORY_START = date(2024, 7, 8)  # first UDiFF-format F&O bhavcopy; older archives use a different layout
 BOARD_MEETING_LOOKAHEAD_DAYS = 45
+FILINGS_EXTRA_DAYS = 1  # collected from this many days before the previous trading session
 PREOPEN_COLLECT_UNTIL = "09:08:15"
 PREOPEN_COLLECT_EVERY_SEC = 45
 
@@ -72,21 +74,67 @@ def session_coverage(ctx: JobContext, session: date) -> tuple[float, list[str]]:
     return (1 - len(missing) / len(universe)) if universe else 0.0, missing
 
 
+def provisional_symbols(ctx: JobContext, session: date) -> list[str]:
+    """Universe names whose bar of ``session`` is still the vendor's provisional one (the official file has not replaced it)."""
+    rows = ctx.store.conn.execute(
+        "SELECT i.symbol AS symbol FROM bars_daily b JOIN instruments i USING (instrument_id) WHERE b.trade_date = ? "
+        "AND i.kind = 'equity' AND i.status = 'active' AND i.in_universe = 1 AND b.source_rank < 2 ORDER BY i.symbol",
+        (session.isoformat(),)).fetchall()
+    return [r["symbol"] for r in rows]
+
+
+def ingest_official(ctx: JobContext, session: date) -> dict[str, Any]:
+    """The official end-of-day file of ``session`` (one request); a provider quirk degrades to vendor data, never a crash."""
+    try:
+        written, _matched = ingest_bhavcopy(ctx.store, ctx.nse_archive(), session)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("official bhavcopy for %s unavailable: %s", session, redact(str(exc)))
+        return {"official_rows": 0, "official_error": redact(str(exc))[:120]}
+    return {"official_rows": written}
+
+
+def repair_basis_breaks(ctx: JobContext, session: date) -> dict[str, Any]:
+    """A split or bonus shows in the official file - the exchange's previous close no longer matches the close we stored - before
+    the vendor history reflects it. Ask the vendor again for exactly those stocks, every session, until it reports the split
+    (which re-adjusts the stored history and records the event); after ``GIVE_UP_DAYS`` the operator is told. See
+    ``ingestion.basis``."""
+    from ingestion import basis
+
+    store = ctx.store
+    found = basis.official_breaks(store, session)
+    basis.mark_pending(store, found)
+    waiting = basis.pending(store)
+    if not waiting:
+        return {}
+    refresh_daily_bars(store, ctx.yahoo(), now=ctx.clock.now(), years=ctx.settings.history_years, symbols=set(waiting),
+                       include_series=False, probe=False, deadline=ctx.budget(180), clock=ctx.clock)
+    repaired, gave_up = [], []
+    for symbol, since in waiting.items():
+        if basis.is_resolved(store, symbol, since):
+            basis.clear(store, symbol)
+            repaired.append(symbol)
+            log.info("%s: the vendor reported the split; history re-based (break seen on %s)", symbol, since)
+        elif basis.overdue(since, session):
+            basis.clear(store, symbol)
+            gave_up.append(symbol)
+    if gave_up:
+        log.error("price basis breaks the vendor never confirmed: %s", ", ".join(gave_up))
+        store.add_alert("warning", "price_basis_unresolved",
+                        f"the exchange's previous close differs from the stored one for {', '.join(gave_up)} but the vendor reports "
+                        "no split: their history may be on the wrong price basis (check the corporate action)",
+                        dedupe_key="basis:" + ",".join(sorted(gave_up)), dedupe_minutes=24 * 60)
+    return {"basis_breaks": len(found), "basis_repaired": len(repaired), "basis_given_up": len(gave_up),
+            "basis_waiting": len(waiting) - len(repaired) - len(gave_up)}
+
+
 def ensure_session_bars(ctx: JobContext, session: date, *, budget_sec: float = 600.0) -> dict[str, Any]:
-    """Make sure the universe has the bar of ``session``: the official file first (one request), vendor data for the rest."""
+    """Make sure the universe has the bar of ``session``: the official file first (one request) - also to replace the vendor's
+    provisional bars once it is published - and vendor data for what is still missing."""
     store, s = ctx.store, ctx.settings
     info: dict[str, Any] = {"official_rows": 0, "vendor_ok": 0, "vendor_failed": 0}
     coverage, missing = session_coverage(ctx, session)
-    if not missing:
-        info["coverage"] = coverage
-        return info
-    if s.nse_enabled:
-        try:
-            written, _matched = ingest_bhavcopy(store, ctx.nse_archive(), session)
-            info["official_rows"] = written
-        except Exception as exc:  # noqa: BLE001 - a provider quirk must degrade to vendor data, never crash the job
-            log.warning("official bhavcopy for %s unavailable: %s", session, redact(str(exc)))
-            info["official_error"] = redact(str(exc))[:120]
+    if s.nse_enabled and (missing or provisional_symbols(ctx, session)):
+        info.update(ingest_official(ctx, session))
         coverage, missing = session_coverage(ctx, session)
     if missing:
         report = refresh_daily_bars(store, ctx.yahoo(), now=ctx.clock.now(), years=s.history_years, symbols=missing,
@@ -95,6 +143,8 @@ def ensure_session_bars(ctx: JobContext, session: date, *, budget_sec: float = 6
         coverage, missing = session_coverage(ctx, session)
     info["coverage"] = round(coverage, 4)
     info["missing"] = len(missing)
+    if s.nse_enabled:
+        info.update(_guarded("price basis", repair_basis_breaks, ctx, session) or {})
     return info
 
 
@@ -160,11 +210,22 @@ def collect_news(ctx: JobContext) -> JobResult:
         gdelt = collector.collect_gdelt(queries, deadline=deadline)
         metrics.update(gdelt_ok=gdelt.ok, gdelt_new=gdelt.new_items)
     if s.nse_enabled:
-        day = ctx.run_date
-        metrics["filings_new"] = collector.collect_filings(ctx.nse_api(), day - timedelta(days=2), day, set(universe_symbols(ctx)))
+        start, end = filings_window(ctx)
+        metrics["filings_new"] = collector.collect_filings(ctx.nse_api(), start, end, set(universe_symbols(ctx)))
+        metrics["filings_window"] = f"{start}..{end}"
     metrics["processed"] = ctx.intel().process()
     healthy = rss.success_ratio >= 0.5
     return JobResult("success" if healthy else "failed", f"{rss.ok}/{rss.attempted} feeds ok, {rss.new_items} new items", metrics)
+
+
+def filings_window(ctx: JobContext) -> tuple[date, date]:
+    """Filings are collected from one day before the previous *trading* session up to today. A fixed "today minus two days"
+    window misses Friday's after-hours filings (results, orders, fund-raising) on Monday morning and everything filed before a
+    long weekend or holiday - exactly the news a pre-open scan needs; the extra day absorbs late dissemination."""
+    day = ctx.run_date
+    previous = trading_days_before(ctx.calendar, day - timedelta(days=1), 1)
+    anchor = previous[0] if previous else day - timedelta(days=4)
+    return anchor - timedelta(days=FILINGS_EXTRA_DAYS), day
 
 
 def collect_india(ctx: JobContext) -> JobResult:
@@ -286,7 +347,7 @@ def backup(ctx: JobContext) -> JobResult:
 
     s = ctx.settings
     result = backup_database(s.db_path, s.backup_dir, keep_daily=s.backup_keep_daily, keep_weekly=s.backup_keep_weekly,
-                             passphrase=s.backup_passphrase, clock=ctx.clock)
+                             passphrase=s.backup_passphrase, clock=ctx.clock, max_total_mb=s.backup_max_mb)
     if not verify_backup(result.path, s.backup_passphrase):
         return JobResult("failed", f"backup {result.path.name} failed verification")
     info = {"file": result.path.name, "bytes": result.size_bytes, "encrypted": result.encrypted, "pruned": len(result.pruned)}
@@ -321,7 +382,9 @@ def _upload_backup(ctx: JobContext, path: Any) -> str | None:
 
 
 def housekeeping(ctx: JobContext) -> JobResult:
-    """Retention, disk guard, DB maintenance and outcome upgrades (provisional -> official)."""
+    """Retention of every table / folder / cache (``automation.retention``), disk guard, DB maintenance and outcome
+    upgrades (provisional -> official). Nothing in the system grows without a bound."""
+    from automation.retention import run_retention
     from backtesting.evaluate import collect_outcomes
 
     s, store = ctx.settings, ctx.store
@@ -333,28 +396,35 @@ def housekeeping(ctx: JobContext) -> JobResult:
     if status.level in {"warn", "crit"}:
         store.add_alert("warning" if status.level == "warn" else "error", "resources", "; ".join(status.messages),
                         dedupe_key=f"resources:{status.level}", dedupe_minutes=360)
-    actions["cache"] = prune_directory(s.cache_dir, max_mb=200, max_age_days=14)
-    actions["tmp"] = prune_directory(s.tmp_dir, max_age_days=1)
     registry = ctx.registry()
     actions["models"] = sum(registry.prune(stage) for stage in ("pre", "final"))
     # the pipeline's retention detaches event links in bulk (fast); the plain delete is only the fallback without it
     actions["news"] = ctx.intel().prune() or _guarded("news retention", ctx.news().prune_raw)
-    store.conn.execute("DELETE FROM alerts WHERE delivered = 1 AND created_at < ?",
-                       ((ctx.clock.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),))
-    store.conn.execute("DELETE FROM job_runs WHERE started_at < ?",
-                       ((ctx.clock.now() - timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ"),))
     upgraded = 0
+    official = 0
+    for day in trading_days_before(ctx.calendar, ctx.run_date, 3):
+        # the vendor's provisional bars of the last sessions are replaced by the official file once it is published (it often
+        # comes out after the evening job ran); the exchange's previous closes in it also reveal splits to repair
+        if s.nse_enabled and provisional_symbols(ctx, day):
+            official += (_guarded("official upgrade", ingest_official, ctx, day) or {}).get("official_rows", 0)
+        if s.nse_enabled:
+            _guarded("price basis", repair_basis_breaks, ctx, day)
+    actions["official_rows"] = official
     for day in trading_days_before(ctx.calendar, ctx.run_date, 5):
         if store.predictions_without_validated_outcome(day.isoformat()):
             counts = _guarded("outcome upgrade", collect_outcomes, store, s, day.isoformat()) or {}
             upgraded += counts.get("validated", 0)
     actions["outcomes_validated"] = upgraded
-    store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    store.conn.execute("PRAGMA optimize")
-    if ctx.run_date.weekday() == 6 and status.free_disk_mb and status.free_disk_mb > 3 * (s.db_path.stat().st_size / 1048576):
-        store.conn.execute("VACUUM")
-        actions["vacuum"] = True
-    return JobResult("success", f"disk {status.free_disk_mb or 0:.0f} MB free; {status.level}", actions)
+    report = run_retention(store, s, now=ctx.clock.now(), clock=ctx.clock, free_disk_mb=status.free_disk_mb,
+                           run_date=ctx.run_date)
+    actions.update({"rows_removed": report.total_rows, "files_removed": sum(report.files.values()),
+                    "removed": report.removed(), "maintenance": report.maintenance, "data_mb": report.data_mb,
+                    "db_mb": report.db_mb, "vacuum": "vacuum_s" in report.maintenance})
+    if report.notes:
+        store.add_alert("warning", "retention", "; ".join(report.notes)[:300], dedupe_key="retention", dedupe_minutes=720)
+    free = status.free_disk_mb or 0
+    return JobResult("success", f"disk {free:.0f} MB free; {status.level}; data {report.data_mb:.0f} MB; "
+                                f"retention removed {report.total_rows} rows, {sum(report.files.values())} files", actions)
 
 
 def train(ctx: JobContext) -> JobResult:
@@ -369,6 +439,10 @@ def train(ctx: JobContext) -> JobResult:
     if s.training_mode == "disabled":
         return JobResult("skipped", "TRAINING_MODE=disabled: the heuristic baseline stays in use")
     ctx.ensure_calendar()
+    free = disk_info(s.data_dir)["free_mb"]
+    if free < s.min_free_disk_mb_crit:  # training writes datasets, boosters and bundles: never into the last megabytes
+        return JobResult("failed", f"only {free:.0f} MB of disk is free (critical below {s.min_free_disk_mb_crit} MB); "
+                                   "training waits for the cleanup to make room")
     end = ctx.calendar.last_completed_session(ctx.clock.now())
     lean = lean_level(ctx)
     years = train_years_for(s, len(universe_symbols(ctx)), lean)
@@ -387,7 +461,7 @@ def train(ctx: JobContext) -> JobResult:
                 top_n=s.top_n, gate_min_days=s.gate_min_days, gate_max_ece=s.gate_max_ece,
                 gate_min_brier_skill=s.gate_min_brier_skill, max_rows_per_fit=fit_rows,
             )
-            result = train_stage(fs, cfg, s.models_dir, now=ctx.clock.now(), stop=ctx.expired)
+            result = train_stage(fs, cfg, s.models_dir, now=ctx.clock.now(), code_commit=release_id(), stop=ctx.expired)
             del fs
             decision = registry.register(result)
             outcomes[stage] = {"version": result.version, "status": result.status, "activated": decision["activate"],

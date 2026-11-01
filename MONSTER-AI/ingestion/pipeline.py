@@ -1,8 +1,10 @@
 """Ingestion orchestration: bars, official end-of-day files, F&O and live pre-open data.
 
 Principles: (1) a bar is stored only once its session is final (point-in-time availability rule); (2) official
-exchange files outrank vendor data; (3) every loop is bounded by a deadline and resumable; (4) one bad symbol never
-stops the run; (5) vendor re-adjustments (splits/bonus) are detected and the history reloaded.
+exchange files outrank vendor data and are stored RAW; (3) every loop is bounded by a deadline and resumable; (4) one bad
+symbol never stops the run; (5) vendor re-adjustments (splits/bonus) are detected and the history reloaded, while the raw
+official rows are re-based on the post-split basis only when the loader reads them (``ingestion.adjust``); (6) a bar that
+validation rejects is logged and counted, never dropped silently.
 """
 
 from __future__ import annotations
@@ -97,6 +99,27 @@ def choose_range(last_date: str | None, today: date, years: int) -> str:
 
 
 # ----------------------------------------------------------------------------------------- vendor bars
+REJECT_SAMPLE = 3  # reasons quoted in a rejection log line
+
+
+def _quote(entries: Sequence[tuple[str, str]]) -> str:
+    """The first few (subject, reason) pairs of a validation report as one log fragment."""
+    text = "; ".join(f"{subject}: {reason}" for subject, reason in entries[:REJECT_SAMPLE])
+    return text + ("; ..." if len(entries) > REJECT_SAMPLE else "")
+
+
+def _count_rejected(store: Store, symbol: str, n: int) -> None:
+    """Running total of the bars validation rejected for ``symbol`` (kv ``bars:rejected:<symbol>``). A bar that stays inside
+    the next refresh window is counted again: the number says "this feed has problems", not "this many distinct days"."""
+    key = f"bars:rejected:{symbol}"
+    try:
+        total = int(store.kv_get(key, "0") or 0)
+    except ValueError:
+        log.warning("%s: unreadable rejection counter %r reset", symbol, store.kv_get(key))
+        total = 0
+    store.kv_set(key, str(total + n))
+
+
 def _store_series(store: Store, row: Any, bars: list[dict[str, Any]], series: Any) -> int:
     written = store.upsert_bars(int(row["instrument_id"]), bars, source="yahoo", source_rank=1)
     for split in series.splits:
@@ -108,43 +131,67 @@ def _store_series(store: Store, row: Any, bars: list[dict[str, Any]], series: An
     return written
 
 
+def _fetch_clean(
+    store: Store, yahoo: YahooClient, row: Any, spec: SeriesSpec, rng: str, now: datetime
+) -> tuple[Any, list[dict[str, Any]]]:
+    """One vendor request: validated, PIT-filtered bars plus the raw series (its split events). Impossible bars are rejected
+    LOUDLY (WARNING with the count and the first reasons, plus the per-symbol counter); extreme but consistent days are kept
+    flagged ``suspect``: they are exactly the large moves this system exists to learn from."""
+    symbol = row["symbol"]
+    series = yahoo.fetch_daily(row["yahoo_symbol"] or symbol, range_=rng)
+    bars, report = validate_bars(series.bars, kind=row["kind"], keep_extreme=True)
+    if report.rejected:
+        log.warning("%s: %d of %d bars rejected by validation (%s)", symbol, report.rejected_count, len(series.bars),
+                    _quote(report.rejected))
+        _count_rejected(store, symbol, report.rejected_count)
+    if report.suspect:
+        log.info("%s: %d extreme but consistent bars kept as suspect (%s)", symbol, report.suspect_count, _quote(report.suspect))
+    return series, pit_filter(bars, spec, now)
+
+
+def _vendor_history_changed(store: Store, iid: int, bars: list[dict[str, Any]], series: Any) -> bool:
+    """True when the vendor re-adjusted history: a split inside the stored history that has not been recorded yet, or stored
+    vendor closes that no longer match the fresh ones. Only reads: the split is recorded together with the reload."""
+    stored = {
+        r["trade_date"]: r["close"]
+        for r in store.conn.execute(
+            "SELECT trade_date, close FROM bars_daily WHERE instrument_id = ? AND source_rank <= 1 "
+            "AND trade_date BETWEEN ? AND ?", (iid, bars[0]["trade_date"], bars[-1]["trade_date"]),
+        ).fetchall()
+        if r["close"]
+    }
+    known = {r["ex_date"] for r in store.corporate_actions(iid, "split")}
+    earliest = _earliest(store, iid)
+    new_split = any(s["ex_date"] not in known and s["ex_date"] > earliest for s in series.splits)
+    return new_split or not overlap_consistent(stored, bars)
+
+
 def ingest_symbol_daily(
     store: Store, yahoo: YahooClient, row: Any, *, now: datetime, years: int, force_full: bool = False
 ) -> int:
-    """Fetch, validate, PIT-filter and store one instrument; reload full history if the vendor re-adjusted it."""
-    iid, symbol, kind = int(row["instrument_id"]), row["symbol"], row["kind"]
-    ysym = row["yahoo_symbol"] or symbol
-    spec = spec_for_instrument(symbol, kind)
+    """Fetch, validate, PIT-filter and store one instrument; reload full history if the vendor re-adjusted it.
+
+    The reload fetches the full history FIRST and only then, in one transaction, drops the vendor rows, writes the fresh ones
+    and records the split events: a failing request leaves the stored history and the events as they were, so the next run
+    detects the re-adjustment again instead of finding a half-reloaded series. Official rows are never touched: they stay raw
+    and ``features.loader`` re-bases them on the post-split basis at read time (``ingestion.adjust``)."""
+    iid, symbol = int(row["instrument_id"]), row["symbol"]
+    spec = spec_for_instrument(symbol, row["kind"])
     last = store.latest_bar_date(iid)
     full = force_full or last is None
     rng = range_for_years(years) if full else choose_range(last, ist_date(now), years)
-    series = yahoo.fetch_daily(ysym, range_=rng)
-    bars, report = validate_bars(series.bars, kind=kind)
-    bars = pit_filter(bars, spec, now)
-    if report.rejected_count > max(3, len(series.bars) // 5):
-        log.warning("%s: %d of %d bars rejected by validation", symbol, report.rejected_count, len(series.bars))
+    series, bars = _fetch_clean(store, yahoo, row, spec, rng, now)
     if not bars:
         return 0
-
-    if not full:
-        stored = {
-            r["trade_date"]: r["close"]
-            for r in store.conn.execute(
-                "SELECT trade_date, close FROM bars_daily WHERE instrument_id = ? AND source_rank <= 1 "
-                "AND trade_date BETWEEN ? AND ?", (iid, bars[0]["trade_date"], bars[-1]["trade_date"]),
-            ).fetchall()
-            if r["close"]
-        }
-        earliest = _earliest(store, iid)
-        new_split = False
-        for split in series.splits:
-            ratio = split["numerator"] / split["denominator"] if split["denominator"] else None
-            is_new = store.add_corporate_action(iid, "split", split["ex_date"], ratio=ratio, source="yahoo")
-            new_split = new_split or (is_new and split["ex_date"] > earliest)
-        if new_split or not overlap_consistent(stored, bars):
-            log.warning("%s: vendor history changed (split/re-adjustment); reloading full history", symbol)
+    if not full and _vendor_history_changed(store, iid, bars, series):
+        log.warning("%s: vendor history changed (split/re-adjustment); reloading full history", symbol)
+        series, bars = _fetch_clean(store, yahoo, row, spec, range_for_years(years), now)
+        if not bars:
+            log.warning("%s: the full reload returned no usable bars; the stored history is kept", symbol)
+            return 0
+        with store.tx():
             store.delete_vendor_bars(iid)
-            return ingest_symbol_daily(store, yahoo, row, now=now, years=years, force_full=True)
+            return _store_series(store, row, bars, series)
     return _store_series(store, row, bars, series)
 
 
@@ -318,7 +365,11 @@ def backfill_history(
 
 # ------------------------------------------------------------------------------------ official end-of-day
 def ingest_bhavcopy(store: Store, archive: NseArchive, day: date) -> tuple[int, int]:
-    """Write official OHLC/turnover/delivery for ``day``; returns (rows written, instruments matched)."""
+    """Write official OHLC/turnover/delivery for ``day``; returns (rows written, instruments matched).
+
+    Official rows are stored RAW, exactly as traded that day (``features.loader`` re-bases the ones older than a split on the
+    post-split basis when it reads them, see ``ingestion.adjust``). A row that validation rejects is logged and counted per
+    symbol; an extreme but consistent one is kept with quality ``suspect``."""
     rows = archive.bhavcopy(day)
     if not rows:
         return 0, 0
@@ -331,13 +382,22 @@ def ingest_bhavcopy(store: Store, archive: NseArchive, day: date) -> tuple[int, 
         if current is None or (r["series"] == "EQ" and current["series"] != "EQ"):
             by_symbol[r["symbol"]] = r
     written = 0
+    rejected: list[tuple[str, str]] = []
+    suspect: list[tuple[str, str]] = []
     for symbol, r in by_symbol.items():
-        clean, _report = validate_bars([r], kind="equity")
+        clean, report = validate_bars([r], kind="equity", keep_extreme=True)
         if not clean:
+            rejected.append((symbol, report.rejected[0][1] if report.rejected else "rejected"))
+            _count_rejected(store, symbol, 1)
             continue
+        suspect += [(symbol, reason) for _, reason in report.suspect]
         bar = clean[0]
         bar.update({k: r.get(k) for k in ("prev_close", "turnover", "delivery_pct", "vwap", "trades")})
         written += store.upsert_bars(ids[symbol], [bar], source="nse_bhavcopy", source_rank=2, quality="official")
+    if rejected:
+        log.warning("bhavcopy %s: %d of %d rows rejected by validation (%s)", day, len(rejected), len(by_symbol), _quote(rejected))
+    if suspect:
+        log.info("bhavcopy %s: %d extreme but consistent rows kept as suspect (%s)", day, len(suspect), _quote(suspect))
     store.record_source_result("nse_bhavcopy", True, data_ts=day.isoformat())
     return written, len(by_symbol)
 

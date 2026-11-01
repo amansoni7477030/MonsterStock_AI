@@ -1,8 +1,14 @@
-"""Load market data from the database into the wide ``Panel`` consumed by the feature builder."""
+"""Load market data from the database into the wide ``Panel`` consumed by the feature builder.
+
+Three properties are enforced here, once, for training and live alike: ONE price basis (official rows re-based on the
+post-split basis, see ``ingestion.adjust``), POINT-IN-TIME F&O membership (``LoadedPanel.is_fno_pit``) and, for training
+panels, a universe that also holds the names that stopped trading or were quarantined (no survivorship bias)."""
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import numpy as np
@@ -12,6 +18,7 @@ from automation.calendar import ExchangeCalendar
 from database.store import Store
 from features.builder import Panel
 from features.calendar_features import next_trading_days
+from ingestion.adjust import adjust_for_splits
 from ingestion.series import INDIA_MARKET, SERIES
 
 SERIES_KINDS = ["global", "fx", "commodity", "rate", "volatility", "index"]
@@ -19,6 +26,45 @@ MASTER_MIN_COVERAGE = 0.30
 # Market-wide volume relative to the trailing 20-day median below which a "session" is not a regular one.
 SPECIAL_SESSION_VOLUME_RATIO = 0.30
 SPECIAL_WEEKEND_VOLUME_RATIO = 0.60
+
+
+@dataclass
+class LoadedPanel(Panel):
+    """A ``Panel`` read from the database. ``is_fno_pit`` (dates x symbols) is the point-in-time F&O membership behind the
+    ``u_is_fno`` feature: 1 once the symbol has F&O rows, 0 while F&O data exists but not for the symbol, NaN on dates before
+    the earliest F&O data in the database (no information). The static ``is_fno`` flag describes today, not history."""
+
+    is_fno_pit: pd.DataFrame | None = None
+
+
+def fno_first_dates(store: Store) -> tuple[str | None, dict[str, str]]:
+    """The earliest ``fno_daily`` date of the whole database and the first F&O date of every symbol that has any."""
+    first = {r["symbol"]: r["first_day"] for r in store.conn.execute(
+        "SELECT symbol, MIN(trade_date) AS first_day FROM fno_daily GROUP BY symbol").fetchall()}
+    return (min(first.values()) if first else None), first
+
+
+def fno_membership(dates: pd.DatetimeIndex, symbols: Sequence[str], earliest: str | None, first: Mapping[str, str]) -> pd.DataFrame:
+    """Point-in-time F&O membership: from a symbol's first F&O row on 1, before it 0, and NaN on every date before the earliest
+    F&O data of the database (nothing is known then, which is not the same as "not in F&O"). Dates after the last F&O row of the
+    database (the live session) follow the same rule, so training and live agree."""
+    symbols = list(symbols)
+    if earliest is None:
+        return pd.DataFrame(np.nan, index=dates, columns=symbols)
+    day = dates.to_numpy().astype("datetime64[D]")
+    joined = np.array([first.get(s, "9999-12-31") for s in symbols], dtype="datetime64[D]")
+    member = (day[:, None] >= joined[None, :]).astype(np.float64)
+    member[day < np.datetime64(earliest, "D")] = np.nan
+    return pd.DataFrame(member, index=dates, columns=symbols)
+
+
+def _inactive_with_bars(store: Store, start: str, end: str) -> list[sqlite3.Row]:
+    """Equities that are no longer active (quarantined, suspended, delisted) but have bars inside ``[start, end]``."""
+    return store.conn.execute(
+        "SELECT * FROM instruments i WHERE i.kind = 'equity' AND i.status <> 'active' AND EXISTS ("
+        "SELECT 1 FROM bars_daily b WHERE b.instrument_id = i.instrument_id AND b.trade_date BETWEEN ? AND ?) "
+        "ORDER BY i.symbol", (start, end),
+    ).fetchall()
 
 
 def _wide_fields(long: pd.DataFrame, fields: Sequence[str], dates: pd.DatetimeIndex, symbols: list[str]) -> dict[str, pd.DataFrame]:
@@ -52,20 +98,37 @@ def _special_sessions(volume: pd.DataFrame) -> np.ndarray:
 def load_panel(
     store: Store, *, start: str, end: str, symbols: Sequence[str] | None = None, today: date | None = None,
     live_open: Mapping[str, float] | None = None, calendar: ExchangeCalendar | None = None, fno_start: str | None = None,
-) -> Panel:
+    include_inactive: bool | None = None,
+) -> LoadedPanel:
     """Equities of the universe (or ``symbols``) on the master trading-date index.
 
     ``today`` appends a not-yet-traded row (all NaN except ``live_open`` = the pre-open equilibrium price), which is how
-    the live scan reuses exactly the training code path."""
+    the live scan reuses exactly the training code path.
+
+    Price basis: official rows are stored raw, so those older than a split's ex-date are re-based on the post-split basis
+    (``ingestion.adjust``) whatever the order in which rows and split events arrived; the stored rows are never changed.
+
+    Survivorship: a TRAINING panel (``include_inactive`` left at None while there is no ``today``) also holds the quarantined,
+    suspended or delisted equities that have bars in the window; they contribute rows up to their last bar and none after.
+    A live panel (``today`` given) scores the active universe only; pass ``include_inactive`` to force either behaviour.
+    Names this database never ingested (delisted before it started, or never in the instrument master) stay unknown: the panel
+    cannot contain what was never loaded (documented limitation). Names that merely left the universe while still active are
+    not restored either."""
+    wanted = None if symbols is None else set(symbols)
     rows = store.list_instruments(kind="equity", in_universe=True, status="active")
-    if symbols is not None:
-        wanted = set(symbols)
+    if wanted is not None:
         rows = [r for r in store.list_instruments(kind="equity", status="active") if r["symbol"] in wanted]
+    inactive = (today is None) if include_inactive is None else include_inactive
+    if inactive:
+        have = {r["symbol"] for r in rows}
+        rows += [r for r in _inactive_with_bars(store, start, end)
+                 if r["symbol"] not in have and (wanted is None or r["symbol"] in wanted)]
     syms = sorted(r["symbol"] for r in rows)
     sectors = {r["symbol"]: r["sector"] for r in rows}
     is_fno = {r["symbol"]: int(r["is_fno"]) for r in rows}
 
     long = store.bars_long(kind="equity", symbols=syms, start=start, end=end)
+    long = adjust_for_splits(store, long, through=end if today is None else today.isoformat())
     nifty_long = store.bars_long(kind=["index", "volatility"], symbols=[INDIA_MARKET, "^INDIAVIX"], start=start, end=end)
     counts = long.groupby("trade_date")["symbol"].nunique() if not long.empty else pd.Series(dtype=int)
     stock_dates = set(counts[counts >= max(1, MASTER_MIN_COVERAGE * max(len(syms), 1))].index)
@@ -108,7 +171,8 @@ def load_panel(
         for key, group in glob.groupby("symbol"):
             closes[key] = group.set_index("trade_date")["close"].astype(float).sort_index()
 
-    fno_syms = [s for s in syms if is_fno.get(s)]
+    earliest_fno, first_fno = fno_first_dates(store)
+    fno_syms = [s for s in syms if is_fno.get(s) or s in first_fno]  # names that left F&O keep the rows of their F&O years
     fno = store.fno_frame(symbols=fno_syms, start=fno_start or start, end=end) if fno_syms else None
 
     meetings = None
@@ -124,8 +188,8 @@ def load_panel(
     if calendar is not None:
         future = next_trading_days(last, 5, calendar.is_trading_day)
         next_after = future[0]
-    return Panel(
+    return LoadedPanel(
         dates=dates, symbols=syms, o=o, h=h, low=low, c=c, v=v, nifty=nifty, vix=vix, closes=closes, sectors=sectors,
         is_fno=is_fno, fno=fno, meetings=meetings, meetings_coverage_start=coverage, next_after_last=next_after,
-        future_dates=future or [],
+        future_dates=future or [], is_fno_pit=fno_membership(dates, syms, earliest_fno, first_fno),
     )

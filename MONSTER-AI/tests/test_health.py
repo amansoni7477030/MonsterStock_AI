@@ -46,6 +46,32 @@ def test_fresh_heartbeat_passes(env):
     assert "scheduler_stalled" not in codes(evaluate_health(env.store, env.settings, env.clock))
 
 
+def test_a_fresh_heartbeat_file_proves_liveness_while_the_database_is_busy(env):
+    from automation.health import write_heartbeat_file
+
+    env.store.kv_set(HEARTBEAT_KEY, "2026-11-02T04:00:00Z")  # 30 min old: a long VACUUM blocked the database write
+    write_heartbeat_file(env.settings.data_dir, env.clock.now() - timedelta(seconds=20))
+    report = evaluate_health(env.store, env.settings, env.clock)
+    assert "scheduler_stalled" not in codes(report) and "heartbeat_db_stale" in codes(report)
+    assert report.checks["heartbeat_age_sec"] == 20 and report.checks["heartbeat_db_age_sec"] == 1800
+    write_heartbeat_file(env.settings.data_dir, env.clock.now() - timedelta(minutes=10))  # now both proofs are old
+    assert "scheduler_stalled" in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
+def test_the_heartbeat_file_alone_is_enough_and_garbage_is_ignored(env):
+    from automation.health import heartbeat_path, read_heartbeat_file, write_heartbeat_file
+
+    assert read_heartbeat_file(env.settings.data_dir) is None
+    heartbeat_path(env.settings.data_dir).write_text("not json")
+    assert read_heartbeat_file(env.settings.data_dir) is None
+    heartbeat_path(env.settings.data_dir).write_text('["list"]')
+    assert read_heartbeat_file(env.settings.data_dir) is None
+    assert write_heartbeat_file(env.settings.data_dir, env.clock.now()) is True
+    assert read_heartbeat_file(env.settings.data_dir) == env.clock.now()
+    assert not list(heartbeat_path(env.settings.data_dir).parent.glob("*.tmp"))  # atomic: no temp file left behind
+    assert "scheduler_stalled" not in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
 def test_failed_critical_job_and_missing_final_scan_are_critical(env):
     env.store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
     env.store.job_record("prelim_scan", "2026-11-02", "failed", message="no data")
@@ -120,3 +146,58 @@ def test_calendar_is_used_for_trading_day_logic(env):
     saturday = datetime(2026, 10, 31, 5, 0, tzinfo=UTC)  # 10:30 IST Saturday: no final scan expected
     env.clock.set(saturday)
     assert "final_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock, cal))
+
+
+# ------------------------------------------------------------------------------------------- storage
+def test_data_directory_budget_warnings(env):
+    import dataclasses
+
+    from app.resources import dir_size_mb
+
+    with open(env.settings.cache_dir / "blob.bin", "wb") as handle:
+        handle.truncate(50 * 1024 * 1024)
+    used = dir_size_mb(env.settings.data_dir)
+    budget_codes = {"storage_budget", "storage_over_budget"}
+
+    def check(limit):
+        return evaluate_health(env.store, dataclasses.replace(env.settings, data_max_mb=limit), env.clock)
+
+    assert not budget_codes & codes(check(1000))  # far below the budget
+    near = codes(check(int(used / 0.9) + 1))  # between 80 % and 100 % of the budget
+    assert "storage_budget" in near and "storage_over_budget" not in near
+    over = check(int(used) - 5)
+    assert "storage_over_budget" in codes(over) and over.checks["data_budget_mb"] == int(used) - 5
+    assert not budget_codes & codes(check(0))  # 0 = no budget
+
+
+def test_retention_that_stopped_running_is_flagged(env):
+    from automation.retention import RETENTION_KEY
+
+    env.store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
+    assert "retention_never_ran" in codes(evaluate_health(env.store, env.settings, env.clock))
+    env.store.kv_set_json(RETENTION_KEY, {"at": "2026-11-02T01:00:00Z", "notes": []})
+    assert not {"retention_never_ran", "retention_stale", "retention_errors"} & codes(
+        evaluate_health(env.store, env.settings, env.clock))
+    env.store.kv_set_json(RETENTION_KEY, {"at": "2026-10-20T01:00:00Z", "notes": []})
+    assert "retention_stale" in codes(evaluate_health(env.store, env.settings, env.clock))
+    env.store.kv_set_json(RETENTION_KEY, {"at": "2026-11-02T01:00:00Z", "notes": ["events: OperationalError: locked"]})
+    failing = evaluate_health(env.store, env.settings, env.clock)
+    assert "events: OperationalError" in next(p.message for p in failing.problems if p.code == "retention_errors")
+
+
+def test_a_new_install_is_not_blamed_for_missing_retention(env):
+    assert "retention_never_ran" not in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
+def test_an_oversized_wal_is_reported(env, monkeypatch, tmp_path):
+    import dataclasses
+
+    from automation import health
+
+    elsewhere = dataclasses.replace(env.settings, db_path=tmp_path / "other.db")  # never touch the live WAL
+    elsewhere.db_path.with_name("other.db-wal").write_bytes(b"x" * 3_000_000)
+    monkeypatch.setattr(health, "WAL_WARN_MB", 1)
+    report = evaluate_health(env.store, elsewhere, env.clock)
+    assert "wal_large" in codes(report) and report.checks["wal_mb"] >= 2.8
+    monkeypatch.setattr(health, "WAL_WARN_MB", 256)
+    assert "wal_large" not in codes(evaluate_health(env.store, elsewhere, env.clock))

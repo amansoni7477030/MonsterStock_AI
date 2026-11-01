@@ -65,8 +65,14 @@ def test_at_most_six_confirmations_are_returned_in_a_fixed_order():
     ({"s_ret1": 2.0}, [cat(-0.6)], "negative company news but the sector rose +2.0% yesterday"),
     ({"p_gap_pct": -1.0}, [cat(0.6)], "positive news but the stock is indicated -1.0% lower at the open"),
     ({"p_gap_pct": 1.0}, [cat(-0.6)], "negative news but the stock is indicated +1.0% higher at the open"),
-    ({"f_oi_price_code": 2.0, "t_ret1": 2.0, "f_fut_oi_chg_pct": 4.0}, [], "price rose yesterday but futures OI build-up looks bearish"),
-    ({"f_oi_price_code": 1.0, "t_ret1": -2.0, "f_fut_oi_chg_pct": 4.0}, [], "price fell yesterday while futures OI build-up looks bullish"),
+    ({"f_oi_price_code": 2.0, "f_fut_oi_chg_pct": 5.0, "p_gap_pct": 1.4}, [],
+     "F&O positioning reads bearish (short build-up, OI +5.0%) but the stock is indicated +1.4% higher at the open"),
+    ({"f_oi_price_code": 4.0, "f_fut_oi_chg_pct": -4.0, "t_ret5": 4.5}, [],
+     "F&O positioning reads bearish (long unwinding, OI -4.0%) but its 5-day return is +4.5%"),
+    ({"f_oi_price_code": 1.0, "f_fut_oi_chg_pct": 4.0, "p_gap_pct": -1.0}, [],
+     "F&O positioning reads bullish (long build-up, OI +4.0%) but the stock is indicated -1.0% lower at the open"),
+    ({"f_oi_price_code": 3.0, "f_fut_oi_chg_pct": -3.5, "t_ret5": -3.5}, [],
+     "F&O positioning reads bullish (short covering, OI -3.5%) but its 5-day return is -3.5%"),
     ({"g_us_ret": -1.5}, [cat(0.6)], "positive stock-specific news against a weak global tone (US -1.5%)"),
     ({"g_oil_ret": 4.0, "g_exp_oil": 0.05}, [], "large oil move but this stock shows little historical oil sensitivity"),
 ])
@@ -94,6 +100,66 @@ def test_at_most_four_contradictions_are_kept():
     row = {"s_ret1": -2.0, "p_gap_pct": -2.0, "g_us_ret": -2.0, "g_oil_ret": 5.0, "g_exp_oil": 0.0}
     found = sg.contradictions(row, [cat(0.6, confidence=0.2)], None, 0.5)
     assert found.count == 4
+
+
+# ---------------------------------------------- futures positioning against price action (heuristic)
+@pytest.mark.parametrize("code, label, read, oi_chg", [
+    (1, "long build-up", "bullish", 4.0), (2, "short build-up", "bearish", 4.0),
+    (3, "short covering", "bullish", -4.0), (4, "long unwinding", "bearish", -4.0),
+])
+def test_each_oi_reading_is_checked_against_price_action_pointing_the_other_way(code, label, read, oi_chg):
+    sign = 1 if read == "bullish" else -1
+    for evidence in ({"p_gap_pct": -1.2 * sign}, {"t_ret5": -4.0 * sign}):
+        row = {"f_oi_price_code": float(code), "f_fut_oi_chg_pct": oi_chg, **evidence}
+        found = sg.contradictions(row, [], None, None)
+        assert found.count == 1 and f"reads {read} ({label}, OI {oi_chg:+.1f}%)" in found.items[0]
+        assert found.items[0].endswith("- heuristic")  # a reading of positioning, not a statement of fact
+
+
+@pytest.mark.parametrize("row", [
+    {"f_oi_price_code": 1.0, "f_fut_oi_chg_pct": 4.0, "p_gap_pct": 1.5, "t_ret5": 5.0},       # bullish reading, bullish price action
+    {"f_oi_price_code": 2.0, "f_fut_oi_chg_pct": 4.0, "p_gap_pct": -1.5, "t_ret5": -5.0},     # bearish reading, bearish price action
+    {"f_oi_price_code": 3.0, "f_fut_oi_chg_pct": -4.0, "p_gap_pct": -0.5, "t_ret5": -2.0},    # opposite price action, but too small
+    {"f_oi_price_code": 1.0, "f_fut_oi_chg_pct": 2.5, "p_gap_pct": -2.0, "t_ret5": -6.0},     # a small OI change reads as nothing
+    {"f_oi_price_code": 1.0, "f_fut_oi_chg_pct": 4.0, "p_gap_pct": -0.8, "t_ret5": -3.0},     # exactly at the limits, not beyond them
+    {"f_oi_price_code": 9.0, "f_fut_oi_chg_pct": 5.0, "p_gap_pct": -2.0},                     # an unknown code
+    {"f_oi_price_code": 1.0, "p_gap_pct": -2.0},                                              # no OI change
+    {"f_fut_oi_chg_pct": 5.0, "p_gap_pct": -2.0},                                             # no code
+    {"f_oi_price_code": 1.0, "f_fut_oi_chg_pct": 4.0, "t_ret1": -2.0},                        # yesterday's move alone is no evidence
+])
+def test_agreeing_weak_or_incomplete_positioning_evidence_is_not_a_contradiction(row):
+    assert sg.contradictions(row, [], None, None).count == 0
+
+
+def test_the_indicated_gap_is_named_before_the_five_day_trend_and_only_once():
+    row = {"f_oi_price_code": 2.0, "f_fut_oi_chg_pct": 5.0, "p_gap_pct": 1.4, "t_ret5": 6.0}
+    (item,) = sg.contradictions(row, [], None, None).items
+    assert "indicated +1.4% higher at the open" in item and "5-day" not in item
+
+
+def test_the_message_fits_the_report_line_so_the_heuristic_label_is_never_clipped():
+    report_item_limit = 120  # the Telegram report clips each item at this many characters
+    for code, oi in ((1, 9.9), (4, -9.9)):
+        for evidence in ({"p_gap_pct": -9.9 if code == 1 else 9.9}, {"t_ret5": -9.9 if code == 1 else 9.9}):
+            row = {"f_oi_price_code": float(code), "f_fut_oi_chg_pct": oi, **evidence}
+            (item,) = sg.contradictions(row, [], None, None).items
+            assert len(item) <= report_item_limit and item.endswith("- heuristic"), item
+
+
+# ------------------------------------------------------------------------------ specialist disagreement
+def test_the_disagreement_limit_defaults_to_0_12_and_a_model_derived_limit_can_replace_it():
+    assert sg.SPEC_STD_LIMIT == 0.12
+    assert sg.contradictions({}, [], None, 0.13).count == 1 and sg.contradictions({}, [], None, 0.12).count == 0
+    assert sg.contradictions({}, [], None, 0.13, spec_std_limit=0.2).count == 0
+    assert sg.contradictions({}, [], None, 0.25, spec_std_limit=0.2).items == [
+        "specialist models disagree materially (low signal agreement)"]
+    assert sg.contradictions({}, [], None, 0.05, spec_std_limit=0.04).count == 1  # a model whose agreement is normally tighter
+
+
+@pytest.mark.parametrize("limit", [None, 0.0, -0.1, float("nan"), float("inf")])
+def test_an_unusable_limit_falls_back_to_the_default(limit):
+    assert sg.contradictions({}, [], None, 0.13, spec_std_limit=limit).count == 1
+    assert sg.contradictions({}, [], None, 0.11, spec_std_limit=limit).count == 0
 
 
 # --------------------------------------------------------------------------------------------- priced in

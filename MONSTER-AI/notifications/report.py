@@ -10,7 +10,7 @@ from __future__ import annotations
 import html
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from itertools import accumulate
 from typing import Any
@@ -404,6 +404,110 @@ def _table_row(rank: Any, symbol: Any, tier: Any, p: Any, rng: Any, ret: Any, hi
     return f"{rank:>2} {symbol:<10} {tier:<8} {p:>{max(5, len(ph))}} {rng:>6} {ret:>7} {hit:>3}"
 
 
+_RECORD_TITLE = "Live record: frozen picks against realised outcomes (95% day-block intervals)"
+_RECORD_EMPTY = "Live record: n/a (no evaluated picks yet)"
+_WINDOW = 12
+_MAX_BASELINES = 8
+
+
+def _dec2(value: Any) -> str:
+    x = _num(value)
+    return NA if x is None else f"{x:.2f}"
+
+
+def _signed2(value: Any) -> str:
+    x = _num(value)
+    return NA if x is None else f"{x:+.2f}"
+
+
+_RECORD_SERIES: tuple[tuple[str, str, Callable[[Any], str]], ...] = (
+    ("Hit rate", "topn_hit_rate", _pct),
+    ("Range MAE of the median forecast (pp)", "range_mae_q50", _dec2),
+    ("80% interval coverage (nominal 80%)", "range_coverage_80", _pct),
+    ("Direction accuracy (non-flat closes)", "direction_accuracy", _pct),
+)
+
+
+def _window_order(label: str) -> tuple[int, int, str]:
+    days = label[:-1] if label.endswith("d") else ""
+    return (0, int(days), label) if days.isdigit() else (1, 0, label)
+
+
+def _record_windows(record: Any) -> list[tuple[str, dict[str, Any]]]:
+    """(window label, metric name -> its all-picks row) of a live record that may be malformed; shortest window first.
+    Slice rows are for the database and the dashboard, not for the report."""
+    windows = []
+    for label, rows in _map(record).items():
+        named: dict[str, Any] = {}
+        for item in _seq(rows):
+            name = _clean(_get(item, "name"))
+            if name and _clean(_get(item, "slice", "all")) == "all":
+                named[name] = item
+        if named:
+            windows.append((_clip(label, _WINDOW), named))
+    return sorted(windows, key=lambda pair: _window_order(pair[0]))
+
+
+def _stat(row: Any, fmt: Callable[[Any], str], unit: str = "") -> str:
+    """``value [low to high] n=N``: the number, its interval and its sample size (each only when known)."""
+    value, low, high, n = (_num(_get(row, key)) for key in ("value", "ci_low", "ci_high", "n"))
+    text = NA if value is None else fmt(value)
+    if low is not None and high is not None:
+        text += f" [{fmt(low)} to {fmt(high)}]"
+    if n is not None and n >= 0:
+        count = int(n)
+        text += f" n={count}{unit.removesuffix('s') if count == 1 else unit}"  # "n=1 day", "n=5 days"
+    return text
+
+
+def _latest_window(windows: list[tuple[str, dict[str, Any]]], *names: str) -> tuple[str, dict[str, Any]] | None:
+    return next(((label, rows) for label, rows in reversed(windows) if any(name in rows for name in names)), None)
+
+
+def _realised_line(windows: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    found = _latest_window(windows, "pick_range_mean")
+    if found is None:
+        return []
+    label, rows = found
+    parts = [f"picks mean {_pp(_get(rows['pick_range_mean'], 'value'))} / median {_pp(_get(rows.get('pick_range_median'), 'value'))}"]
+    prefix, suffix = "baseline_", "_range_mean"
+    names = sorted(n[len(prefix):-len(suffix)] for n in rows if n.startswith(prefix) and n.endswith(suffix))
+    for name in names[:_MAX_BASELINES]:
+        mean = _pp(_get(rows[f"{prefix}{name}{suffix}"], "value"))
+        median = _pp(_get(rows.get(f"{prefix}{name}_range_median"), "value"))
+        parts.append(f"{_esc(_clip(name, 24))} {mean} / {median}")
+    return [f"Realised range, picks vs baselines ({_esc(label)}): " + " | ".join(parts)]
+
+
+def _ranking_line(windows: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    found = _latest_window(windows, "ndcg_at_5", "rank_ic")
+    if found is None:
+        return []
+    label, rows = found
+    parts = []
+    if "ndcg_at_5" in rows:
+        text = f"NDCG@5 {_stat(rows['ndcg_at_5'], _dec2, ' days')}"
+        random = _map(_get(rows["ndcg_at_5"], "extra")).get("random")
+        parts.append(text if _num(random) is None else f"{text} vs random {_dec2(random)}")
+    if "rank_ic" in rows:
+        parts.append(f"rank IC {_stat(rows['rank_ic'], _signed2, ' days')}")
+    return [f"Ranking quality ({_esc(label)}): " + " | ".join(parts)]
+
+
+def _record_lines(record: Any) -> list[str]:
+    """The rolling live record: range-forecast error, interval coverage, direction accuracy, realised range versus the
+    baselines and ranking quality, every number with its sample size and interval (blueprint acceptance 23.4)."""
+    windows = _record_windows(record)
+    if not windows:
+        return [_RECORD_EMPTY]
+    out = [f"<b>{_RECORD_TITLE}</b>"]
+    for title, name, fmt in _RECORD_SERIES:
+        pieces = [f"{_esc(label)} {_stat(rows[name], fmt)}" for label, rows in windows if name in rows]
+        if pieces:
+            out.append(f"{title}: " + " | ".join(pieces))
+    return out + _realised_line(windows) + _ranking_line(windows)
+
+
 def render_evening_report(summary: EveningSummary) -> list[str]:
     """Post-session evaluation. Raises ``ValueError`` when ``summary.model_version`` is empty."""
     version = _clip(_get(summary, "model_version"), 60)
@@ -475,6 +579,7 @@ def render_evening_report(summary: EveningSummary) -> list[str]:
     calibration = _clip(_get(summary, "calibration_note"), _NOTE)
     if calibration:
         stats.append(f"Calibration: {_esc(calibration)}")
+    stats.extend(_record_lines(_get(summary, "live_record")))
     quality = _items(_get(summary, "data_quality_notes"), 5, _NOTE)
     if quality:
         stats.append(f"Data-quality notes: {'; '.join(quality)}")

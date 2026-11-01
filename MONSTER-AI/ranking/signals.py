@@ -14,6 +14,13 @@ import numpy as np
 from ranking.types import Catalyst
 
 OI_PRICE = {1: "long build-up", 2: "short build-up", 3: "short covering", 4: "long unwinding"}
+# Conventional reading of each price / open-interest combination (a heuristic about positioning, not proof of intent):
+# +1 bullish, -1 bearish.
+OI_READING = {1: 1, 2: -1, 3: 1, 4: -1}
+OI_MIN_CHANGE_PCT = 3.0  # futures OI change (absolute, %) beyond which there is positioning to read
+OI_CONTRA_GAP_PCT = 0.8  # indicated opening gap (%) against the reading; the size the news-versus-gap rules use
+OI_CONTRA_TREND_PCT = 3.0  # 5-session return (%) against the reading
+SPEC_STD_LIMIT = 0.12  # spread of the specialists' probabilities above which their agreement is called low
 
 
 def _v(row: Mapping[str, Any], key: str) -> float | None:
@@ -81,12 +88,37 @@ class Contradictions:
         return len(self.items)
 
 
-def contradictions(row: Mapping[str, Any], catalysts: list[Catalyst], uncertainty: float | None, spec_std: float | None) -> Contradictions:
-    """Conflicts that should lower confidence instead of being averaged away."""
+def _oi_conflict(row: Mapping[str, Any]) -> str | None:
+    """Yesterday's futures positioning read against price action that is independent of yesterday's session.
+
+    ``f_oi_price_code`` is derived from yesterday's price move (and OI change), so that move can never contradict it; what can
+    is the indicated pre-open gap (final scan) and the 5-session trend. Long build-up and short covering read bullish, short
+    build-up and long unwinding bearish. The gap is named first when both disagree."""
+    code, oi_chg = _v(row, "f_oi_price_code"), _v(row, "f_fut_oi_chg_pct")
+    sign = OI_READING.get(code)
+    if sign is None or oi_chg is None or abs(oi_chg) <= OI_MIN_CHANGE_PCT:
+        return None
+    gap, trend = _v(row, "p_gap_pct"), _v(row, "t_ret5")
+    if gap is not None and gap * sign < -OI_CONTRA_GAP_PCT:
+        against = f"the stock is indicated {gap:+.1f}% {'higher' if gap > 0 else 'lower'} at the open"
+    elif trend is not None and trend * sign < -OI_CONTRA_TREND_PCT:
+        against = f"its 5-day return is {trend:+.1f}%"
+    else:
+        return None
+    return (f"F&O positioning reads {'bullish' if sign > 0 else 'bearish'} ({OI_PRICE[int(code)]}, OI {oi_chg:+.1f}%) "
+            f"but {against} - heuristic")
+
+
+def contradictions(
+    row: Mapping[str, Any], catalysts: list[Catalyst], uncertainty: float | None, spec_std: float | None, *,
+    spec_std_limit: float | None = None,
+) -> Contradictions:
+    """Conflicts that should lower confidence instead of being averaged away. ``spec_std_limit`` is the specialist disagreement
+    above which signal agreement is called low (default ``SPEC_STD_LIMIT``); a caller can pass one derived from the model."""
     found: list[str] = []
     polarity = [c.polarity for c in catalysts if c.polarity not in (None, 0.0)]
     net = float(np.mean(polarity)) if polarity else 0.0
-    sector, gap, ret1 = _v(row, "s_ret1"), _v(row, "p_gap_pct"), _v(row, "t_ret1")
+    sector, gap = _v(row, "s_ret1"), _v(row, "p_gap_pct")
     us, oil = _v(row, "g_us_ret"), _v(row, "g_oil_ret")
     if net > 0.2 and sector is not None and sector < -1.0:
         found.append(f"positive company news but the sector fell {sector:+.1f}% yesterday")
@@ -96,17 +128,14 @@ def contradictions(row: Mapping[str, Any], catalysts: list[Catalyst], uncertaint
         found.append(f"positive news but the stock is indicated {gap:+.1f}% lower at the open")
     if net < -0.2 and gap is not None and gap > 0.8:
         found.append(f"negative news but the stock is indicated {gap:+.1f}% higher at the open")
-    code = _v(row, "f_oi_price_code")
-    oi_chg = _v(row, "f_fut_oi_chg_pct")
-    if code in (2.0, 4.0) and ret1 is not None and ret1 > 1.5 and oi_chg is not None and oi_chg > 3.0:
-        found.append("price rose yesterday but futures OI build-up looks bearish (short build-up)")
-    if code == 1.0 and ret1 is not None and ret1 < -1.5 and oi_chg is not None and oi_chg > 3.0:
-        found.append("price fell yesterday while futures OI build-up looks bullish (long build-up)")
+    if (oi_conflict := _oi_conflict(row)) is not None:
+        found.append(oi_conflict)
     if us is not None and us < -1.0 and net > 0.2:
         found.append(f"positive stock-specific news against a weak global tone (US {us:+.1f}%)")
     if oil is not None and abs(oil) > 3.0 and _v(row, "g_exp_oil") is not None and abs(_v(row, "g_exp_oil") or 0.0) < 0.1:
         found.append("large oil move but this stock shows little historical oil sensitivity")
-    if spec_std is not None and spec_std > 0.12:
+    limit = spec_std_limit if spec_std_limit is not None and math.isfinite(spec_std_limit) and spec_std_limit > 0 else SPEC_STD_LIMIT
+    if spec_std is not None and spec_std > limit:
         found.append("specialist models disagree materially (low signal agreement)")
     if any(c.confidence is not None and c.confidence < 0.4 for c in catalysts):
         found.append("catalyst evidence is low-confidence (possible rumour / single source)")

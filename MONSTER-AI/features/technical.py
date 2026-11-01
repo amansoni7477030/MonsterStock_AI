@@ -138,12 +138,14 @@ def stock_features(
     put("t_vwap_dist", (c / typical - 1.0) * 100.0)  # typical-price proxy: identical in training and live
     del typical
 
-    vol_mean20 = v.rolling(20, min_periods=10).mean()
-    rvol1 = put("t_rvol1", v / vol_mean20)
-    rvol5 = v.rolling(5, min_periods=3).mean() / vol_mean20
+    # Relative volume = current volume / comparable HISTORICAL volume (blueprint Appendix A): the baseline is the mean of
+    # the 20 sessions BEFORE the session, so a spike does not dilute its own yardstick (10x would read as 6.9x otherwise).
+    vol_base20 = v.shift(1).rolling(20, min_periods=10).mean()
+    rvol1 = put("t_rvol1", v / vol_base20)
+    rvol5 = v.rolling(5, min_periods=3).mean() / vol_base20
     put("t_rvol5", rvol5)
     put("t_vol_acc", rvol1 - rvol5)
-    del vol_mean20, rvol5
+    del vol_base20, rvol5
     traded_value = c * v
     tv_med = traded_value.rolling(20, min_periods=10).median() / 1e7
     put("t_tv_med20_cr", tv_med)

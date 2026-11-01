@@ -1,0 +1,5 @@
+{
+  "_comment": "Operator overrides for the exchange calendar. 'sessions' re-open a weekend/holiday (special live session, e.g. a budget-day Saturday); 'closures' close a day at short notice. Dates are IST (YYYY-MM-DD), times HH:MM. This shipped template is replaced on upgrade: put your own entries in <MONSTER_DATA_DIR>/calendar_overrides.json (same format), which survives upgrades.",
+  "sessions": [],
+  "closures": []
+}

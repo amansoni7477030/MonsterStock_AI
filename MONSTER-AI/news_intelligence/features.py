@@ -38,16 +38,22 @@ BROAD_TYPES = frozenset({"market_stress", "central_bank", "geopolitical_conflict
                          "elections_politics", "trade_policy"})
 MIN_ENTITY_CONFIDENCE = 0.5
 MAX_VIEWS = 6000
+_FAR_FUTURE = "9999-12-31T23:59:59Z"
 _COLUMNS = (
     "event_id, cluster_key, event_type, headline, summary, region, scope, entities_json, source_quality, confidence, novelty, "
     "severity, horizon, event_time, published_at, first_seen_at, last_updated_at, n_articles, n_independent_sources, "
-    "market_reacted, reaction_json, evidence_json, contradictions_json, extraction_method"
+    "market_reacted, reaction_json, evidence_json, contradictions_json, extraction_method, novelty_class, rumour, source_class"
 )
 
 
 @dataclass
 class EventView:
-    """An event as it looked at ``as_of`` (counts, corroboration, confidence, novelty and entities all point-in-time)."""
+    """An event as it looked at ``as_of`` (counts, corroboration, confidence, novelty and entities all point-in-time).
+
+    ``novelty_class`` (new / follow_up / resurfaced / rumour) is fixed when the event is created; ``rumour`` (still unconfirmed),
+    ``source_class`` (of the best source so far) and ``n_conflicts`` follow the evidence visible at ``as_of`` (``None`` =
+    unknown, for events written before that metadata was recorded). ``event_time_bound`` is set only while the event time itself
+    is unknown: the event happened no later than this."""
 
     event_id: int
     cluster_key: str
@@ -75,6 +81,11 @@ class EventView:
     source: str = ""
     url: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    novelty_class: str | None = None
+    rumour: bool | None = None
+    source_class: str | None = None
+    n_conflicts: int = 0
+    event_time_bound: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +97,8 @@ class EventView:
             "published_at": self.published_at, "event_time": self.event_time, "market_reacted": self.market_reacted,
             "reaction": self.reaction, "contradictions": self.contradictions, "extraction_method": self.extraction_method,
             "hours_since": round(self.hours_since, 2), "source": self.source, "url": self.url, "evidence": self.evidence[:4],
+            "novelty_class": self.novelty_class, "rumour": self.rumour, "source_class": self.source_class,
+            "n_conflicts": self.n_conflicts, "event_time_bound": self.event_time_bound,
         }
 
     def entity(self, entity_id: str) -> dict[str, Any] | None:
@@ -119,6 +132,15 @@ def is_subject(entity: dict[str, Any]) -> bool:
     if "subject" in entity:
         return bool(entity["subject"])
     return float(entity.get("polarity") or 0.0) != 0.0 or bool(entity.get("in_title"))
+
+
+def is_company_subject(entity: dict[str, Any]) -> bool:
+    """A company entity the event counts for: it is the event's subject (``is_subject``) and was resolved with enough
+    confidence. Catalysts, event features and the already-priced-in counts all use this one definition."""
+    return (
+        entity.get("type") == "company" and float(entity.get("confidence") or 0.0) >= MIN_ENTITY_CONFIDENCE
+        and is_subject(entity)
+    )
 
 
 def _lead_origin(evidence: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -165,6 +187,12 @@ def _entities(text: str | None, as_of_iso: str, first_seen: str) -> list[dict[st
     return out
 
 
+def subject_companies(entities_json: str | None, as_of_iso: str | None = None) -> set[str]:
+    """Ids of the companies an event is about, as known at ``as_of_iso``: signed by it or named in its headline, never a
+    passing mention of a company in another company's story."""
+    return {e["id"] for e in _entities(entities_json, as_of_iso or _FAR_FUTURE, "") if is_company_subject(e)}
+
+
 def _visible_counts(store: Store, event_ids: Sequence[int], as_of_iso: str) -> dict[int, tuple[int, int]]:
     """(articles added by as_of, all articles) per event."""
     out: dict[int, tuple[int, int]] = {}
@@ -178,6 +206,14 @@ def _visible_counts(store: Store, event_ids: Sequence[int], as_of_iso: str) -> d
         for row in rows:
             out[int(row["event_id"])] = (int(row["visible"] or 0), int(row["total"]))
     return out
+
+
+def _rumour_status(evidence: Sequence[dict[str, Any]]) -> bool | None:
+    """Is the event still an unconfirmed rumour, judging by the visible origins? ``None`` when an origin predates the per-origin
+    metadata. A denial is a conflict, never a confirmation: only a report that is neither a rumour nor a denial confirms."""
+    if not all("sc" in e for e in evidence):
+        return None
+    return any(e.get("rum") for e in evidence) and all(e.get("rum") or e.get("den") for e in evidence)
 
 
 def build_views(
@@ -228,6 +264,14 @@ def build_views(
         origin = _lead_origin(evidence)
         headline = str(origin.get("title") or row["headline"]) if evidence else row["headline"]
         published = min((str(e["published_at"]) for e in evidence if e.get("published_at")), default=None) if evidence else row["published_at"]
+        if evidence:  # recomputed from what was visible at as_of, never from the mutable columns
+            source_class, rumour = origin.get("sc"), _rumour_status(evidence)
+        else:
+            source_class, rumour = row["source_class"], None if row["rumour"] is None else bool(row["rumour"])
+        time_bound = None
+        if not row["event_time"]:
+            bounds = [str(e["event_time_bound"]) for e in evidence if e.get("event_time_bound")]
+            time_bound = min(bounds) if bounds else published  # a publication time bounds the event even without an explicit bound
         entities = _entities(row["entities_json"], as_of_iso, first_seen)
         scale = _agreement_scale(evidence, contradictions)
         if scale is not None:
@@ -245,6 +289,8 @@ def build_views(
                 contradictions=contradictions, extraction_method=row["extraction_method"],
                 hours_since=max(0.0, (as_of_ts.timestamp() - (first_ts.timestamp() if first_ts else as_of_ts.timestamp())) / 3600.0),
                 source=str(origin.get("owner") or ""), url=origin.get("url"), evidence=evidence,
+                novelty_class=row["novelty_class"], rumour=rumour, source_class=source_class, n_conflicts=len(contradictions),
+                event_time_bound=time_bound,
             )
         )
     return views

@@ -9,7 +9,13 @@ import pandas as pd
 import pytest
 
 from automation.scan import _uncertainty_limits
-from models.inference import BaselineBundle, combine_uncertainty, drift_share, pick_uncertainty_ceilings
+from models.inference import (
+    BaselineBundle,
+    combine_uncertainty,
+    disagreement_limit,
+    drift_share,
+    pick_uncertainty_ceilings,
+)
 from models.training import _pick_uncertainty_reference, daily_top_rows, uncertainty_curve
 
 SCALES = {"spec_std_p95": 0.1, "spread_p95": 2.0, "dist_median": 1.0, "dist_p95": 3.0, "drift_p95": 0.2}
@@ -91,6 +97,26 @@ def test_an_absent_or_implausible_curve_means_use_the_configured_constants(meta)
 
 def test_the_heuristic_baseline_has_no_learned_reference():
     assert pick_uncertainty_ceilings(BaselineBundle("pre", (3.0,), 3.0).meta, [0.5]) is None
+
+
+# --------------------------------------------------------- the specialist disagreement the model calls abnormal
+def test_the_disagreement_limit_is_the_models_own_95th_percentile():
+    assert disagreement_limit({"unc_scales": SCALES}) == 0.1
+    assert disagreement_limit({"unc_scales": {"spec_std_p95": 3}}) == 3.0  # an integer is fine, and comes back as a float
+
+
+@pytest.mark.parametrize("meta", [
+    {}, {"unc_scales": None}, {"unc_scales": {}}, {"unc_scales": {"spec_std_p95": None}}, {"unc_scales": {"spec_std_p95": 0.0}},
+    {"unc_scales": {"spec_std_p95": -0.1}}, {"unc_scales": {"spec_std_p95": float("nan")}},
+    {"unc_scales": {"spec_std_p95": float("inf")}}, {"unc_scales": {"spec_std_p95": "0.1"}},
+    {"unc_scales": {"spec_std_p95": True}}, {"unc_scales": [0.1]},
+])
+def test_no_or_implausible_limit_means_the_caller_keeps_its_default(meta):
+    assert disagreement_limit(meta) is None
+
+
+def test_the_heuristic_baseline_has_no_disagreement_limit():
+    assert disagreement_limit(BaselineBundle("pre", (3.0,), 3.0).meta) is None
 
 
 # ------------------------------------------------------------------------- limits per scored symbol

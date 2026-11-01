@@ -15,7 +15,7 @@ from typing import Any
 from app.clock import Clock, get_clock
 from app.config import Settings
 from app.locks import heavy_lock, job_lock
-from app.logging_setup import redact
+from app.logging_setup import job_context, redact
 from app.resources import RssWatchdog, peak_rss_mb
 from automation.context import JobContext, JobResult
 from automation.jobspec import JOBS
@@ -88,6 +88,24 @@ def execute_job(
 def _run(settings, name, fn, store, clock, run_key, attempt, max_attempts, last_attempt, force, dry_run, minutes,
          options) -> JobResult:
     run_id = store.job_start(name, run_key, attempt=attempt, pid=os.getpid())
+    # every line logged from here on reads "[final_scan 2026-11-02#1 r1234]": job, run key, attempt and ledger row
+    with job_context(name, f"{run_key}#{attempt} r{run_id}"):
+        return _execute(settings, name, fn, store, clock, run_key, run_id, attempt, max_attempts, last_attempt, force, dry_run,
+                        minutes, options)
+
+
+def _execute(settings, name, fn, store, clock, run_key, run_id, attempt, max_attempts, last_attempt, force, dry_run, minutes,
+             options) -> JobResult:
+    from ingestion.http import (  # job processes only: keeps the scheduler daemon lean
+        http_summary,
+        reset_http_stats,
+    )
+
+    log.info("job %s [%s] attempt %d/%d starting: pid %d, timeout %d min, force=%s, dry_run=%s%s", name, run_key, attempt,
+             max_attempts, os.getpid(), minutes, force, dry_run,
+             f", options {sorted(options)}" if options else "")
+    reset_http_stats()
+    started = clock.monotonic()
     watchdog = RssWatchdog(float(settings.job_max_rss_mb)).start()
     ctx = JobContext.create(settings, store, run_key=run_key, clock=clock, attempt=attempt, max_attempts=max_attempts,
                             last_attempt=last_attempt, dry_run=dry_run, force=force, options=options,
@@ -108,7 +126,12 @@ def _run(settings, name, fn, store, clock, run_key, attempt, max_attempts, last_
         store.job_finish(run_id, result.status, message=result.message, exit_code=0 if result.status in OK_STATUSES else 1,
                          peak_rss_mb=peak_rss_mb())
     level = log.info if result.status in OK_STATUSES else log.warning
-    level("job %s [%s] attempt %d/%d -> %s: %s", name, run_key, attempt, max_attempts, result.status, result.message)
+    peak = peak_rss_mb()
+    level("job %s [%s] attempt %d/%d -> %s in %.1f s (peak memory %s): %s", name, run_key, attempt, max_attempts, result.status,
+          clock.monotonic() - started, f"{peak:.0f} MB" if peak else "n/a", result.message)
+    traffic = http_summary()
+    if traffic:
+        log.info("job %s network: %s", name, traffic)
     if result.status in {"failed", "timeout"} and last_attempt and not result.message.startswith(PREEMPTED):
         store.add_alert("error", f"job_failed_{name}", f"{name} [{run_key}] failed: {result.message}",
                         dedupe_key=f"job-failed:{name}:{run_key}", dedupe_minutes=24 * 60)

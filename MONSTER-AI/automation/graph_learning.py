@@ -20,6 +20,7 @@ from automation.calendar import ExchangeCalendar
 from database.store import Store
 from event_graph.repository import GraphRepository
 from event_graph.sensitivity import update_graph_from_returns
+from ingestion.adjust import adjusted_bars
 from ingestion.series import SERIES_BY_KEY
 
 log = logging.getLogger(__name__)
@@ -41,10 +42,7 @@ INDIA_TARGET_SERIES: dict[str, str] = {"macro:india_vix": "^INDIAVIX"}
 
 
 def _close_returns(store: Store, symbol: str, kind: str, start: str, end: str) -> pd.Series | None:
-    instrument_id = store.instrument_id(symbol, kind)
-    if instrument_id is None:
-        return None
-    bars = store.get_bars(instrument_id, start, end)
+    bars = adjusted_bars(store, symbol, start, end, kind=kind)  # stocks on the post-split basis, series unchanged
     if bars.empty or "close" not in bars:
         return None
     close = bars["close"].where(bars["close"] > 0).dropna()

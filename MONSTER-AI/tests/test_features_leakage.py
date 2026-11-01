@@ -135,6 +135,46 @@ def test_results_features_are_unknown_before_coverage_not_zero(panel):
     assert early.isna().all() and late.notna().all()
 
 
+def test_a_meeting_further_ahead_than_the_results_horizon_is_invisible(panel):
+    """Live only knows meetings NSE has announced (a week or two ahead); training must not know further than that either."""
+    meeting = T0 + 30
+    q = copy_panel(panel)
+    extra = {"symbol": "S00", "meeting_date": q.dates[meeting].date().isoformat(), "purpose": "Results", "is_results": 1}
+    q.meetings = pd.concat([q.meetings, pd.DataFrame([extra])], ignore_index=True)
+    base, perturbed = build(panel, "pre"), build(q, "pre")
+    calendar_cols = [c for c in base.X.columns if c.startswith("c_")]
+    dates = base.X.index.get_level_values("date")
+    unaware = dates <= q.dates[meeting - 11]  # 11+ sessions before the meeting
+    assert_same(base.X[unaware], perturbed.X[unaware], calendar_cols)
+    edge = (q.dates[meeting - 10], "S00")
+    assert perturbed.X.loc[edge, "c_days_to_results"] == 10.0 and np.isnan(base.X.loc[edge, "c_days_to_results"])
+
+
+def test_relative_volume_compares_with_the_sessions_before_it(panel):
+    """The feature of date t describes session t-1 against the 20 sessions before THAT one (never including it)."""
+    fs = build(panel, "pre")
+    sym = panel.symbols[3]
+    v = panel.v[sym]
+    baseline = v.iloc[T0 - 21:T0 - 1].mean()
+    row = fs.X.loc[(panel.dates[T0], sym)]
+    assert row["t_rvol1"] == pytest.approx(v.iloc[T0 - 1] / baseline, rel=1e-4)
+    assert row["t_rvol5"] == pytest.approx(v.iloc[T0 - 5:T0].mean() / baseline, rel=1e-4)
+    q = copy_panel(panel)
+    q.v.iloc[T0 - 1, 3] = 10.0 * baseline  # a ten-fold spike in the latest finished session
+    assert build(q, "pre").X.loc[(q.dates[T0], sym), "t_rvol1"] == pytest.approx(10.0, rel=1e-4)  # it read 6.9 before
+
+
+def test_a_stocks_own_return_stays_out_of_its_sector_dispersion(panel):
+    base = build(panel, "pre")
+    q = copy_panel(panel)
+    q.c.iloc[T0 - 1, 0] *= 1.08  # S00 jumps 8% in the latest finished session
+    moved = build(q, "pre")
+    day = panel.dates[T0]
+    assert panel.sectors["S00"] == panel.sectors["S04"]
+    assert moved.X.loc[(day, "S00"), "s_disp1"] == base.X.loc[(day, "S00"), "s_disp1"]
+    assert moved.X.loc[(day, "S04"), "s_disp1"] > base.X.loc[(day, "S04"), "s_disp1"]  # its peers do see the outlier
+
+
 def test_labels_describe_the_session_and_baseline_is_prior_only(panel):
     fs = build(panel, "pre")
     t = panel.dates[T0]

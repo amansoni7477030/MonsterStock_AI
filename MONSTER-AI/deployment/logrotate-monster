@@ -1,12 +1,17 @@
 # MONSTER AI - logrotate policy (installed as /etc/logrotate.d/monster-ai)
 #
-# The application rotates its own monster.log (5 files x 5 MB) - this policy is only the safety net for
-# any other *.log file that ends up in /var/log/monster-ai (for example output of a manual CLI run).
+# The application manages its own logs: /var/log/monster-ai/<role>-YYYY-MM-DD.log and errors-YYYY-MM-DD.log are daily files (a
+# new day opens a new file by name, nothing is ever renamed) that the application prunes itself - by LOG_RETENTION_DAYS and
+# the LOG_MAX_MB budget, at every start and in the nightly housekeeping. logrotate must NOT touch them: copytruncate would
+# empty yesterday's file and `python -m app.cli logs` would show nothing for it.
 #
-#   copytruncate - the running daemon keeps its file handle, so the file is copied and truncated in place
+# This policy therefore covers only what the application does not know about:
+#   *.out   - output of a manual run that was redirected into the log directory (for example `... > /var/log/monster-ai/manual.out`)
+#
+#   copytruncate - a running process keeps its file handle, so the file is copied and truncated in place
 #   su monster   - the directory is owned by the service user; without `su` logrotate refuses to rotate
 #                  in a directory that is not writable by root only
-/var/log/monster-ai/*.log {
+/var/log/monster-ai/*.out {
     weekly
     rotate 4
     compress

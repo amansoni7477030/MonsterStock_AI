@@ -8,11 +8,12 @@ import os
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app import jsonutil
-from app.clock import Clock, get_clock, iso
+from app.clock import Clock, get_clock, iso, parse_ts
 from database.connection import connect, transaction
 from database.migrate import apply_migrations
 
@@ -30,6 +31,12 @@ FNO_FIELDS = (
     "call_vol", "put_vol", "pcr_oi", "pcr_vol", "atm_strike", "atm_straddle", "expected_move_pct", "iv_atm",
     "iv_skew", "max_call_oi_strike", "max_put_oi_strike", "dte",
 )
+# The snapshot that counts for a (trade date, stage) is its LATEST one: what ``latest_snapshot`` returns and what a retried
+# scan re-sends. A forced re-scan stores a second snapshot; the earlier one is superseded and must never be scored again.
+_EFFECTIVE_SNAPSHOT_IDS = "(SELECT MAX(snapshot_id) FROM snapshots GROUP BY trade_date, stage)"
+FRESHNESS_LOOKBACK_DAYS = 10  # bars / F&O older than this are not "recent" input of a scan
+NEWS_LOOKBACK_HOURS = 48
+GIFT_QUOTE_KEY = "GIFT_NIFTY"
 
 
 def _num(value: Any) -> float | None:
@@ -515,6 +522,46 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
+    def source_freshness(self, *, trade_date: str, cutoff_ts: str) -> dict[str, dict[str, Any]]:
+        """The inputs of a scan at ``cutoff_ts`` per source family, using only data that had ARRIVED by then: ``latest`` is
+        the newest source timestamp (a bar date, an exchange time, a publication time as stored), ``received_at`` the newest
+        arrival here and ``n`` the rows or series seen (bars / F&O within ``FRESHNESS_LOOKBACK_DAYS``, news and filings within
+        ``NEWS_LOOKBACK_HOURS``). Frozen into every snapshot so a prediction can be traced to the data behind it."""
+        recent = (date.fromisoformat(trade_date) - timedelta(days=FRESHNESS_LOOKBACK_DAYS)).isoformat()
+        text_since = iso(parse_ts(cutoff_ts) - timedelta(hours=NEWS_LOOKBACK_HOURS))
+        bars = (
+            "SELECT MAX(b.trade_date) AS latest, MAX(b.received_at) AS received, COUNT(DISTINCT b.instrument_id) AS n "
+            "FROM bars_daily b JOIN instruments i USING (instrument_id) WHERE {} AND b.trade_date >= ? "
+            "AND b.trade_date <= ? AND b.received_at <= ?"
+        )
+        window = (recent, trade_date, cutoff_ts)
+
+        def family(sql: str, params: Sequence[Any]) -> dict[str, Any]:
+            row = self.conn.execute(sql, tuple(params)).fetchone()
+            if row is None or not row["n"]:
+                return {"latest": None, "received_at": None, "n": 0}
+            return {"latest": row["latest"], "received_at": row["received"], "n": int(row["n"])}
+
+        book = (
+            "SELECT source_ts AS latest, received_at AS received, (SELECT COUNT(DISTINCT symbol) FROM preopen_quotes "
+            "WHERE trade_date = ? AND received_at <= ?) AS n FROM preopen_quotes WHERE trade_date = ? AND received_at <= ? "
+            "ORDER BY received_at DESC, id DESC LIMIT 1"
+        )
+        gift = self.latest_live_quote(GIFT_QUOTE_KEY, before=cutoff_ts)
+        return {
+            "market_bars": family(bars.format("i.kind = 'equity' AND i.in_universe = 1"), window),
+            "global_closes": family(bars.format("i.kind <> 'equity'"), window),
+            "fno": family("SELECT MAX(trade_date) AS latest, MAX(received_at) AS received, COUNT(*) AS n FROM fno_daily "
+                          "WHERE trade_date >= ? AND trade_date <= ? AND received_at <= ?", window),
+            "preopen": family(book, (trade_date, cutoff_ts, trade_date, cutoff_ts)),
+            "gift": ({"latest": gift["source_ts"], "received_at": gift["received_at"], "n": 1} if gift
+                     else {"latest": None, "received_at": None, "n": 0}),
+            "news": family("SELECT MAX(published_at) AS latest, MAX(first_seen_at) AS received, COUNT(*) AS n FROM news_raw "
+                           "WHERE first_seen_at >= ? AND first_seen_at <= ?", (text_since, cutoff_ts)),
+            "filings": family("SELECT MAX(disseminated_at) AS latest, MAX(first_seen_at) AS received, COUNT(*) AS n "
+                              "FROM filings WHERE first_seen_at >= ? AND first_seen_at <= ?", (text_since, cutoff_ts)),
+        }
+
     # ------------------------------------------------------------------------------------------ calendar
     def upsert_calendar_days(self, rows: Sequence[Mapping[str, Any]], *, source: str) -> int:
         if not rows:
@@ -613,16 +660,38 @@ class Store:
         return self._snapshot_dict(row) if row else None
 
     def latest_snapshot(self, trade_date: str, stage: str | None = None) -> dict[str, Any] | None:
+        """The newest snapshot of a date. For a stage this IS its effective snapshot (see ``effective_snapshot``)."""
         if stage:
-            row = self.conn.execute(
-                "SELECT * FROM snapshots WHERE trade_date = ? AND stage = ? ORDER BY snapshot_id DESC LIMIT 1",
-                (trade_date, stage),
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT * FROM snapshots WHERE trade_date = ? ORDER BY snapshot_id DESC LIMIT 1", (trade_date,)
-            ).fetchone()
+            return self.effective_snapshot(trade_date, stage)
+        row = self.conn.execute(
+            "SELECT * FROM snapshots WHERE trade_date = ? ORDER BY snapshot_id DESC LIMIT 1", (trade_date,)
+        ).fetchone()
         return self._snapshot_dict(row) if row else None
+
+    def effective_snapshot(self, trade_date: str, stage: str) -> dict[str, Any] | None:
+        """The snapshot that counts for ``(trade_date, stage)``: the latest one. A forced re-scan freezes a second snapshot
+        and supersedes the first; only the effective one is re-sent by a retried scan and scored by the evaluation."""
+        row = self.conn.execute(
+            "SELECT * FROM snapshots WHERE trade_date = ? AND stage = ? ORDER BY snapshot_id DESC LIMIT 1",
+            (trade_date, stage),
+        ).fetchone()
+        return self._snapshot_dict(row) if row else None
+
+    def effective_snapshots(
+        self, *, since: str | None = None, until: str | None = None, stage: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The effective snapshot of every (trade date, stage) in the range, without payloads, oldest first."""
+        clauses = [f"snapshot_id IN {_EFFECTIVE_SNAPSHOT_IDS}"]
+        params: list[Any] = []
+        for clause, value in (("trade_date >= ?", since), ("trade_date <= ?", until), ("stage = ?", stage)):
+            if value:
+                clauses.append(clause)
+                params.append(value)
+        rows = self.conn.execute(
+            "SELECT snapshot_id, trade_date, stage, cutoff_ts, created_at, feature_version, model_version, code_version "
+            f"FROM snapshots WHERE {' AND '.join(clauses)} ORDER BY trade_date, stage", params,
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _snapshot_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -659,8 +728,12 @@ class Store:
         return ids
 
     def predictions_for(
-        self, trade_date: str, *, stage: str | None = None, baselines: bool | None = False
+        self, trade_date: str, *, stage: str | None = None, baselines: bool | None = False, all_snapshots: bool = False
     ) -> list[dict[str, Any]]:
+        """Frozen predictions of a trade date (``baselines``: False = model picks, True = baseline picks, None = both).
+
+        Only the EFFECTIVE snapshot of each stage counts: a forced re-scan freezes a second snapshot, and scoring both would
+        count the same pick twice. ``all_snapshots=True`` returns every frozen record, superseded ones included."""
         clauses, params = ["trade_date = ?"], [trade_date]
         if stage:
             clauses.append("stage = ?")
@@ -668,6 +741,8 @@ class Store:
         if baselines is not None:
             clauses.append("is_baseline = ?")
             params.append(1 if baselines else 0)
+        if not all_snapshots:
+            clauses.append(f"snapshot_id IN {_EFFECTIVE_SNAPSHOT_IDS}")
         rows = self.conn.execute(
             f"SELECT * FROM predictions WHERE {' AND '.join(clauses)} ORDER BY stage, is_baseline, baseline_name, rank", params
         ).fetchall()
@@ -695,10 +770,12 @@ class Store:
         ).fetchall()
         return [r["trade_date"] for r in rows]
 
-    def predictions_without_validated_outcome(self, trade_date: str) -> list[dict[str, Any]]:
+    def predictions_without_validated_outcome(self, trade_date: str, *, all_snapshots: bool = False) -> list[dict[str, Any]]:
+        """Predictions still lacking an official (validated) outcome; effective snapshots only unless ``all_snapshots``."""
+        effective = "" if all_snapshots else f" AND p.snapshot_id IN {_EFFECTIVE_SNAPSHOT_IDS}"
         rows = self.conn.execute(
             "SELECT p.* FROM predictions p WHERE p.trade_date = ? AND NOT EXISTS ("
-            "SELECT 1 FROM outcomes o WHERE o.prediction_id = p.prediction_id AND o.validated = 1) "
+            f"SELECT 1 FROM outcomes o WHERE o.prediction_id = p.prediction_id AND o.validated = 1){effective} "
             "ORDER BY p.stage, p.is_baseline, p.rank",
             (trade_date,),
         ).fetchall()
@@ -724,8 +801,9 @@ class Store:
         )
 
     def evaluated_rows(self, *, since: str | None = None, until: str | None = None,
-                       include_baselines: bool = True) -> list[dict[str, Any]]:
-        """Predictions joined with their best outcome (validated beats provisional)."""
+                       include_baselines: bool = True, all_snapshots: bool = False) -> list[dict[str, Any]]:
+        """Predictions joined with their best outcome (validated beats provisional). Effective snapshots only, so a
+        forced re-scan never scores one pick twice; ``all_snapshots=True`` reads the superseded records too."""
         clauses, params = [], []
         if since:
             clauses.append("p.trade_date >= ?")
@@ -735,6 +813,8 @@ class Store:
             params.append(until)
         if not include_baselines:
             clauses.append("p.is_baseline = 0")
+        if not all_snapshots:
+            clauses.append(f"p.snapshot_id IN {_EFFECTIVE_SNAPSHOT_IDS}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
             "SELECT p.*, o.range_pct, o.exc_pct, o.dir_ret_pct, o.mfe_pct, o.mae_pct, o.validated AS o_validated, "
@@ -747,22 +827,50 @@ class Store:
         ).fetchall()
         return [self._prediction_dict(r) for r in rows]
 
+    def outcome_counts(self) -> dict[str, int]:
+        """Outcomes of effective predictions: validated, provisional, and the number of days with a validated one."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(o.validated = 1), 0) AS validated, COALESCE(SUM(o.validated = 0), 0) AS provisional, "
+            "COUNT(DISTINCT CASE WHEN o.validated = 1 THEN o.trade_date END) AS days "
+            "FROM outcomes o JOIN predictions p ON p.prediction_id = o.prediction_id "
+            f"WHERE p.snapshot_id IN {_EFFECTIVE_SNAPSHOT_IDS}"
+        ).fetchone()
+        return {"validated": int(row["validated"]), "provisional": int(row["provisional"]), "days": int(row["days"])}
+
+    def realised_ranges(self, start: str, end: str) -> dict[str, dict[str, float]]:
+        """trade date -> {symbol: realised intraday range in % of the open} for every equity with a usable bar in the range."""
+        cursor = self.conn.execute(
+            "SELECT b.trade_date AS d, i.symbol AS s, (b.high - b.low) / b.open * 100.0 AS r FROM bars_daily b "
+            "JOIN instruments i USING (instrument_id) WHERE i.kind = 'equity' AND b.trade_date >= ? AND b.trade_date <= ? "
+            "AND b.open > 0 AND b.high > 0 AND b.low > 0", (start, end),
+        )
+        out: dict[str, dict[str, float]] = {}
+        for row in cursor:
+            out.setdefault(row["d"], {})[row["s"]] = float(row["r"])
+        return out
+
     # ------------------------------------------------------------------------------------- eval metrics
     def insert_metrics(self, as_of_date: str, scope: str, metrics: Iterable[Mapping[str, Any]]) -> int:
+        """Record metrics of ``as_of_date``. Idempotent: a metric (scope, slice, name) already recorded for that date is
+        REPLACED, never duplicated, so re-running an evaluation is safe; the last of duplicates within a call wins."""
         now = self.now()
-        payload = [
-            (as_of_date, now, scope, m.get("slice", "all"), m["name"], _num(m.get("value")), m.get("n"),
-             _num(m.get("ci_low")), _num(m.get("ci_high")), jsonutil.dumps(m["extra"]) if m.get("extra") else None)
-            for m in metrics
-        ]
-        if not payload:
+        rows: dict[tuple[str, str], tuple[Any, ...]] = {}
+        for m in metrics:
+            key = (m.get("slice", "all"), m["name"])
+            rows[key] = (as_of_date, now, scope, key[0], key[1], _num(m.get("value")), m.get("n"), _num(m.get("ci_low")),
+                         _num(m.get("ci_high")), jsonutil.dumps(m["extra"]) if m.get("extra") else None)
+        if not rows:
             return 0
         with self.tx():
             self.conn.executemany(
-                "INSERT INTO eval_metrics (as_of_date, computed_at, scope, slice, name, value, n, ci_low, ci_high, extra_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", payload,
+                "DELETE FROM eval_metrics WHERE as_of_date = ? AND scope = ? AND slice = ? AND name = ?",
+                [(as_of_date, scope, slice_, name) for slice_, name in rows],
             )
-        return len(payload)
+            self.conn.executemany(
+                "INSERT INTO eval_metrics (as_of_date, computed_at, scope, slice, name, value, n, ci_low, ci_high, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", list(rows.values()),
+            )
+        return len(rows)
 
     def latest_metrics(self, scope: str, *, name: str | None = None) -> list[dict[str, Any]]:
         row = self.conn.execute("SELECT MAX(as_of_date) AS d FROM eval_metrics WHERE scope = ?", (scope,)).fetchone()

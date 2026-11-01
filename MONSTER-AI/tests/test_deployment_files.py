@@ -54,7 +54,7 @@ CLI_CONTRACT = {
     "version", "env-example", "init", "doctor", "bootstrap", "daemon", "health", "alert-unit",
     "telegram-setup", "telegram-test", "dashboard", "backup",
 }
-CLI_WORKFLOW_EXTRA = {"train"}
+CLI_WORKFLOW_EXTRA = {"train", "logs", "diag", "storage"}  # operator commands: documented, never called by units or scripts
 
 # Names that are not application settings (app.config.VARS) but are set / read by the deployment layer.
 RUNTIME_VARIABLES = {
@@ -393,7 +393,10 @@ def test_journald_and_logrotate_configs():
     for line in ("[Journal]", "SystemMaxUse=100M", "RuntimeMaxUse=50M", "MaxRetentionSec=2week"):
         assert line in journald.split("\n"), line
     rotate = read(DEPLOY / "logrotate-monster")
-    assert "/var/log/monster-ai/*.log {" in rotate
+    assert "/var/log/monster-ai/*.out {" in rotate
+    # the application owns its daily *.log files: logrotate's copytruncate would empty yesterday's file
+    assert not re.search(r"^/var/log/monster-ai/\*\.log\b", rotate, re.M)
+    assert "/var/log/monster-ai-install.log {" in rotate
     for token in ("weekly", "rotate 4", "compress", "missingok", "notifempty", "copytruncate", "su monster monster"):
         assert token in rotate, token
 

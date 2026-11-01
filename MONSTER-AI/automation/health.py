@@ -6,21 +6,28 @@ the notification service delivers to the operator chat. Exit codes for the CLI: 
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from app.clock import Clock, at_ist, get_clock, iso, ist_date, parse_ts
 from app.config import Settings
-from app.resources import check_resources
+from app.locks import lock_dir
+from app.resources import check_resources, dir_size_mb
 from automation.calendar import ExchangeCalendar
+from automation.retention import BUDGET_WARN_SHARE, RETENTION_KEY
 from database.migrate import check_integrity
 from database.store import Store
 
 log = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "daemon.heartbeat"
+HEARTBEAT_FILE = "daemon.heartbeat"
 HEARTBEAT_MAX_AGE_SEC = 180
 BACKUP_WARN_HOURS = 36
 BACKUP_CRIT_HOURS = 72
@@ -29,6 +36,10 @@ MODEL_STALE_DAYS = 120
 SOURCE_FAIL_WARN = 5
 CALENDAR_REFRESH_KEY = "calendar.last_refresh"  # written by the refresh_calendar job
 CALENDAR_STALE_DAYS = 10
+CALENDAR_HORIZON_WARN_DAYS = 21  # warn when the official holiday list ends within this many days
+RETENTION_STALE_DAYS = 3  # the nightly housekeeping (retention) has not completed for this long
+WAL_WARN_MB = 256  # a WAL this large means checkpoints are starved (a reader never lets go)
+EOD_BARS_EXPECTED_AFTER = timedelta(hours=3)  # end-of-day bars are expected this long after the close (ingest_eod runs ~17:45)
 ECE_WARN = 0.10
 SKILL_WARN = -0.02
 CRITICAL_JOBS = ("prelim_scan", "final_scan")
@@ -67,6 +78,34 @@ def _age_hours(stamp: str | None, now: datetime) -> float | None:
     return None if moment is None else (now - moment).total_seconds() / 3600.0
 
 
+# ------------------------------------------------------------------------------------------- heartbeat
+def heartbeat_path(data_dir: Path) -> Path:
+    return lock_dir(data_dir) / HEARTBEAT_FILE
+
+
+def write_heartbeat_file(data_dir: Path, now: datetime) -> bool:
+    """The scheduler's liveness proof that does not depend on the database: a VACUUM or a bulk delete can hold the SQLite
+    writer lock for a while, but must never make a healthy daemon look dead. Atomic (temp file + replace)."""
+    path = heartbeat_path(data_dir)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"at": iso(now), "pid": os.getpid()}), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.warning("heartbeat file not written: %s", exc)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
+
+
+def read_heartbeat_file(data_dir: Path) -> datetime | None:
+    try:
+        return parse_ts(json.loads(heartbeat_path(data_dir).read_text(encoding="utf-8")).get("at"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 # ---------------------------------------------------------------------------------------------------- checks
 def _check_database(report: HealthReport, store: Store) -> None:
     try:
@@ -88,16 +127,25 @@ def _check_resources(report: HealthReport, settings: Settings) -> None:
         report.add(status.level, "resources", "; ".join(status.messages))
 
 
-def _check_heartbeat(report: HealthReport, store: Store, now: datetime) -> None:
-    beat = parse_ts(store.kv_get(HEARTBEAT_KEY))
-    if beat is None:
+def _check_heartbeat(report: HealthReport, store: Store, settings: Settings, now: datetime) -> None:
+    """The scheduler is alive if EITHER proof is fresh: the database row (what the dashboard shows) or the heartbeat file
+    (written independently of the SQLite writer lock, so a long VACUUM never makes a healthy daemon look dead)."""
+    db_beat = parse_ts(store.kv_get(HEARTBEAT_KEY))
+    file_beat = read_heartbeat_file(settings.data_dir)
+    beats = [b for b in (db_beat, file_beat) if b is not None]
+    if not beats:
         if store.recent_jobs(1):
             report.add("crit", "scheduler_silent", "scheduler has never reported a heartbeat although jobs exist")
         return
-    age = (now - beat).total_seconds()
+    age = (now - max(beats)).total_seconds()
     report.checks["heartbeat_age_sec"] = round(age)
+    if db_beat is not None:
+        report.checks["heartbeat_db_age_sec"] = round((now - db_beat).total_seconds())
     if age > HEARTBEAT_MAX_AGE_SEC:
         report.add("crit", "scheduler_stalled", f"scheduler heartbeat is {age / 60:.0f} min old (service stopped or hung?)")
+    elif db_beat is not None and (now - db_beat).total_seconds() > HEARTBEAT_MAX_AGE_SEC:
+        report.add("warn", "heartbeat_db_stale", "the scheduler is alive (heartbeat file) but cannot write to the database: "
+                   "a long maintenance run or a locked database")
 
 
 def _check_jobs(report: HealthReport, store: Store, calendar: ExchangeCalendar, now: datetime) -> None:
@@ -131,11 +179,13 @@ def _check_data(report: HealthReport, store: Store, calendar: ExchangeCalendar, 
     if not universe:
         report.add("warn", "no_universe", "no instruments in the universe yet (bootstrap not finished?)")
         return
-    session = calendar.last_completed_session(now).isoformat()
+    # The official end-of-day file is ingested ~17:45 IST: from the close (15:30) until then the newest session legitimately
+    # has no bars yet, so judge the universe against the session that SHOULD be complete by now (a daily false alarm before).
+    session = calendar.last_completed_session(now - EOD_BARS_EXPECTED_AFTER).isoformat()
     have_bar = store.symbols_with_bar(session, universe_only=True)
     coverage = sum(1 for r in universe if r["symbol"] in have_bar) / len(universe)
     report.checks.update(last_session=session, coverage=round(coverage, 3))
-    if coverage < 0.90 and now.hour >= 1:
+    if coverage < 0.90:
         report.add("warn", "stale_bars", f"only {coverage:.0%} of the universe has the {session} bar")
 
 
@@ -204,9 +254,25 @@ def _check_performance(report: HealthReport, store: Store) -> None:
                                               "(python -m app.cli models rollback)")
 
 
-def _check_calendar(report: HealthReport, store: Store, settings: Settings, now: datetime) -> None:
-    """The shipped holiday list covers one year; the NSE refresh keeps it current. If that refresh keeps failing the system
-    could scan on an exchange holiday, so a stale calendar is surfaced early."""
+def _check_calendar(report: HealthReport, store: Store, settings: Settings, now: datetime,
+                    calendar: ExchangeCalendar | None = None) -> None:
+    """Holidays must be right for ANY date. NSE publishes next year's list in December; until then (and if the NSE refresh keeps
+    failing) rule-based holidays and the final scan's live check cover the gap, and this check says so early."""
+    cal = calendar or ExchangeCalendar(store)
+    cal.reload()
+    status = cal.status(ist_date(now))
+    report.checks["calendar_official_through"] = status.official_through.isoformat() if status.official_through else None
+    report.checks["calendar_days_left"] = status.days_left
+    if status.days_left is None:
+        report.add("warn", "calendar_unofficial", "no official NSE holiday list is loaded; holidays come from rules only "
+                                                  f"(fixed-date holidays and Good Friday){_refresh_hint(settings)}")
+    elif status.days_left < 0:
+        report.add("warn", "calendar_unofficial", f"the official holiday list ended on {status.official_through}; holidays "
+                    f"since then come from rules only{_refresh_hint(settings)}")
+    elif status.days_left <= CALENDAR_HORIZON_WARN_DAYS:
+        report.add("warn", "calendar_horizon", f"the official holiday list ends in {status.days_left} days "
+                    f"({status.official_through}); NSE publishes the next year's list in December and the daily refresh "
+                    "picks it up")
     if not settings.nse_enabled:
         return
     age = _age_hours(store.kv_get(CALENDAR_REFRESH_KEY), now)
@@ -221,6 +287,43 @@ def _check_calendar(report: HealthReport, store: Store, settings: Settings, now:
         report.add("warn", "calendar_stale", f"the holiday calendar was last refreshed {age / 24:.0f} days ago")
 
 
+def _check_storage(report: HealthReport, store: Store, settings: Settings, now: datetime) -> None:
+    """Nothing may grow without bound: the data directory stays within its budget and the nightly retention keeps running."""
+    data_mb = dir_size_mb(settings.data_dir) if settings.data_dir.exists() else 0.0
+    budget = settings.data_max_mb
+    report.checks["data_mb"] = round(data_mb)
+    report.checks["data_budget_mb"] = budget
+    if budget and data_mb >= budget:
+        report.add("warn", "storage_over_budget", f"the data directory uses {data_mb:.0f} MB, above its {budget} MB budget "
+                   "(retention trims optional data harder; inspect with: python -m app.cli storage)")
+    elif budget and data_mb >= BUDGET_WARN_SHARE * budget:
+        report.add("warn", "storage_budget", f"the data directory uses {data_mb:.0f} MB of its {budget} MB budget")
+    wal = settings.db_path.with_name(settings.db_path.name + "-wal")
+    wal_mb = wal.stat().st_size / 1048576.0 if wal.exists() else 0.0
+    report.checks["wal_mb"] = round(wal_mb, 1)
+    if wal_mb > WAL_WARN_MB:
+        report.add("warn", "wal_large", f"the database WAL file is {wal_mb:.0f} MB: checkpoints are blocked by a long-running "
+                   "reader (restart the dashboard / daemon)")
+    last = store.kv_get_json(RETENTION_KEY)
+    age = _age_hours(last.get("at"), now) if isinstance(last, dict) else None
+    report.checks["retention_age_h"] = None if age is None else round(age, 1)
+    first = parse_ts(store.kv_get("daemon.first_start"))
+    running_days = (now - first).total_seconds() / 86400 if first else 0
+    if age is None:
+        if running_days > RETENTION_STALE_DAYS:
+            report.add("warn", "retention_never_ran", "the nightly retention (housekeeping job) has never completed although "
+                        "the scheduler has been running for days")
+    elif age > RETENTION_STALE_DAYS * 24:
+        report.add("warn", "retention_stale", f"the last retention run was {age / 24:.0f} days ago (housekeeping job failing?)")
+    elif last.get("notes"):
+        report.add("warn", "retention_errors", "retention rules failed: " + "; ".join(last["notes"])[:200])
+
+
+def _refresh_hint(settings: Settings) -> str:
+    return "; the daily refresh from NSE fixes this as soon as the list is published" if settings.nse_enabled else \
+        " (NSE_ENABLED=false: add the dates to calendar_overrides.json)"
+
+
 def evaluate_health(store: Store, settings: Settings, clock: Clock | None = None,
                     calendar: ExchangeCalendar | None = None) -> HealthReport:
     clk = clock or get_clock()
@@ -230,10 +333,11 @@ def evaluate_health(store: Store, settings: Settings, clock: Clock | None = None
     for name, check in (
         ("database", lambda: _check_database(report, store)),
         ("resources", lambda: _check_resources(report, settings)),
-        ("heartbeat", lambda: _check_heartbeat(report, store, now)),
+        ("heartbeat", lambda: _check_heartbeat(report, store, settings, now)),
         ("jobs", lambda: _check_jobs(report, store, cal, now)),
         ("data", lambda: _check_data(report, store, cal, now)),
-        ("calendar", lambda: _check_calendar(report, store, settings, now)),
+        ("calendar", lambda: _check_calendar(report, store, settings, now, cal)),
+        ("storage", lambda: _check_storage(report, store, settings, now)),
         ("models", lambda: _check_models(report, store, settings, now)),
         ("sources", lambda: _check_sources(report, store)),
         ("backup", lambda: _check_backup(report, store, now)),

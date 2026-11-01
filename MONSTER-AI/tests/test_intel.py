@@ -4,6 +4,9 @@ failure isolation (news is enrichment - it may reduce coverage but must never bl
 from __future__ import annotations
 
 import builtins
+import json
+import logging
+import sqlite3
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -222,3 +225,127 @@ def test_prune_returns_the_retention_counts(intel, store):
 def test_the_coverage_note_mentions_a_degraded_llm(intel, store):
     store.kv_set("news.reduced_coverage", "1")
     assert "LLM extraction degraded" in intel.coverage_note()
+
+
+# --------------------------------------------------------------- a stock is only counted for events it is the subject of
+def entity_json(symbol, **over):
+    item = {"id": symbol, "type": "company", "name": symbol, "polarity": 0.0, "confidence": 0.9, **over}
+    return json.dumps([item])
+
+
+def test_reacted_does_not_count_a_passing_mention_as_an_event_for_the_stock(intel, store, fake_clock):
+    now = fake_clock.now()
+    stamp = lambda hours: (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    reliance_story = json.dumps([
+        {"id": "RELIANCE", "type": "company", "polarity": 0.8, "confidence": 0.9, "in_title": True},
+        {"id": "TCS", "type": "company", "polarity": 0.0, "confidence": 0.9},  # TCS is only named in the body
+    ])
+    insert_event(store, "story", entities_json=reliance_story, market_reacted=1, first_seen_at=stamp(2))
+    insert_event(store, "real", entities_json=entity_json("TCS", polarity=-0.5), market_reacted=0, first_seen_at=stamp(3))
+    assert intel.reacted(["RELIANCE", "TCS"], now) == {"RELIANCE": (1, 1), "TCS": (0, 1)}  # not (1, 2) for TCS
+
+
+def test_reacted_matches_structured_entities_not_text(intel, store, fake_clock):
+    now = fake_clock.now()
+    stamp = lambda hours: (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    spaced = '[ { "id" : "TCS", "type": "company", "polarity": 0.6, "confidence": 0.9 } ]'  # any JSON layout will do
+    insert_event(store, "spaced", entities_json=spaced, market_reacted=1, first_seen_at=stamp(2))
+    insert_event(store, "headline", entities_json=entity_json("TCS", in_title=True), market_reacted=0, first_seen_at=stamp(3))
+    insert_event(store, "unsure", entities_json=entity_json("TCS", polarity=0.7, confidence=0.3), first_seen_at=stamp(4))
+    insert_event(store, "sector", entities_json=entity_json("TCS", type="sector", polarity=0.7), first_seen_at=stamp(5))
+    insert_event(store, "broken", entities_json="{not json", first_seen_at=stamp(6))
+    insert_event(store, "text-only", entities_json="[]", headline="TCS wins an order", first_seen_at=stamp(7))
+    assert intel.reacted(["TCS"], now) == {"TCS": (1, 2)}
+
+
+def test_reacted_only_knows_entities_attached_by_the_as_of_time(intel, store, fake_clock):
+    now = fake_clock.now()
+    seen = (now - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    late = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    story = json.dumps([{"id": "RELIANCE", "type": "company", "polarity": 0.8, "confidence": 0.9},
+                        {"id": "TCS", "type": "company", "polarity": 0.4, "confidence": 0.9, "t": late}])
+    insert_event(store, "story", entities_json=story, market_reacted=1, first_seen_at=seen)
+    assert intel.reacted(["TCS"], now - timedelta(hours=2)) == {}
+    assert intel.reacted(["TCS"], now) == {"TCS": (1, 1)}
+
+
+# -------------------------------------------------------------- news failures reduce coverage out loud, never silently
+def test_failing_catalyst_lookups_are_logged_and_reported_as_reduced_coverage(intel, caplog):
+    def catalysts_for(symbol, as_of, limit=3):
+        if symbol in ("TCS", "INFY"):
+            raise RuntimeError("bad row")
+        return ["catalyst"] if symbol == "RELIANCE" else []
+
+    intel.pipeline = SimpleNamespace(catalysts_for=catalysts_for)
+    with caplog.at_level(logging.WARNING, logger="automation.intel"):
+        out = intel.catalysts(["RELIANCE", "TCS", "INFY", "SBIN"], intel.clock.now())
+        intel.catalysts(["RELIANCE", "TCS", "INFY", "SBIN"], intel.clock.now())
+    assert out == {"RELIANCE": ["catalyst"]}
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 4 and "TCS" in warned[0].getMessage() and "INFY" in warned[1].getMessage()
+    assert all(r.exc_info for r in warned)  # the traceback is kept
+    assert intel.coverage_note() == "catalysts unavailable for 2 of 4 stock(s) (RuntimeError)"  # once, however often it recurs
+
+
+def test_a_failing_graph_propagation_is_logged_and_reported(intel, caplog):
+    intel.pipeline = SimpleNamespace(recent_events=lambda *a, **k: ["event"])
+    intel.graph = Boom()
+    with caplog.at_level(logging.WARNING, logger="automation.intel"):
+        assert intel.chains(["RELIANCE"], intel.clock.now()) == {}
+        assert intel.chains(["TCS"], intel.clock.now()) == {}
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+    assert intel.coverage_note() == "event chains unavailable (RuntimeError)"  # reported once however often it fails
+    intel.graph = None
+    assert intel.chains(["RELIANCE"], intel.clock.now()) == {}  # no graph at all: already reported at start-up
+
+
+def test_failing_event_features_are_logged_and_reported(intel, caplog):
+    intel.pipeline = Boom()
+    with caplog.at_level(logging.WARNING, logger="automation.intel"):
+        assert intel.event_features(["RELIANCE"], intel.clock.now()) == {}
+    assert [r.levelno for r in caplog.records if "event features" in r.getMessage()] == [logging.WARNING]
+    assert intel.coverage_note() == "event features unavailable (RuntimeError)"
+
+
+def test_a_failing_priced_in_check_is_logged_and_reported(intel, caplog):
+    class BrokenConnection:
+        def execute(self, *_a, **_k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    intel.store = SimpleNamespace(conn=BrokenConnection(), kv_get=lambda *a, **k: None)
+    with caplog.at_level(logging.WARNING, logger="automation.intel"):
+        assert intel.reacted(["RELIANCE"], intel.clock.now()) == {}
+    assert any(r.levelno == logging.WARNING and "priced-in" in r.getMessage() for r in caplog.records)
+    assert intel.coverage_note() == "already-priced-in check unavailable (OperationalError)"
+
+
+def test_healthy_queries_leave_the_coverage_note_empty(intel, store, fake_clock):
+    insert_event(store, "a", entities_json=COMPANY, first_seen_at=(fake_clock.now() - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    now = fake_clock.now()
+    intel.catalysts(["RELIANCE", "TCS"], now)
+    intel.chains(["RELIANCE"], now)
+    intel.event_features(["RELIANCE"], now)
+    intel.reacted(["RELIANCE"], now)
+    assert intel.coverage_note() is None
+
+
+# ---------------------------------------------------------------------- the report chains tell measured, prior and broken apart
+def test_report_chains_label_each_link_and_call_a_broken_relationship_broken(intel, store, fake_clock):
+    from event_graph.repository import GraphRepository
+
+    now = fake_clock.now()
+    brent = json.dumps([{"id": "macro:brent", "type": "commodity", "name": "Brent crude", "polarity": 0.7, "confidence": 0.9,
+                         "move_pct": 3.1}])
+    insert_event(store, "brent", entities_json=brent, scope="macro", event_type="commodity_supply", severity=0.8, confidence=0.9,
+                 first_seen_at=(now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    chains = intel.chains(["HINDPETRO"], now)["HINDPETRO"]
+    assert chains[0].startswith("Brent +3.1% -> ") and "[expert prior]" in chains[0] and "[broken]" not in chains[0]
+
+    repo = GraphRepository(store)
+    for edge in repo.get_edges(src="macro:brent"):  # the data says the crude relationships no longer hold
+        repo.upsert_edge(edge.src, edge.dst, edge.relation, direction=0, sensitivity=None, lag_days_mean=edge.lag_days_mean,
+                         lag_days_sd=edge.lag_days_sd, confidence=0.05, rationale=edge.rationale, source="relationship_break",
+                         evidence_count=300)
+    broken = intel.chains(["HINDPETRO"], now)["HINDPETRO"]
+    assert broken and all("[broken]" in chain and "[expert prior]" not in chain for chain in broken)
+    assert intel.coverage_note() is None  # a broken relationship is information, not a news outage

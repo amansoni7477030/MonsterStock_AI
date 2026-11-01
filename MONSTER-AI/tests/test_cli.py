@@ -37,9 +37,12 @@ def test_version_and_env_example(cli_env, capsys):
 
 
 def test_init_creates_database_and_calendar(cli_env, capsys):
+    import re
+
     assert run(["init"]) == 0
     out = capsys.readouterr().out
-    assert "database ready" in out and "calendar seeded: 20 rows" in out
+    seeded = re.search(r"calendar seeded: (\d+) rows", out)
+    assert "database ready" in out and seeded and int(seeded.group(1)) >= 20  # the 2026 list + rule-based years ahead
     assert (cli_env / "data" / "monster.db").exists()
 
 
@@ -206,3 +209,29 @@ def test_bootstrap_plumbing_passes_skip_train(cli_env, monkeypatch, capsys):
     assert run(["bootstrap", "--resume", "--skip-train"]) == 0
     assert seen == {"opts": {"skip_train": "1"}, "force": False}
     assert run(["bootstrap"]) == 0 and seen["force"] is True  # without --resume the run starts over
+
+
+def test_storage_report_dry_run_prune_and_busy_housekeeping(cli_env, capsys):
+    from app.locks import job_lock
+
+    assert run(["init"]) == 0
+    capsys.readouterr()
+    assert run(["storage"]) == 0
+    out = capsys.readouterr().out
+    assert "Retention windows" in out and "bars_daily" in out and "Last retention run: never" in out
+
+    assert run(["storage", "--prune", "--dry-run"]) == 0
+    assert "(dry run)" in capsys.readouterr().out
+    assert run(["storage", "--json"]) == 0 and json.loads(capsys.readouterr().out)["last_run"] is None  # a dry run records nothing
+
+    assert run(["storage", "--prune", "--vacuum"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("retention ") and "maintenance:" in out and "Last retention run: 20" in out
+    assert run(["storage", "--json"]) == 0 and json.loads(capsys.readouterr().out)["last_run"]["pressure"]
+
+    held = job_lock(cli_env / "data", "housekeeping")
+    assert held.acquire()
+    try:
+        assert run(["storage", "--prune"]) == 3  # the nightly job is running: do not collide with it
+    finally:
+        held.release()

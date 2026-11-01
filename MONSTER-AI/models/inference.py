@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,10 @@ from models import gbm
 from models.artifacts import read_bundle
 from models.calibration import Calibrator
 
+log = logging.getLogger(__name__)
+
 STATUS_BASELINE = "baseline"
+DEFAULT_UNUSUAL_K = 1.5  # the Settings default of the "unusual range" multiple
 
 
 def _matrix(X: pd.DataFrame, columns: list[str]) -> np.ndarray:
@@ -91,6 +95,17 @@ def pick_uncertainty_ceilings(meta: dict[str, Any], p: Any) -> tuple[np.ndarray,
         return None
     p = np.asarray(p, dtype=float)
     return np.interp(p, level, strong), np.interp(p, level, moderate)
+
+
+def disagreement_limit(meta: dict[str, Any]) -> float | None:
+    """The specialist disagreement this model considers abnormal (the 95th percentile of its out-of-sample disagreement,
+    ``meta['unc_scales']['spec_std_p95']``), for ``ranking.signals.contradictions(spec_std_limit=...)``. ``None`` for the
+    heuristic baseline, older artifacts or an implausible value: the caller then keeps the default limit."""
+    scales = meta.get("unc_scales")
+    value = scales.get("spec_std_p95") if isinstance(scales, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
 
 
 class ModelBundle:
@@ -245,15 +260,21 @@ def _pretty(column: str) -> str:
 class BaselineBundle:
     """Transparent heuristic used before any model is trained or validated (always labelled BASELINE, tiers capped).
 
-    Range is modelled as lognormal around ``m * mean20_range`` with sigma 0.45; a pre-open gap widens it. These are
-    uncalibrated heuristics, shown to the user as such - they exist so the pipeline stays alive and honest.
+    Range is modelled as lognormal around ``m * mean20_range`` with sigma 0.45; a pre-open gap widens it; "unusual" means a
+    range above ``unusual_k`` times the normal one (the same multiple the labels use). These are uncalibrated heuristics,
+    shown to the user as such - they exist so the pipeline stays alive and honest.
     """
 
     SIGMA = 0.45
 
-    def __init__(self, stage: str, thresholds: tuple[float, ...], primary_threshold: float) -> None:
+    def __init__(self, stage: str, thresholds: tuple[float, ...], primary_threshold: float,
+                 unusual_k: float = DEFAULT_UNUSUAL_K) -> None:
+        if not (math.isfinite(unusual_k) and unusual_k > 0):  # the safety net must never be the thing that fails
+            log.warning("unusual_k=%r is not a positive number; the baseline uses %.1f", unusual_k, DEFAULT_UNUSUAL_K)
+            unusual_k = DEFAULT_UNUSUAL_K
+        self.unusual_k = float(unusual_k)
         self.meta = {"version": f"baseline-{stage}", "stage": stage, "thresholds": list(thresholds),
-                     "primary_threshold": primary_threshold, "status": STATUS_BASELINE}
+                     "primary_threshold": primary_threshold, "unusual_k": self.unusual_k, "status": STATUS_BASELINE}
         self.directory = None
 
     version = property(lambda self: self.meta["version"])
@@ -275,7 +296,7 @@ class BaselineBundle:
         out = pd.DataFrame(index=X.index)
         for t in self.thresholds:
             out[f"p_hit_{threshold_name(t)}"] = 1.0 - ndtr((math.log(t) - mu) / self.SIGMA)
-        out["p_unusual"] = 1.0 - ndtr((math.log(1.5) + mu_normal - mu) / self.SIGMA)
+        out["p_unusual"] = 1.0 - ndtr((math.log(self.unusual_k) + mu_normal - mu) / self.SIGMA)
         out["p_primary"] = out[f"p_{self.primary_head}"]
         out["p_up"] = np.nan  # the heuristic has no directional view: report n/a rather than a fake 50/50
         out["p_down"] = np.nan

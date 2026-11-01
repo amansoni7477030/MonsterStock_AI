@@ -37,19 +37,24 @@ class Intel:
                 llm = LLMExtractor(settings, clock=clock)
             self.pipeline = NewsPipeline(store, settings, clock=clock, llm=llm)
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"news pipeline unavailable ({type(exc).__name__})")
+            self._degrade(f"news pipeline unavailable ({type(exc).__name__})")
             log.warning("news pipeline unavailable: %s", exc)
         try:
             from event_graph.propagation import GraphImpactEngine
 
             self.graph = GraphImpactEngine(store)
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"event graph unavailable ({type(exc).__name__})")
+            self._degrade(f"event graph unavailable ({type(exc).__name__})")
             log.warning("event graph unavailable: %s", exc)
         self._ensure_graph()
 
     def _now(self) -> datetime:
         return (self.clock or get_clock()).now()
+
+    def _degrade(self, note: str) -> None:
+        """Record a coverage problem (once per run); ``coverage_note`` hands it to the report."""
+        if note not in self.errors:
+            self.errors.append(note)
 
     # ------------------------------------------------------------------------------------------- graph
     def _ensure_graph(self) -> None:
@@ -62,7 +67,7 @@ class Intel:
             if self.store.kv_get(SEED_KEY) != seed_fingerprint(load_seed()):
                 self.reseed_graph()
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"event graph seed unavailable ({type(exc).__name__})")
+            self._degrade(f"event graph seed unavailable ({type(exc).__name__})")
             log.warning("event graph seed check failed: %s", exc)
 
     def reseed_graph(self) -> dict[str, Any]:
@@ -80,7 +85,7 @@ class Intel:
             # what changed in THIS call is usually nothing (the graph is also seeded on first use); the size is what matters
             return out | {"nodes": size["nodes"], "edges": size["edges"]}
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"event graph seeding failed ({type(exc).__name__})")
+            self._degrade(f"event graph seeding failed ({type(exc).__name__})")
             log.warning("event graph seeding failed: %s", exc)
             return {}
 
@@ -94,7 +99,7 @@ class Intel:
 
             return learn_graph(self.store, ExchangeCalendar(self.store), as_of)
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"event graph learning failed ({type(exc).__name__})")
+            self._degrade(f"event graph learning failed ({type(exc).__name__})")
             log.warning("event graph learning failed: %s", exc)
             return {}
 
@@ -119,7 +124,7 @@ class Intel:
             totals["batches"] = batches
         except Exception as exc:  # noqa: BLE001
             log.exception("news processing failed")
-            self.errors.append(f"news processing failed ({type(exc).__name__})")
+            self._degrade(f"news processing failed ({type(exc).__name__})")
             return {"error": type(exc).__name__}
         totals["reactions"] = self.refresh_reactions(self._now())
         return totals
@@ -131,7 +136,7 @@ class Intel:
         try:
             return int(self.pipeline.refresh_reactions(as_of))
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"market-reaction check unavailable ({type(exc).__name__})")
+            self._degrade(f"market-reaction check unavailable ({type(exc).__name__})")
             log.warning("refreshing market reactions failed: %s", exc)
             return 0
 
@@ -150,14 +155,18 @@ class Intel:
         out: dict[str, list[Catalyst]] = {}
         if self.pipeline is None:
             return out
+        failures: list[str] = []
         for symbol in symbols:
             try:
                 items = self.pipeline.catalysts_for(symbol, as_of, limit=limit)
-            except Exception:  # noqa: BLE001
-                log.debug("catalysts_for failed for %s", symbol, exc_info=True)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("catalysts_for failed for %s", symbol, exc_info=True)
+                failures.append(type(exc).__name__)
                 continue
             if items:
                 out[symbol] = list(items)
+        if failures:
+            self._degrade(f"catalysts unavailable for {len(failures)} of {len(symbols)} stock(s) ({', '.join(sorted(set(failures)))})")
         return out
 
     def chains(self, symbols: Sequence[str], as_of: datetime) -> dict[str, list[str]]:
@@ -166,33 +175,46 @@ class Intel:
         try:
             events = self.pipeline.recent_events(as_of, self.settings.news_lookback_hours, limit=80)
             impacts = self.graph.impacts(events, as_of)
-        except Exception:  # noqa: BLE001
-            log.debug("graph propagation failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("graph propagation failed", exc_info=True)
+            self._degrade(f"event chains unavailable ({type(exc).__name__})")
             return {}
         wanted = set(symbols)
         return {s: list(getattr(i, "chains", []))[:3] for s, i in impacts.items() if s in wanted and getattr(i, "chains", None)}
 
     def reacted(self, symbols: Sequence[str], as_of: datetime) -> dict[str, tuple[int, int]]:
-        """Per symbol: (events already showing a market reaction, events) within the lookback, point-in-time."""
+        """Per symbol: (events already showing a market reaction, events) within the lookback, point-in-time. Only the events
+        a stock is the SUBJECT of count (signed by the event or named in its headline): a passing mention of the stock in
+        another company's story is not an event for it."""
         since = iso(as_of - timedelta(hours=self.settings.news_lookback_hours))
         until = iso(as_of)
-        out: dict[str, tuple[int, int]] = {}
-        for symbol in symbols:
-            pattern = f'%"id":"{symbol}"%'
-            row = self.store.conn.execute(
-                "SELECT COUNT(*) AS n, SUM(CASE WHEN market_reacted = 1 THEN 1 ELSE 0 END) AS r FROM events "
-                "WHERE first_seen_at >= ? AND first_seen_at <= ? AND entities_json LIKE ?", (since, until, pattern),
-            ).fetchone()
-            if row and row["n"]:
-                out[symbol] = (int(row["r"] or 0), int(row["n"]))
-        return out
+        wanted = set(symbols)
+        tally: dict[str, list[int]] = {}
+        try:
+            from news_intelligence.features import subject_companies
+
+            rows = self.store.conn.execute(
+                "SELECT entities_json, market_reacted FROM events WHERE first_seen_at >= ? AND first_seen_at <= ?", (since, until)
+            ).fetchall()
+            for row in rows:
+                for symbol in subject_companies(row["entities_json"], until) & wanted:
+                    counts = tally.setdefault(symbol, [0, 0])
+                    counts[0] += 1 if row["market_reacted"] == 1 else 0
+                    counts[1] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("already-priced-in check failed", exc_info=True)
+            self._degrade(f"already-priced-in check unavailable ({type(exc).__name__})")
+            return {}
+        return {symbol: (counts[0], counts[1]) for symbol, counts in tally.items()}
 
     def event_features(self, symbols: Sequence[str], as_of: datetime) -> dict[str, dict[str, float]]:
         if self.pipeline is None:
             return {}
         try:
             return self.pipeline.event_features(list(symbols), as_of, self.settings.news_lookback_hours)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            log.warning("event features failed", exc_info=True)
+            self._degrade(f"event features unavailable ({type(exc).__name__})")
             return {}
 
     def coverage_note(self) -> str | None:

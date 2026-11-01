@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,10 +33,18 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _isolate_globals():
+    zone = os.environ.get("TZ")
     yield
     reset_logging()
     clear_secrets()
     set_clock(__import__("app.clock", fromlist=["Clock"]).Clock())
+    if os.environ.get("TZ") != zone:  # cli.main() pins the process zone to UTC; do not leak that into other tests
+        if zone is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = zone
+        if hasattr(time, "tzset"):
+            time.tzset()
 
 
 @pytest.fixture()

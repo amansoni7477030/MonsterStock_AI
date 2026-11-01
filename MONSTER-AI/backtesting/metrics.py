@@ -6,14 +6,19 @@ Every headline number comes with a sample size and an interval; a bare percentag
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import warnings
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
+MIN_BOOT_DAYS = 5  # a day-block interval needs at least this many days: fewer cannot describe day-to-day variation
+
 
 def wilson_interval(successes: float, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for a binomial proportion (well behaved at small n and extreme rates)."""
+    """Wilson score interval for a binomial proportion (well behaved at small n and extreme rates). It assumes
+    independent trials: use ``day_block_bootstrap`` for picks that cluster by day."""
     if n <= 0:
         return (float("nan"), float("nan"))
     p = successes / n
@@ -115,6 +120,18 @@ def ndcg_at_k(scores: np.ndarray, relevance: np.ndarray, k: int) -> float:
     return dcg / ideal if ideal > 0 else float("nan")
 
 
+def ndcg_random_expectation(relevance: np.ndarray, k: int) -> float:
+    """Expected ``ndcg_at_k`` of a uniformly random ranking: the no-skill reference a real ranking has to beat."""
+    relevance = np.asarray(relevance, dtype=float)
+    relevance = relevance[np.isfinite(relevance)]
+    if len(relevance) == 0:
+        return float("nan")
+    k = min(k, len(relevance))
+    discounts = 1.0 / np.log2(np.arange(2, k + 2))
+    ideal = float((np.sort(relevance)[::-1][:k] * discounts).sum())
+    return float(relevance.mean() * discounts.sum() / ideal) if ideal > 0 else float("nan")
+
+
 def daily_topn(frame: pd.DataFrame, score_col: str, value_col: str, n: int, *, date_col: str = "date") -> pd.DataFrame:
     """For each date select the ``n`` highest ``score_col`` rows; return per-date mean/sum of ``value_col`` and count."""
     rows = []
@@ -129,20 +146,71 @@ def daily_topn(frame: pd.DataFrame, score_col: str, value_col: str, n: int, *, d
     return pd.DataFrame(rows)
 
 
+def _resample_days(rng: np.random.Generator, n_days: int, n_boot: int, block: int | None) -> np.ndarray:
+    """(n_boot, n_days) day indices drawn as circular blocks of consecutive days; ``block`` defaults to about
+    ``n_days ** (1/3)`` (the usual order for a moving-block bootstrap) and ``block=1`` is the plain independent-day draw."""
+    length = max(1, round(n_days ** (1.0 / 3.0))) if block is None else max(1, int(block))
+    length = min(length, n_days)
+    n_blocks = -(-n_days // length)
+    starts = rng.integers(0, n_days, size=(n_boot, n_blocks))
+    idx = (starts[:, :, None] + np.arange(length)) % n_days
+    return idx.reshape(n_boot, -1)[:, :n_days]
+
+
+def day_block_bootstrap(
+    by_day: np.ndarray, stat: Callable[..., np.ndarray] = np.nanmean, *, block: int | None = None, n_boot: int = 500,
+    seed: int = 7, level: float = 0.95, min_days: int = MIN_BOOT_DAYS,
+) -> tuple[float, float]:
+    """Percentile interval of ``stat`` under a day-block bootstrap: (low, high).
+
+    ``by_day`` has one row per day (oldest first) and one column per pick, NaN where a day has fewer picks (a 1-D array is
+    one value per day). Whole days are resampled, never single picks: the picks of a day share one market, so treating
+    them as independent (Wilson, a plain binomial) makes intervals far too narrow. Consecutive days also stay together in
+    blocks, because ranges cluster in time. ``stat(sample, axis=1)`` reduces a (resamples, picks) array, e.g. ``np.nanmean``
+    for a pooled rate or ``np.nanmedian``. Days without any value are ignored; (NaN, NaN) below ``min_days`` days. The
+    seed is fixed, so re-running an evaluation reproduces the interval it stored."""
+    arr = np.asarray(by_day, dtype=float)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    arr = arr[np.isfinite(arr).any(axis=1)]
+    if len(arr) < min_days:
+        return (float("nan"), float("nan"))
+    idx = _resample_days(np.random.default_rng(seed), len(arr), n_boot, block)
+    sample = arr[idx].reshape(n_boot, -1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # a resample can hold no value at all
+        values = np.asarray(stat(sample, axis=1), dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return (float("nan"), float("nan"))
+    tail = (1.0 - level) / 2.0 * 100.0
+    return (float(np.percentile(values, tail)), float(np.percentile(values, 100.0 - tail)))
+
+
 def topn_hit_rate(daily: pd.DataFrame) -> tuple[float, float, float, int]:
-    """Pooled hit rate over all selected names with a Wilson interval: (rate, ci_low, ci_high, n_selected)."""
+    """Pooled hit rate over all selected names: (rate, ci_low, ci_high, n_selected). The interval is a day-block bootstrap
+    (the picks of a day are dependent) and NaN when there are fewer than ``MIN_BOOT_DAYS`` days."""
     if daily.empty:
         return (float("nan"), float("nan"), float("nan"), 0)
-    hits, n = float(daily["sum"].sum()), int(daily["n"].sum())
-    low, high = wilson_interval(hits, n)
-    return (hits / n if n else float("nan"), low, high, n)
+    ordered = daily.sort_values("date")
+    hits, counts = ordered["sum"].to_numpy(dtype=float), ordered["n"].to_numpy(dtype=int)
+    n = int(counts.sum())
+    if n == 0:
+        return (float("nan"), float("nan"), float("nan"), 0)
+    matrix = np.full((len(counts), int(counts.max())), np.nan)
+    for row, (wins, picks) in enumerate(zip(hits, counts, strict=True)):
+        matrix[row, :picks] = 0.0
+        matrix[row, : int(round(wins))] = 1.0
+    low, high = day_block_bootstrap(matrix)
+    return (float(hits.sum()) / n, low, high, n)
 
 
 def paired_day_bootstrap(
-    model_daily: pd.DataFrame, baseline_daily: pd.DataFrame, *, n_boot: int = 1000, seed: int = 7
+    model_daily: pd.DataFrame, baseline_daily: pd.DataFrame, *, n_boot: int = 1000, seed: int = 7, block: int = 1
 ) -> dict[str, float]:
-    """Day-level paired bootstrap of (model - baseline) mean top-N value. Resampling days respects within-day
-    dependence; the 10th percentile is the one-sided 90% lower bound."""
+    """Day-level paired bootstrap of (model - baseline) mean top-N value; the 10th percentile is the one-sided 90% lower
+    bound. ``block=1`` resamples days independently (the historical behaviour, used by the training gates); a larger
+    ``block`` resamples runs of consecutive days, which also respects the clustering of ranges over time."""
     merged = model_daily.merge(baseline_daily, on="date", suffixes=("_m", "_b"))
     if merged.empty:
         return {"mean_diff": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "p10": float("nan"), "n_days": 0}
@@ -150,8 +218,7 @@ def paired_day_bootstrap(
     diff = diff[np.isfinite(diff)]
     if len(diff) == 0:
         return {"mean_diff": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "p10": float("nan"), "n_days": 0}
-    rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(diff), size=(n_boot, len(diff)))
+    idx = _resample_days(np.random.default_rng(seed), len(diff), n_boot, block)
     means = diff[idx].mean(axis=1)
     return {
         "mean_diff": float(diff.mean()), "ci_low": float(np.percentile(means, 2.5)), "ci_high": float(np.percentile(means, 97.5)),
@@ -159,16 +226,34 @@ def paired_day_bootstrap(
     }
 
 
+def rank_correlation(scores: np.ndarray, outcomes: np.ndarray, *, min_names: int = 8) -> float:
+    """Spearman correlation between one day's scores and outcomes (pairs with a missing value are dropped). NaN with fewer than
+    ``min_names`` names or without any variation in either."""
+    s, o = _clean(scores, outcomes)
+    if len(s) < min_names or np.ptp(s) == 0 or np.ptp(o) == 0:
+        return float("nan")
+    return float(np.corrcoef(pd.Series(s).rank().to_numpy(), pd.Series(o).rank().to_numpy())[0, 1])
+
+
+def daily_rank_ic(
+    frame: pd.DataFrame, score_col: str, outcome_col: str, *, date_col: str = "date", min_names: int = 8
+) -> pd.Series:
+    """Cross-sectional Spearman correlation between score and realised outcome for every day with at least ``min_names``
+    names and some variation in both (index = date)."""
+    ics: dict[Any, float] = {}
+    for day, group in frame.groupby(date_col, sort=True):
+        ic = rank_correlation(group[score_col].to_numpy(dtype=float), group[outcome_col].to_numpy(dtype=float), min_names=min_names)
+        if np.isfinite(ic):
+            ics[day] = ic
+    return pd.Series(ics, dtype=float)
+
+
 def spearman_ic(frame: pd.DataFrame, score_col: str, outcome_col: str, *, date_col: str = "date") -> dict[str, float]:
     """Mean cross-sectional Spearman correlation between score and realised outcome per day (rank IC)."""
-    ics = []
-    for _day, group in frame.groupby(date_col):
-        g = group[[score_col, outcome_col]].dropna()
-        if len(g) >= 8 and g[score_col].nunique() > 1 and g[outcome_col].nunique() > 1:
-            ics.append(g[score_col].rank().corr(g[outcome_col].rank()))
-    if not ics:
+    ics = daily_rank_ic(frame, score_col, outcome_col, date_col=date_col)
+    if ics.empty:
         return {"ic_mean": float("nan"), "ic_std": float("nan"), "n_days": 0, "t_stat": float("nan")}
-    arr = np.asarray(ics, dtype=float)
+    arr = ics.to_numpy(dtype=float)
     std = float(arr.std(ddof=1)) if len(arr) > 1 else float("nan")
     t = float(arr.mean() / (std / math.sqrt(len(arr)))) if std and std == std else float("nan")
     return {"ic_mean": float(arr.mean()), "ic_std": std, "n_days": int(len(arr)), "t_stat": t}

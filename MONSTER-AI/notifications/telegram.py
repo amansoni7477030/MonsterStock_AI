@@ -20,7 +20,7 @@ import requests
 
 from app.clock import Clock, get_clock
 from app.errors import DataUnavailable
-from app.logging_setup import redact, register_secret
+from app.logging_setup import exception_site, redact, register_secret
 
 log = logging.getLogger(__name__)
 
@@ -491,6 +491,8 @@ class TelegramClient:
         except (requests.exceptions.RequestException, OSError) as exc:
             return _Reply(transient=True, reason=f"network error ({type(exc).__name__})")
         except Exception as exc:  # never let an unknown error (whose text may embed the URL) escape
+            # only the type and the place, never the message: it may embed the request URL (and with it the bot token)
+            log.warning("telegram request failed unexpectedly: %s at %s", type(exc).__name__, exception_site(exc))
             return _Reply(reason=f"unexpected error ({type(exc).__name__})")
         return self._interpret(response)
 

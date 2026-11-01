@@ -3,43 +3,46 @@
 One scan = assess data quality -> build point-in-time features -> score with the active model (verified, with automatic
 fallbacks) -> rank with abstention -> FREEZE an immutable snapshot and predictions -> deliver the report.
 
-The snapshot is written exactly once per (trade date, stage). A retry after a crash or a failed delivery re-sends the
-frozen report instead of recomputing, so what is evaluated later is precisely what was reported.
+The snapshot and its predictions are written in ONE transaction, exactly once per (trade date, stage). A retry after a crash or
+a failed delivery re-sends the frozen report instead of recomputing (and first restores the predictions of a snapshot that an
+older version froze without them), so what is evaluated later is precisely what was reported. A forced re-scan freezes a second
+snapshot; only the latest one is effective (``Store.effective_snapshot``) and ever scored.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
 
-from app import __version__, jsonutil
+from app import __version__
 from app.clock import at_ist, iso
 from app.config import Settings
 from app.logging_setup import redact
 from automation.context import JobContext, JobResult
-from backtesting.evaluate import feature_payload, snapshot_table
+from backtesting.evaluate import feature_payload, features_hash, snapshot_table
 from database.store import Store
 from features import regime
 from features.live import LiveFeatures, build_live_features
 from features.schema import FEATURE_VERSION
 from ingestion.freshness import DataQuality, assess_data_quality, ist_label
 from ingestion.pipeline import collect_gift, collect_preopen
-from models.inference import Bundle, ModelBundle, check_columns, pick_uncertainty_ceilings
-from ranking.ranker import RankInput, RankResult, p_and_range, rank
-from ranking.types import ReportContext
+from models.inference import Bundle, ModelBundle, check_columns, disagreement_limit, pick_uncertainty_ceilings
+from ranking.ranker import RankInput, RankResult, enrichment_pool, p_and_range, rank
+from ranking.types import Candidate, ReportContext
 
 log = logging.getLogger(__name__)
 
 PREOPEN_TARGET_COVERAGE = 0.90
 PREOPEN_POLL_SEC = 15.0
 PREOPEN_MAX_CONSECUTIVE_FAILURES = 3
-ENRICH_POOL = 15  # best-scored names that get news / event-graph enrichment before the final ranking
+PREOPEN_CONFIRM_AFTER = "09:06:00"  # IST: from here on an empty pre-open book means the exchange is closed today
+ENRICH_POOL = 15  # best-ranked names the report can list (after eligibility / cost filters) that get news / event-graph enrichment
 MISSING_INPUT_WARN_RATIO = 0.25
 STATUS_ORDER = {"baseline": 0, "shadow": 1, "validated": 2}
 
@@ -54,6 +57,7 @@ class Scored:
     notes: list[str] = field(default_factory=list)
     n_fallback: int = 0
     ceilings: dict[str, tuple[float, float]] = field(default_factory=dict)  # symbol -> (STRONG, MODERATE) uncertainty limits
+    spec_std_limits: dict[str, float] = field(default_factory=dict)  # symbol -> specialist-disagreement limit of its model
 
 
 # ------------------------------------------------------------------------------------------------ timing
@@ -80,32 +84,68 @@ def monotonic_at(ctx: JobContext, moment: datetime) -> float:
     return ctx.clock.monotonic() + max((moment - ctx.clock.now()).total_seconds(), 0.0)
 
 
-def wait_for_preopen(ctx: JobContext, symbols: list[str]) -> float:
+@dataclass(frozen=True)
+class PreopenWait:
+    share: float      # share of the universe with a final equilibrium price
+    usable: float     # share with any usable pre-open price for the trade date
+    reachable: bool   # NSE answered at least once (an answered-but-stale book means no session today)
+
+
+def await_preopen(ctx: JobContext, symbols: list[str]) -> PreopenWait:
     """Poll the NSE pre-open book until the equilibrium prices are published or the report cutoff is reached. Every request
     carries the cutoff as its deadline, so a slow NSE can never push the final report past 09:12."""
     s, day = ctx.settings, ctx.run_date
     if not s.nse_enabled:
-        return 0.0
+        return PreopenWait(0.0, 0.0, False)
     limit = at_ist(day, s.report_cutoff_time)
 
-    def final_share() -> float:
-        return preopen_coverage(ctx.store, day.isoformat(), symbols, ctx.clock.now())[1]
+    def coverage() -> tuple[float, float]:
+        usable, final = preopen_coverage(ctx.store, day.isoformat(), symbols, ctx.clock.now())
+        return final, usable
 
     failures = 0
-    final = final_share()
+    reachable = False
+    final, usable = coverage()
+    reachable = usable > 0  # rows already stored today prove NSE answered with a fresh book
     while final < PREOPEN_TARGET_COVERAGE and ctx.clock.now() < limit:
         snapshot = _best_effort("pre-open collection", collect_preopen, ctx.store, ctx.nse_api(), day.isoformat(), symbols,
                                 deadline=monotonic_at(ctx, limit))
+        reachable = reachable or snapshot is not None
         failures = 0 if snapshot is not None and snapshot.rows else failures + 1
         if failures >= PREOPEN_MAX_CONSECUTIVE_FAILURES:
             log.warning("pre-open book unavailable after %d attempts; continuing without it", failures)
             break
-        final = final_share()
+        final, usable = coverage()
         remaining = (limit - ctx.clock.now()).total_seconds()
         if final >= PREOPEN_TARGET_COVERAGE or remaining <= 0:
             break
         ctx.clock.sleep(min(PREOPEN_POLL_SEC, remaining))
-    return final_share()
+    final, usable = coverage()
+    return PreopenWait(final, usable, reachable or usable > 0)
+
+
+def wait_for_preopen(ctx: JobContext, symbols: list[str]) -> float:
+    """``await_preopen`` reduced to the share of the universe that has its final equilibrium price."""
+    return await_preopen(ctx, symbols).share
+
+
+def suspected_holiday(ctx: JobContext, wait: PreopenWait) -> JobResult | None:
+    """The calendar of a year without an official NSE list holds only rule-based holidays, so before the final report goes
+    out the exchange itself is asked: NSE answered but published no pre-open book for today = a closed day. The day is then
+    recorded as an inferred closure and the operator is told. A merely unreachable NSE proves nothing: the scan goes on."""
+    s, day = ctx.settings, ctx.run_date
+    if not s.nse_enabled or ctx.force or ctx.calendar.is_official(day):
+        return None
+    if wait.usable > 0 or not wait.reachable or ctx.clock.now() < at_ist(day, PREOPEN_CONFIRM_AFTER):
+        return None
+    ctx.store.upsert_calendar_days([{"trade_date": day.isoformat(), "is_trading_day": False, "session_kind": "holiday",
+                                     "description": "no NSE pre-open book for the day (inferred closed)"}], source="inferred")
+    ctx.calendar.reload()
+    message = (f"{day} looks like an exchange holiday: NSE published no pre-open book and the {day.year} holiday list is not "
+               "official yet. No report was sent.")
+    ctx.store.add_alert("warning", "holiday_inferred", message, dedupe_key=f"holiday-inferred:{day}", dedupe_minutes=24 * 60)
+    log.warning("%s", message)
+    return JobResult("skipped", message)
 
 
 # ------------------------------------------------------------------------------------------------ scoring
@@ -158,6 +198,7 @@ def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
 
     frames, predictions, explainers = [], [], {}
     ceilings: dict[str, tuple[float, float]] = {}
+    spec_limits: dict[str, float] = {}
     versions, statuses = [], []
     for bundle, frame in parts:
         used, preds = _predict(bundle, frame, registry, bundle.stage, notes, ctx.store)
@@ -166,11 +207,14 @@ def score(ctx: JobContext, stage: str, live: LiveFeatures) -> Scored:
         versions.append(used.version)
         statuses.append(used.status)
         ceilings.update(_uncertainty_limits(used, preds))
+        limit = disagreement_limit(used.meta)  # a model's own normal level of specialist disagreement
+        if limit is not None:
+            spec_limits.update(dict.fromkeys(frame.index, limit))
         for position, symbol in enumerate(frame.index):
             explainers[symbol] = _explainer(used, frame, position)
     features = pd.concat(frames).reindex(X.index)
     preds = pd.concat(predictions).reindex(X.index)
-    return Scored(features, preds, explainers, versions[0], _weakest(*statuses), notes, n_fallback, ceilings)
+    return Scored(features, preds, explainers, versions[0], _weakest(*statuses), notes, n_fallback, ceilings, spec_limits)
 
 
 def _uncertainty_limits(bundle: Bundle, preds: pd.DataFrame) -> dict[str, tuple[float, float]]:
@@ -205,19 +249,34 @@ def _last_closes(store: Store, session: str | None) -> dict[str, float]:
     return {r["symbol"]: float(r["close"]) for r in rows}
 
 
-def _prediction_rows(result: RankResult, scored: Scored, settings: Settings) -> list[dict[str, Any]]:
-    """Model picks (listed and shadow-only), plus same-day baseline picks for later comparison."""
-    rows: list[dict[str, Any]] = []
+def _candidate_row(c: Candidate, version: str, status: str, stored: Mapping[str, Any]) -> dict[str, Any]:
+    """The frozen prediction row of one listed candidate: shared by a fresh freeze and by the restore of an interrupted one."""
+    return {
+        "symbol": c.symbol, "rank": c.rank, "tier": c.tier, "model_version": version, "model_status": status,
+        "p": c.p, "range": c.range, "uncertainty": c.uncertainty, "data_quality": c.data_quality,
+        "liquidity": {"turnover_cr": c.turnover_cr, "est_cost_pct": c.est_cost_pct, "note": c.liquidity_note},
+        "explanation": {"drivers": c.drivers, "confirmations": c.confirmations, "contradictions": c.contradictions,
+                        "priced_in": c.priced_in, "chain": c.chain, "catalysts": [x.to_dict() for x in c.catalysts]},
+        "features_hash": features_hash(stored, c.symbol),
+    }
+
+
+def _baseline_rows(baselines: Mapping[str, Sequence[str]], version: str) -> list[dict[str, Any]]:
+    return [{"symbol": symbol, "rank": position, "tier": "BASELINE", "model_version": version, "model_status": "baseline",
+             "p": {}, "range": {}, "uncertainty": None, "data_quality": "ok", "explanation": {}, "is_baseline": True,
+             "baseline_name": name}
+            for name, symbols in baselines.items() for position, symbol in enumerate(symbols, 1)]
+
+
+def _prediction_rows(
+    result: RankResult, scored: Scored, settings: Settings, stored: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Model picks (listed and shadow-only), plus same-day baseline picks for later comparison. ``stored`` is the snapshot's
+    feature payload (built from ``scored.features`` when omitted): a pick's ``features_hash`` covers exactly what the
+    snapshot keeps for it, so it can be re-verified from the snapshot alone."""
+    stored = feature_payload(scored.features) if stored is None else stored
     version, status = scored.version, scored.status
-    for c in result.candidates:
-        rows.append({
-            "symbol": c.symbol, "rank": c.rank, "tier": c.tier, "model_version": version, "model_status": status,
-            "p": c.p, "range": c.range, "uncertainty": c.uncertainty, "data_quality": c.data_quality,
-            "liquidity": {"turnover_cr": c.turnover_cr, "est_cost_pct": c.est_cost_pct, "note": c.liquidity_note},
-            "explanation": {"drivers": c.drivers, "confirmations": c.confirmations, "contradictions": c.contradictions,
-                            "priced_in": c.priced_in, "chain": c.chain, "catalysts": [asdict(x) for x in c.catalysts]},
-            "features_hash": jsonutil.content_hash(scored.features.loc[c.symbol].to_dict()),
-        })
+    rows = [_candidate_row(c, version, status, stored) for c in result.candidates]
     listed = {c.symbol for c in result.candidates}
     pool = result.table[result.table["in_pool"]].sort_values("p_primary", ascending=False, kind="mergesort")
     rank_no = len(rows)
@@ -231,13 +290,41 @@ def _prediction_rows(result: RankResult, scored: Scored, settings: Settings) -> 
         rows.append({"symbol": symbol, "rank": rank_no, "tier": "NONE", "model_version": version, "model_status": status,
                      "p": p, "range": rng, "uncertainty": float(scored.preds.at[symbol, "uncertainty"]), "data_quality": "ok",
                      "explanation": {"note": "below the listing threshold; recorded for shadow evaluation only"},
-                     "features_hash": jsonutil.content_hash(scored.features.loc[symbol].to_dict())})
-    for name, symbols in result.baselines.items():
-        for position, symbol in enumerate(symbols, 1):
-            rows.append({"symbol": symbol, "rank": position, "tier": "BASELINE", "model_version": version,
-                         "model_status": "baseline", "p": {}, "range": {}, "uncertainty": None, "data_quality": "ok",
-                         "explanation": {}, "is_baseline": True, "baseline_name": name})
-    return rows
+                     "features_hash": features_hash(stored, symbol)})
+    return rows + _baseline_rows(result.baselines, version)
+
+
+def restore_predictions(store: Store, snapshot: Mapping[str, Any]) -> int:
+    """Re-create the predictions of a snapshot that was frozen without them, from its own payload: the report's listed
+    candidates and the baseline picks, row for row what the original freeze stored. The shadow-only extras below the listing
+    threshold were never part of the payload and are not invented. Returns the number of rows written."""
+    payload = snapshot["payload"]
+    report = ReportContext.from_dict(payload["report"])
+    version = snapshot.get("model_version") or report.model_version
+    rows = [_candidate_row(c, version, report.model_status, payload.get("features") or {}) for c in report.candidates]
+    rows += _baseline_rows(payload.get("baselines") or {}, version)
+    return len(store.insert_predictions(snapshot["snapshot_id"], snapshot["trade_date"], snapshot["stage"], rows))
+
+
+def _ensure_predictions(store: Store, snapshot: Mapping[str, Any]) -> None:
+    """A frozen snapshot must have its predictions. One that lost them (an interruption between the two writes of an older
+    version) is repaired from its payload. A failed repair is reported but must not stop the frozen report being re-sent."""
+    day, stage, snapshot_id = snapshot["trade_date"], snapshot["stage"], snapshot["snapshot_id"]
+    if store.predictions_for(day, stage=stage, baselines=None):
+        return
+    key = f"snapshot-repair:{snapshot_id}"
+    try:
+        restored = restore_predictions(store, snapshot)
+    except Exception as exc:  # noqa: BLE001
+        message = (f"{stage} snapshot {snapshot_id} of {day} has no predictions and they could not be restored: "
+                   f"{redact(str(exc))[:160]}")
+        log.warning("%s", message, exc_info=True)
+        store.add_alert("error", "snapshot_repair_failed", message, dedupe_key=key, dedupe_minutes=24 * 60)
+        return
+    message = (f"{stage} snapshot {snapshot_id} of {day} had no predictions (interrupted freeze): restored {restored} "
+               "from its frozen payload")
+    log.warning("%s", message)
+    store.add_alert("warning", "snapshot_repaired", message, dedupe_key=key, dedupe_minutes=24 * 60)
 
 
 # --------------------------------------------------------------------------------------------- delivery
@@ -276,6 +363,7 @@ def run_scan(ctx: JobContext, stage: str) -> JobResult:
         stored = existing["payload"].get("report")
         if not stored:
             return JobResult("failed", f"frozen {stage} snapshot {existing['snapshot_id']} has no report payload")
+        _ensure_predictions(ctx.store, existing)
         return deliver(ctx, stage, ReportContext.from_dict(stored))
     try:
         return _scan(ctx, stage)
@@ -295,7 +383,9 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
         gift_limit = at_ist(day, s.report_cutoff_time) if stage == "final" else at_ist(day, s.final_scan_time)
         _best_effort("GIFT Nifty collection", collect_gift, store, ctx.nse_api(), deadline=monotonic_at(ctx, gift_limit))
     if stage == "final":
-        wait_for_preopen(ctx, symbols)
+        closed = suspected_holiday(ctx, await_preopen(ctx, symbols))
+        if closed is not None:
+            return closed
     cutoff = scan_cutoff(s, day, stage, clock.now())
 
     quality = assess_data_quality(store, ctx.calendar, cutoff=cutoff, stage=stage, trade_date=day)
@@ -308,17 +398,18 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
     intel = ctx.intel()
     if stage == "final":
         intel.refresh_reactions(cutoff)  # the pre-open quotes are in by now: sharper "already priced in" detection
-    top = scored.preds["p_primary"].dropna().nlargest(ENRICH_POOL).index.tolist()
+    last_close = _last_closes(store, live.last_bar)
+    top = enrichment_pool(scored.features, scored.preds, last_close, s, ENRICH_POOL)  # after the eligibility / cost filters
     catalysts = intel.catalysts(top, cutoff)
     result = rank(
         RankInput(
             stage=stage, trade_date=day.isoformat(), model_version=scored.version, model_status=scored.status,
             primary_threshold=s.primary_threshold, features=scored.features, preds=scored.preds,
             instruments={r["symbol"]: {"name": r["name"], "sector": r["sector"], "is_fno": bool(r["is_fno"])} for r in universe},
-            last_close=_last_closes(store, live.last_bar), catalysts=catalysts, chains=intel.chains(top, cutoff),
+            last_close=last_close, catalysts=catalysts, chains=intel.chains(top, cutoff),
             reacted=intel.reacted(top, cutoff), quality_status=quality.status, quality_notes=quality.messages[:3],
             explainer=lambda symbol: scored.explainers[symbol]() if symbol in scored.explainers else [],
-            uncertainty_ceilings=scored.ceilings,
+            uncertainty_ceilings=scored.ceilings, spec_std_limits=scored.spec_std_limits,
         ),
         s,
     )
@@ -329,16 +420,20 @@ def _scan(ctx: JobContext, stage: str) -> JobResult:
 
     created = clock.now()
     late = created > at_ist(day, s.report_deadline_time)
+    stored = feature_payload(scored.features)
+    freshness = _best_effort("freshness inputs", store.source_freshness, trade_date=day.isoformat(), cutoff_ts=iso(cutoff) or "")
     payload = {
-        "report": report.to_dict(), "table": snapshot_table(result.table), "features": feature_payload(scored.features),
+        "report": report.to_dict(), "table": snapshot_table(result.table), "features": stored,
         "baselines": result.baselines, "excluded": result.excluded, "open_source": live.open_source,
-        "meta": {"late": late, "n_fallback": scored.n_fallback, "market": live.market, "code": __version__},
+        "meta": {"late": late, "n_fallback": scored.n_fallback, "market": live.market, "code": __version__,
+                 "expected_session": quality.expected_session, "freshness": freshness or {}},
     }
-    snapshot_id = store.insert_snapshot(
-        trade_date=day.isoformat(), stage=stage, cutoff_ts=iso(cutoff) or "", feature_version=FEATURE_VERSION,
-        model_version=scored.version, code_version=__version__, payload=payload, data_quality=quality.to_dict(),
-    )
-    ids = store.insert_predictions(snapshot_id, day.isoformat(), stage, _prediction_rows(result, scored, s))
+    with store.tx():  # frozen together or not at all: a snapshot without its predictions could never be evaluated
+        snapshot_id = store.insert_snapshot(
+            trade_date=day.isoformat(), stage=stage, cutoff_ts=iso(cutoff) or "", feature_version=FEATURE_VERSION,
+            model_version=scored.version, code_version=__version__, payload=payload, data_quality=quality.to_dict(),
+        )
+        ids = store.insert_predictions(snapshot_id, day.isoformat(), stage, _prediction_rows(result, scored, s, stored))
     log.info("%s scan frozen: snapshot=%s predictions=%d model=%s (%s) candidates=%s", stage, snapshot_id, len(ids),
              scored.version, scored.status, [c.symbol for c in result.candidates])
     outcome = deliver(ctx, stage, report)
@@ -356,6 +451,8 @@ def _build_report(
         notes.append(f"news coverage reduced: {news_note}")
     if scored.status == "baseline":
         notes.append("no trained model is active yet; heuristic baseline in use")
+    if not ctx.calendar.is_official(ctx.run_date):
+        notes.append(f"the {ctx.run_date.year} NSE holiday list is not published yet: holidays are rule-based")
     return ReportContext(
         trade_date=ctx.run_date.isoformat(), stage=stage, snapshot_ist=ist_label(cutoff), model_version=scored.version,
         model_status=scored.status, mode=ctx.settings.mode, candidates=result.candidates, no_setup=result.no_setup,

@@ -127,7 +127,7 @@ def seed_graph(store: Store, *, force: bool = False, path: Path | str | None = N
                 e for e in repo.get_edges(src=symbol, relation="membership", source=MASTER_MEMBERSHIP) if e.dst != target
             ]
             for edge_row in stale:
-                store.conn.execute("DELETE FROM graph_edges WHERE edge_id = ?", (edge_row.edge_id,))
+                repo.delete_edge(edge_row.src, edge_row.dst, edge_row.relation)
             current = repo.get_edge(symbol, target, "membership")
             if current is not None and current.source == CURATED_MEMBERSHIP:
                 continue  # the curated edge already says the same; never flip provenance back and forth

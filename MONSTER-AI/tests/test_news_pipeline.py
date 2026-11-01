@@ -284,9 +284,12 @@ def test_a_poison_item_is_isolated_and_the_rest_still_processed(store, pipe, mon
 
     monkeypatch.setattr(pipe, "_prepare_article", explode)
     stats = pipe.process_pending()
-    assert stats.errors == 1 and count(store, "news_raw", "processed = 0") == 0
+    assert stats.errors == 1 and count(store, "news_raw", "processed = 0") == 1  # the poison item waits for a retry
     assert {e["event_type"] for e in events(store)} == {"order_win"} and len(events(store)) == 2
     assert count(store, "event_articles") == 3
+    for _ in range(pl.MAX_ATTEMPTS - 1):  # bounded: after the last attempt it is flagged as failed, not retried for ever
+        pipe.process_pending()
+    assert count(store, "news_raw", "processed = 0") == 0 and count(store, "news_raw", "processed = 2") == 1
 
 
 def test_a_failed_write_rolls_back_the_whole_item(store, pipe, monkeypatch):
@@ -337,7 +340,11 @@ def test_bad_timestamps_are_a_poison_item_not_a_crash(store, pipe):
                text="TCS has received an order worth Rs 900 crore.", seen="garbage")
     stats = pipe.process_pending()
     assert stats.errors == 2 and events(store) == []
+    assert count(store, "news_raw", "processed = 0") == 1 and count(store, "filings", "processed = 0") == 1
+    for _ in range(pl.MAX_ATTEMPTS - 1):
+        pipe.process_pending()
     assert count(store, "news_raw", "processed = 0") == 0 and count(store, "filings", "processed = 0") == 0
+    assert count(store, "news_raw", "processed = 2") == 1 and count(store, "filings", "processed = 2") == 1
 
 
 def test_last_run_stats_are_persisted_and_usable_as_a_dict(store, pipe, fake_clock):

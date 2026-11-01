@@ -2,6 +2,10 @@
 
 Edges carry their provenance (source, rationale, evidence count, version), so every relationship is auditable and a
 prior is never presented as a measurement. ``load()`` returns a plain-dict :class:`Graph` cached by a version stamp.
+
+The graph is versioned (blueprint 23.6): every real change of an edge (created, updated, removed) appends the new state to
+the append-only ``graph_edge_history`` table in the same transaction, so :meth:`GraphRepository.edges_as_of` can rebuild the
+edges that were valid at any past instant and a replay does not have to use today's edges.
 """
 
 from __future__ import annotations
@@ -12,14 +16,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app import jsonutil
+from app.clock import iso, parse_ts
 from database.store import Store
 
 RELATIONS = (
     "exposure", "membership", "input_cost", "export_demand", "fx_translation", "rate_sensitivity", "co_movement",
     "supply_chain",
 )
+MEASURED_SOURCE = "measured"  # re-estimated from returns
+BROKEN_SOURCE = "relationship_break"  # a significant measurement contradicts the prior: the edge asserts no direction
 _TRACKED = ("direction", "sensitivity", "lag_days_mean", "lag_days_sd", "confidence", "regime_dependence", "rationale",
             "source", "evidence_count")
+_HISTORY_COLUMNS = ("src", "dst", "relation", "version", "change", *_TRACKED, "valid_from")
 
 
 @dataclass(frozen=True)
@@ -163,7 +171,7 @@ class GraphRepository:
             sensitivity=row["sensitivity"], lag_days_mean=row["lag_days_mean"], lag_days_sd=row["lag_days_sd"],
             confidence=float(row["confidence"]), regime_dependence=row["regime_dependence"], rationale=row["rationale"] or "",
             source=row["source"], evidence_count=int(row["evidence_count"]), version=int(row["version"]),
-            last_updated=row["last_updated"], edge_id=int(row["edge_id"]),
+            last_updated=row["last_updated"], edge_id=None if row["edge_id"] is None else int(row["edge_id"]),
         )
 
     def get_edge(self, src: str, dst: str, relation: str) -> Edge | None:
@@ -200,7 +208,8 @@ class GraphRepository:
         source: str = "prior",
         evidence_count: int = 0,
     ) -> tuple[Edge, str]:
-        """Insert or update an edge. The version is bumped only when a tracked field actually changes."""
+        """Insert or update an edge. The version is bumped, and the new state appended to the history, only when a tracked
+        field actually changes."""
         if relation not in RELATIONS:
             raise ValueError(f"unknown relation {relation!r}")
         if direction not in (-1, 0, 1):
@@ -215,28 +224,80 @@ class GraphRepository:
         }
         now = self.store.now()
         existing = self.get_edge(src, dst, relation)
-        if existing is None:
-            self.store.conn.execute(
-                "INSERT INTO graph_edges (src, dst, relation, direction, sensitivity, lag_days_mean, lag_days_sd, confidence, "
-                "regime_dependence, rationale, source, evidence_count, version, last_updated) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-                (src, dst, relation, *(values[k] for k in _TRACKED), now),
-            )
-            return self._require_edge(src, dst, relation), "created"
-        if all(_same(getattr(existing, k), values[k]) for k in _TRACKED):
+        if existing is not None and all(_same(getattr(existing, k), values[k]) for k in _TRACKED):
             return existing, "unchanged"
-        assignments = ", ".join(f"{k} = ?" for k in _TRACKED)
+        with self.store.tx():  # the edge and its history row are written together or not at all
+            if existing is None:
+                self.store.conn.execute(
+                    "INSERT INTO graph_edges (src, dst, relation, direction, sensitivity, lag_days_mean, lag_days_sd, "
+                    "confidence, regime_dependence, rationale, source, evidence_count, version, last_updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    (src, dst, relation, *(values[k] for k in _TRACKED), now),
+                )
+                change = "created"
+            else:
+                assignments = ", ".join(f"{k} = ?" for k in _TRACKED)
+                self.store.conn.execute(
+                    f"UPDATE graph_edges SET {assignments}, version = version + 1, last_updated = ? WHERE edge_id = ?",
+                    (*(values[k] for k in _TRACKED), now, existing.edge_id),
+                )
+                change = "updated"
+            edge = self._require_edge(src, dst, relation)
+            self._record(edge, change, now)
+        return edge, change
+
+    def delete_edge(self, src: str, dst: str, relation: str) -> bool:
+        """Remove an edge (kept in the history as ``removed``); ``False`` when there was no such edge."""
+        existing = self.get_edge(src, dst, relation)
+        if existing is None:
+            return False
+        with self.store.tx():
+            self.store.conn.execute("DELETE FROM graph_edges WHERE edge_id = ?", (existing.edge_id,))
+            self._record(existing, "removed", self.store.now())
+        return True
+
+    def _record(self, edge: Edge, change: str, valid_from: str) -> None:
+        """Append the state ``edge`` has from ``valid_from`` on (always inside the transaction that made the change)."""
+        state = {**asdict(edge), "change": change, "valid_from": valid_from}
         self.store.conn.execute(
-            f"UPDATE graph_edges SET {assignments}, version = version + 1, last_updated = ? WHERE edge_id = ?",
-            (*(values[k] for k in _TRACKED), now, existing.edge_id),
+            f"INSERT INTO graph_edge_history ({', '.join(_HISTORY_COLUMNS)}) VALUES ({', '.join('?' * len(_HISTORY_COLUMNS))})",
+            [state[column] for column in _HISTORY_COLUMNS],
         )
-        return self._require_edge(src, dst, relation), "updated"
 
     def _require_edge(self, src: str, dst: str, relation: str) -> Edge:
         edge = self.get_edge(src, dst, relation)
         if edge is None:  # pragma: no cover - the row was written a statement ago
             raise RuntimeError(f"edge {src}->{dst} ({relation}) vanished")
         return edge
+
+    # ---------------------------------------------------------------------------------------- history
+    def edge_history(self, src: str, dst: str, relation: str) -> list[dict[str, Any]]:
+        """Every recorded state of one edge, oldest first (``change``: baseline / created / updated / removed)."""
+        rows = self.store.conn.execute(
+            "SELECT * FROM graph_edge_history WHERE src = ? AND dst = ? AND relation = ? ORDER BY valid_from, history_id",
+            (src, dst, relation),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def edges_as_of(self, when: Any) -> list[Edge]:
+        """The edges that were valid at ``when``: the latest recorded state of each edge at or before that instant. An edge
+        that did not exist yet, or had been removed by then, is absent. ``last_updated`` is the time the state began."""
+        stamp = parse_ts(when)
+        if stamp is None:
+            raise ValueError(f"unparseable as-of time {when!r}")
+        rows = self.store.conn.execute(
+            "SELECT h.*, h.valid_from AS last_updated, NULL AS edge_id FROM graph_edge_history h WHERE h.history_id = ("
+            "SELECT h2.history_id FROM graph_edge_history h2 WHERE h2.src = h.src AND h2.dst = h.dst "
+            "AND h2.relation = h.relation AND h2.valid_from <= ? ORDER BY h2.valid_from DESC, h2.history_id DESC LIMIT 1) "
+            "AND h.change <> 'removed' ORDER BY h.src, h.dst, h.relation",
+            (iso(stamp),),
+        ).fetchall()
+        return [self._edge(r) for r in rows]
+
+    def graph_as_of(self, when: Any) -> Graph:
+        """The graph as it was at ``when`` (a replay): the nodes as they are now, the edges as they were then."""
+        edges = self.edges_as_of(when)
+        return Graph({n.node_id: n for n in self.nodes()}, edges, ("as_of", iso(parse_ts(when))))
 
     # --------------------------------------------------------------------------------------- views
     def _stamp(self) -> tuple:
@@ -246,7 +307,9 @@ class GraphRepository:
         nodes = self.store.conn.execute(
             "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(attrs_json)), 0) AS a FROM graph_nodes"
         ).fetchone()
-        return int(edges["n"]), int(edges["v"]), edges["t"], int(nodes["n"]), int(nodes["a"])
+        # every change of an edge appends a history row, so this tells apart states a count / version / second cannot
+        latest = self.store.conn.execute("SELECT COALESCE(MAX(history_id), 0) FROM graph_edge_history").fetchone()[0]
+        return int(edges["n"]), int(edges["v"]), edges["t"], int(nodes["n"]), int(nodes["a"]), int(latest)
 
     def load(self) -> Graph:
         """In-memory adjacency view, rebuilt only when the stored graph changed."""

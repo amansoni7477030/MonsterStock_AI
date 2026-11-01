@@ -4,7 +4,9 @@ Pure numpy/pandas/scipy. Only returns up to ``as_of`` are used. For each candida
 target at lags ``min_lag..max_lag`` and the lag with the best out-of-sample (blocked cross-validation) fit wins.
 An estimate only replaces a prior when it passes every gate: enough observations, a stable sign across rolling
 sub-windows, positive out-of-sample R^2 and Benjamini-Hochberg significance across *all* tested edges. A significant
-estimate with the opposite sign to the prior is recorded as a ``relationship_break`` instead of silently flipping it.
+estimate with the opposite sign to the prior is recorded as a ``relationship_break`` instead of silently flipping it. A break
+asserts no direction (direction 0, lowest confidence): the prior sign is no longer true, the opposite one is not trusted yet.
+It recovers its prior direction when a later estimate agrees with the prior again.
 
 Alignment convention: ``driver_returns`` must be indexed by the date on which the driver value was KNOWN before the
 target's session (shift US closes accordingly); lag 0 then means "known before the session".
@@ -24,7 +26,7 @@ import pandas as pd
 from scipy import stats
 
 from database.store import Store
-from event_graph.repository import Edge, GraphRepository
+from event_graph.repository import BROKEN_SOURCE, MEASURED_SOURCE, Edge, GraphRepository
 
 log = logging.getLogger(__name__)
 
@@ -315,15 +317,20 @@ def update_graph_from_returns(
             base = _label(edge.rationale)
             detail = f"beta {est.beta:+.2f} at lag {est.best_lag}d, t={est.t_stat:.1f}, n={est.n_obs}, as of {summary['as_of']}"
             if prior_dir != 0 and measured_sign != prior_dir:
+                # the relationship stopped working: keep the evidence, but assert no direction at all (neither the stale
+                # prior sign nor a silent flip) and the lowest confidence; the prior stays on record for a later recovery
                 repo.upsert_edge(
-                    edge.src, edge.dst, edge.relation, direction=prior_dir, sensitivity=prior.get("sensitivity"),
-                    lag_days_mean=edge.lag_days_mean, lag_days_sd=edge.lag_days_sd,
-                    confidence=max(CONFIDENCE_FLOOR, float(prior.get("confidence") or edge.confidence) * 0.5),
+                    edge.src, edge.dst, edge.relation, direction=0, sensitivity=None,
+                    lag_days_mean=edge.lag_days_mean, lag_days_sd=edge.lag_days_sd, confidence=CONFIDENCE_FLOOR,
                     regime_dependence=edge.regime_dependence,
-                    rationale=f"{base} | RELATIONSHIP BREAK: prior sign {prior_dir:+d} but measured {detail}",
-                    source="relationship_break", evidence_count=est.n_obs,
+                    rationale=f"{base} | RELATIONSHIP BREAK: prior sign {prior_dir:+d} but measured {detail}; no directional claim",
+                    source=BROKEN_SOURCE, evidence_count=est.n_obs,
                 )
                 summary["breaks"].append(edge.key)
+                log.warning(
+                    "graph relationship break %s: prior sign %+d but measured %s; the edge asserts no direction", edge.key,
+                    prior_dir, detail,
+                )
             else:
                 sensitivity, confidence = shrink_towards_prior(
                     est, prior.get("sensitivity"), float(prior.get("confidence") or edge.confidence)
@@ -332,7 +339,7 @@ def update_graph_from_returns(
                     edge.src, edge.dst, edge.relation, direction=prior_dir or measured_sign, sensitivity=round(sensitivity, 6),
                     lag_days_mean=float(est.best_lag or 0), lag_days_sd=max(0.5, edge.lag_days_sd or 0.5),
                     confidence=round(confidence, 4), regime_dependence=edge.regime_dependence,
-                    rationale=f"{base} | measured {detail}", source="measured", evidence_count=est.n_obs,
+                    rationale=f"{base} | measured {detail}", source=MEASURED_SOURCE, evidence_count=est.n_obs,
                 )
                 summary["updated"].append(edge.key)
             store.kv_set_json(EST_PREFIX + edge.key, record)

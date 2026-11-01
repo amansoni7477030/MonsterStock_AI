@@ -230,15 +230,41 @@ def test_a_confirmed_prior_becomes_a_measured_edge_with_more_confidence(store, r
     assert record["best_lag"] == 0 and record["n_obs"] == edge.evidence_count and record["q"] <= 0.10
 
 
-def test_an_opposite_sign_becomes_a_relationship_break_not_a_silent_flip(store, repo):
+def test_an_opposite_sign_becomes_a_relationship_break_that_asserts_no_direction(store, repo):
     drivers, targets = frames()
     summary = update_graph_from_returns(store, drivers, targets, as_of="2023-06-30")
     edge = repo.get_edge("macro:usdinr", "INFY", "fx_translation")
     assert edge.key in summary["breaks"] and edge.source == "relationship_break"
-    assert edge.direction == 1 and edge.sensitivity == 0.4  # the prior's sign and size are kept
-    assert edge.confidence <= 0.3 * 0.5 + 1e-9 and "RELATIONSHIP BREAK" in edge.rationale and "prior sign +1" in edge.rationale
+    # neither the stale prior sign nor a silent flip: a relationship that stopped working claims no direction at all
+    assert edge.direction == 0 and edge.sensitivity is None and edge.confidence == sens.CONFIDENCE_FLOOR
+    assert "RELATIONSHIP BREAK" in edge.rationale and "prior sign +1" in edge.rationale and "no directional claim" in edge.rationale
     assert re.search(r"measured beta -0\.[89]\d", edge.rationale) and edge.rationale.startswith("rupee revenue")
     assert edge.evidence_count >= 250
+    record = store.kv_get_json(sens.EST_PREFIX + edge.key)
+    assert record["prior"]["direction"] == 1 and record["prior"]["sensitivity"] == 0.4  # the prior stays on record
+    assert [(h["change"], h["direction"], h["source"]) for h in repo.edge_history(edge.src, edge.dst, edge.relation)] == [
+        ("created", 1, "prior_expert"), ("updated", 0, "relationship_break")]  # and the history shows when it broke
+
+
+def test_a_relationship_break_is_logged_as_a_warning(store, repo, caplog):
+    drivers, targets = frames()
+    with caplog.at_level("WARNING", logger="event_graph.sensitivity"):
+        update_graph_from_returns(store, drivers, targets, as_of="2023-06-30")
+    assert "relationship break macro:usdinr|INFY|fx_translation" in caplog.text and "prior sign +1" in caplog.text
+    assert [r.levelname for r in caplog.records if "relationship break" in r.getMessage()] == ["WARNING"]
+
+
+def test_a_broken_relationship_that_the_data_confirms_again_regains_its_prior_direction(store, repo):
+    drivers, targets = frames()
+    update_graph_from_returns(store, drivers, targets, as_of="2023-06-30")
+    assert repo.get_edge("macro:usdinr", "INFY", "fx_translation").direction == 0
+    recovered = targets.copy()
+    recovered["INFY"] = 0.9 * drivers["macro:usdinr"] + np.random.default_rng(5).normal(0, 0.01, len(targets))
+    summary = update_graph_from_returns(store, drivers, recovered, as_of="2023-07-03")
+    edge = repo.get_edge("macro:usdinr", "INFY", "fx_translation")
+    assert "macro:usdinr|INFY|fx_translation" in summary["updated"] and summary["breaks"] == []
+    assert edge.source == "measured" and edge.direction == 1 and edge.sensitivity > 0.3 and edge.confidence > 0.3
+    assert "RELATIONSHIP BREAK" not in edge.rationale
 
 
 def test_failing_the_gates_leaves_the_prior_and_decays_confidence_slightly(store, repo):

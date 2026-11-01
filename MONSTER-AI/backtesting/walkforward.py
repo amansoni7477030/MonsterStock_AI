@@ -2,15 +2,18 @@
 
 The evaluation is the same purged, embargoed walk-forward used for training: every probability is out-of-sample, calibration is
 fitted on earlier data than the holdout, and the model's daily top-N is compared with simple baselines (ATR, 20-day range,
-volume, gap, random) using a paired day-block bootstrap. Nothing is registered or activated; the report states honestly whether
-an edge over baselines exists. Survivorship bias (today's index membership applied to history) and vendor-data quality are
-documented limitations, not hidden.
+volume, gap, random). The per-scorer hit-rate intervals are day-block bootstraps (the picks of a day are dependent) and the
+model-minus-baseline difference is a paired day bootstrap. The report also prints the holdout's range-forecast error (MAE,
+pinball loss, 80 % interval coverage) and direction accuracy, each with its sample size. Nothing is registered or activated;
+the report states honestly whether an edge over baselines exists. Survivorship bias (today's index membership applied to
+history) and vendor-data quality are documented limitations, not hidden.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,7 @@ from app.clock import get_clock
 from app.config import Settings
 from automation.calendar import ExchangeCalendar, seed_calendar
 from database.store import Store
+from features.labels import threshold_name
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +37,45 @@ LIMITATIONS = (
 
 def _fmt(value: Any, digits: int = 3) -> str:
     try:
-        return f"{float(value):.{digits}f}"
+        number = float(value)
     except (TypeError, ValueError):
         return "n/a"
+    return f"{number:.{digits}f}" if math.isfinite(number) else "n/a"  # an interval that cannot be estimated is not "nan"
+
+
+def _count(value: Any) -> str:
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _holdout_rows(result: Any, heads: dict[str, Any], quantiles: dict[str, Any]) -> Any:
+    """Sample size behind the range-forecast numbers: the trainer's own count for the quantile heads when it records one,
+    else the holdout rows of the primary classification head (of any head when the primary is not known)."""
+    if quantiles.get("n") is not None:
+        return quantiles["n"]
+    primary = (getattr(result, "meta", None) or {}).get("primary_threshold")
+    classification = {name: row for name, row in heads.items() if name != "up"}
+    row = classification.get(f"hit_{threshold_name(primary)}") if primary is not None else None
+    return (row or next(iter(classification.values()), {})).get("n")
+
+
+def _forecast_quality(result: Any, heads: dict[str, Any]) -> list[str]:
+    """Range-forecast error and direction accuracy of the holdout, each with n."""
+    quantiles = result.metrics.get("quantiles") or {}
+    n = _count(_holdout_rows(result, heads, quantiles))
+    up = heads.get("up") or {}
+    pinball = " / ".join(_fmt((quantiles.get(f"range_q{alpha}") or {}).get("pinball")) for alpha in (10, 50, 90))
+    base = up.get("base_rate")
+    majority = f"; majority class would score {_fmt(max(base, 1 - base))}" if isinstance(base, (int, float)) and base == base else ""
+    return [
+        "| forecast quality (holdout) | value | n |", "|---|---|---|",
+        f"| MAE of the median range forecast (pp) | {_fmt(quantiles.get('range_mae_median'))} | {n} |",
+        f"| Pinball loss of the range forecast, q10 / q50 / q90 | {pinball} | {n} |",
+        f"| 80% interval coverage (nominal 0.80) | {_fmt(quantiles.get('range_80pct_interval_coverage'))} | {n} |",
+        f"| Direction accuracy, up vs not-up close (secondary{majority}) | {_fmt(up.get('accuracy'))} | {_count(up.get('n'))} |",
+    ]
 
 
 def render_markdown(stage: str, result: Any, years: int) -> str:
@@ -51,7 +91,7 @@ def render_markdown(stage: str, result: Any, years: int) -> str:
     boot = gates.get("vs_best_baseline") or {}
     lines += [f"Model minus best baseline (daily top-{ranking.get('top_n')} hit rate): mean {_fmt(boot.get('mean_diff'))}, "
               f"10th percentile {_fmt(boot.get('p10'))}, 90th percentile {_fmt(boot.get('p90'))}", "",
-              "| scorer | hit rate | 95% CI | mean range % | picks |", "|---|---|---|---|---|"]
+              "| scorer | hit rate | 95% CI (day-block) | mean range % | picks |", "|---|---|---|---|---|"]
     for name, row in (ranking.get("scorers") or {}).items():
         lines.append(f"| {name} | {_fmt(row.get('hit_rate'))} | {_fmt(row.get('ci_low'))} - {_fmt(row.get('ci_high'))} | "
                      f"{_fmt(row.get('mean_range'), 2)} | {row.get('n_selected')} |")
@@ -59,6 +99,7 @@ def render_markdown(stage: str, result: Any, years: int) -> str:
     for name, row in heads.items():
         lines.append(f"| {name} | {_fmt(row.get('auc'))} | {_fmt(row.get('brier'))} | {_fmt(row.get('brier_skill'))} | "
                      f"{_fmt(row.get('ece'))} | {_fmt(row.get('base_rate'))} |")
+    lines += ["", *_forecast_quality(result, heads)]
     return "\n".join(lines)
 
 

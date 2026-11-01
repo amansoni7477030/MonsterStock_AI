@@ -8,6 +8,7 @@ resulting "expected move from factor" features embody the global-to-India transm
 
 from __future__ import annotations
 
+import logging
 import warnings
 from collections.abc import Mapping
 
@@ -16,6 +17,8 @@ import pandas as pd
 
 from app.clock import at_ist
 from ingestion.series import SERIES_BY_KEY, SeriesSpec
+
+log = logging.getLogger(__name__)
 
 # composite -> (member series, unit)  unit: 'pct' = percent return, 'bp' = basis-point change of a yield in percent
 COMPOSITES: dict[str, tuple[tuple[str, ...], str]] = {
@@ -36,6 +39,20 @@ COMPOSITES: dict[str, tuple[tuple[str, ...], str]] = {
 }
 FACTORS_WITH_SENSITIVITY = ("us", "semis", "eu", "oil", "usdinr", "us10y", "copper")
 FIVE_DAY = ("us", "oil", "usdinr", "semis", "us10y")
+COMPOSITE_MEMBERS = frozenset(m for members, _ in COMPOSITES.values() for m in members)
+
+# Calendar days a series' latest final bar may be older than the scan cutoff before its features are blank (NaN): a feed that
+# stopped must not have its last move carried forward for months. The age runs from the moment the bar became final, so
+# ordinary gaps stay inside: a US three-day weekend is 3.3 days, a Monday holiday in Tokyo or Sydney 3.9; the European
+# exchanges' Easter and Christmas closures reach 4.5-5.4 and Tokyo's New Year 5.8, hence a week for non-US equity indices.
+STALE_AFTER_DAYS: dict[str, float] = {
+    "us_equity": 4.0, "volatility": 4.0, "rates": 4.0, "commodity": 4.0, "fx": 4.0, "eu_equity": 7.0, "asia_equity": 7.0,
+}
+DEFAULT_STALE_AFTER_DAYS = 4.0
+
+
+def stale_after_days(spec: SeriesSpec) -> float:
+    return STALE_AFTER_DAYS.get(spec.category, DEFAULT_STALE_AFTER_DAYS)
 
 
 def _cutoffs(dates: pd.DatetimeIndex, hhmm: str) -> np.ndarray:
@@ -45,7 +62,10 @@ def _cutoffs(dates: pd.DatetimeIndex, hhmm: str) -> np.ndarray:
 def aligned_series(
     spec: SeriesSpec, close: pd.Series, cutoffs: np.ndarray, unit: str
 ) -> dict[str, np.ndarray]:
-    """Return (1-day change, 5-day change, level) of the latest bar final at each cutoff."""
+    """Return (1-day change, 5-day change, level) of the latest bar final at each cutoff, plus that bar's age in days.
+
+    The changes and the level are NaN where there is no such bar or it is stale (older than ``stale_after_days``); ``age_days``
+    is always the true age."""
     close = close.dropna().sort_index()
     n = len(cutoffs)
     if close.empty:
@@ -61,10 +81,11 @@ def aligned_series(
         change1, change5 = close.pct_change(fill_method=None) * 100.0, close.pct_change(5, fill_method=None) * 100.0
     level = close.to_numpy(dtype=float)
     age = (cutoffs - available[safe]) / 86400.0
+    fresh = valid & (age <= stale_after_days(spec))
     return {
-        "ret1": np.where(valid, change1.to_numpy(dtype=float)[safe], np.nan),
-        "ret5": np.where(valid, change5.to_numpy(dtype=float)[safe], np.nan),
-        "level": np.where(valid, level[safe], np.nan),
+        "ret1": np.where(fresh, change1.to_numpy(dtype=float)[safe], np.nan),
+        "ret5": np.where(fresh, change5.to_numpy(dtype=float)[safe], np.nan),
+        "level": np.where(fresh, level[safe], np.nan),
         "age_days": np.where(valid, age, np.nan),
     }
 
@@ -73,7 +94,8 @@ def global_features(
     closes: Mapping[str, pd.Series], dates: pd.DatetimeIndex, cutoff_hhmm: str
 ) -> dict[str, np.ndarray]:
     """Composite factor moves available at ``cutoff_hhmm`` IST of each date (values are NOT shifted: they are, by
-    construction, already known before the open of that date)."""
+    construction, already known before the open of that date). A stale or missing series contributes nothing and lowers
+    ``g_cover``, the share of the composites' series with a fresh 1-day change (each composite weighs the same)."""
     cutoffs = _cutoffs(dates, cutoff_hhmm)
     per_series: dict[str, dict[str, np.ndarray]] = {}
     for key, series in closes.items():
@@ -82,13 +104,19 @@ def global_features(
             continue
         unit = "bp" if COMPOSITES["us10y"][0][0] == key else "pct"
         per_series[key] = aligned_series(spec, series, cutoffs, unit)
+        age = per_series[key]["age_days"][-1] if len(cutoffs) else np.nan
+        if key in COMPOSITE_MEMBERS and age > stale_after_days(spec):
+            log.warning("global series %s is stale: its latest final bar is %.1f days old at the last cutoff (limit %.1f); "
+                        "its features are blank", key, age, stale_after_days(spec))
 
     out: dict[str, np.ndarray] = {}
     n = len(dates)
-    available_composites = 0
+    cover = np.zeros(n)
     for name, (members, _unit) in COMPOSITES.items():
         stacks1 = [per_series[m]["ret1"] for m in members if m in per_series]
         stacks5 = [per_series[m]["ret5"] for m in members if m in per_series]
+        cover += np.mean([np.isfinite(per_series[m]["ret1"]) if m in per_series else np.zeros(n, dtype=bool) for m in members],
+                         axis=0)
         if stacks1:
             with np.errstate(all="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)  # "Mean of empty slice": a day with no data is NaN by design
@@ -97,14 +125,11 @@ def global_features(
                 if name in FIVE_DAY:
                     five = {"us10y": "g_us10y_bp5"}.get(name, f"g_{name}_ret5")
                     out[five] = np.nanmean(np.vstack(stacks5), axis=0) if len(stacks5) > 1 else stacks5[0]
-            available_composites += 1
         else:
             out[{"us10y": "g_us10y_bp", "vix": "g_vix_chg"}.get(name, f"g_{name}_ret")] = np.full(n, np.nan)
     out["g_vix_lvl"] = per_series["^VIX"]["level"] if "^VIX" in per_series else np.full(n, np.nan)
     out["g_us10y_lvl"] = per_series["^TNX"]["level"] if "^TNX" in per_series else np.full(n, np.nan)
-    out["g_cover"] = np.sum(
-        [np.isfinite(out[k]).astype(float) for k in out if k.endswith("_ret") or k in ("g_us10y_bp", "g_vix_chg")], axis=0
-    ) / max(1, len(COMPOSITES))
+    out["g_cover"] = cover / len(COMPOSITES)
     return out
 
 

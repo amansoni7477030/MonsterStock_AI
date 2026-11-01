@@ -220,22 +220,26 @@ def check_resources(
 
 
 def prune_directory(path: str | Path, *, max_mb: float | None = None, max_age_days: float | None = None,
-                    keep: Iterable[str] = ()) -> int:
-    """Delete old files (and oldest-first until under ``max_mb``). Returns the number of files removed."""
+                    keep: Iterable[str] = (), dry_run: bool = False) -> int:
+    """Delete old files (and oldest-first until under ``max_mb``). Returns the number of files removed
+    (or that would be, with ``dry_run``). Files whose *name* is in ``keep`` are never removed, but they still count
+    towards the ``max_mb`` budget."""
     base = Path(path)
     if not base.exists():
         return 0
     keep_set = set(keep)
     now = time.time()
     files: list[tuple[float, int, Path]] = []
+    kept_bytes = 0
     for root, _dirs, names in os.walk(base):
         for name in names:
             candidate = Path(root) / name
-            if name in keep_set:
-                continue
             try:
                 stat = candidate.stat()
             except OSError:
+                continue
+            if name in keep_set:
+                kept_bytes += stat.st_size
                 continue
             files.append((stat.st_mtime, stat.st_size, candidate))
     files.sort()
@@ -244,19 +248,21 @@ def prune_directory(path: str | Path, *, max_mb: float | None = None, max_age_da
     for mtime, size, candidate in files:
         if max_age_days is not None and (now - mtime) > max_age_days * 86400:
             try:
-                candidate.unlink()
+                if not dry_run:
+                    candidate.unlink()
                 removed += 1
                 continue
             except OSError:
                 pass
         remaining.append((mtime, size, candidate))
     if max_mb is not None:
-        total = sum(size for _m, size, _p in remaining) / MB
+        total = (sum(size for _m, size, _p in remaining) + kept_bytes) / MB
         for _mtime, size, candidate in remaining:
             if total <= max_mb:
                 break
             try:
-                candidate.unlink()
+                if not dry_run:
+                    candidate.unlink()
                 removed += 1
                 total -= size / MB
             except OSError:

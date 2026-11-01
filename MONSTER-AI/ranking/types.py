@@ -29,6 +29,16 @@ class Catalyst:
     confidence: float | None = None  # 0..1
     severity: float | None = None  # 0..1
     polarity: float | None = None  # -1..1 for this stock (NOT a trading signal)
+    # Provenance, all optional (None = not assessed) so older snapshots and callers stay valid.
+    event_id: int | None = None  # the structured event this catalyst was drawn from
+    novelty_class: str | None = None  # how new the information is: new | follow_up | resurfaced | rumour
+    rumour: bool | None = None  # True = unconfirmed / hearsay (clears once a non-rumour report joins; a denial does not clear it)
+    source_class: str | None = None  # best source so far: exchange_filing | official | company | media | social | unknown
+    n_independent: int | None = None  # independent sources reporting it
+    n_conflicts: int | None = None  # reports that contradict it
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Catalyst:
@@ -122,6 +132,8 @@ class EveningSummary:
     rows: list[EveningRow] = field(default_factory=list)
     n: int = 0
     model_hit_rate: float | None = None
+    # Wilson interval of this ONE day's picks. The picks of a day share one market, so it is optimistic: the rolling
+    # windows in ``live_record`` use a day-block bootstrap and are the intervals to rely on.
     model_hit_ci: tuple[float, float] | None = None
     baseline_hit_rates: dict[str, float] = field(default_factory=dict)  # e.g. {"atr": 0.4, "volume": 0.2, "random": 0.2}
     mean_range_pct: float | None = None
@@ -131,6 +143,9 @@ class EveningSummary:
     data_quality_notes: list[str] = field(default_factory=list)
     provisional: bool = True  # True until the official bhavcopy confirms the OHLC
     missing_symbols: list[str] = field(default_factory=list)
+    # Rolling live record of the frozen picks: window label ("20d", "60d", "all") -> metric rows, each
+    # {name, slice, value, n, ci_low, ci_high, extra}; slice "all" = every pick, other slices are persisted only.
+    live_record: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

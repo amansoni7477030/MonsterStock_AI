@@ -8,10 +8,16 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+# How many sessions ahead a scheduled results meeting is visible (``c_days_to_results``). NSE learns of a board meeting only when
+# the company announces it - typically a week or two before - so a live scan knows the meetings of the next sessions only,
+# while a backfilled history knows every date. Training and live therefore both look no further than this horizon (beyond:
+# unknown, NaN); the panel must carry at least this many upcoming sessions (``Panel.future_dates``) so that the last rows of
+# a training set and a live scan see all of it.
+RESULTS_HORIZON = 10
+
 
 def calendar_market_features(dates: pd.DatetimeIndex, next_after_last: date | None = None) -> dict[str, np.ndarray]:
     """Market-level calendar features for each trading date (``next_after_last``: next trading day after the final date)."""
-    n = len(dates)
     py = [d.date() for d in dates]
     nxt = py[1:] + [next_after_last]
     prev = [None] + py[:-1]
@@ -26,7 +32,6 @@ def calendar_market_features(dates: pd.DatetimeIndex, next_after_last: date | No
         "c_month_start": month_start,
         "c_gap_prev": gap_prev,
         "c_gap_next": gap_next,
-        "c_n": np.full(n, float(n)),
     }
 
 
@@ -36,7 +41,8 @@ def results_features(
     """Scheduled quarterly-results features from board-meeting dates.
 
     Dates before ``coverage_start`` are unknown (NaN) rather than "no results", so a model is never taught that an
-    uncovered period had no catalysts."""
+    uncovered period had no catalysts. ``c_days_to_results`` is the number of sessions to the next meeting if that is at most
+    ``RESULTS_HORIZON`` sessions away, else NaN: the meetings known that far ahead are the same in training and live."""
     n = len(dates)
     extended = [d.date() for d in dates] + list(future)
     pos = {d: i for i, d in enumerate(extended)}
@@ -74,7 +80,7 @@ def results_features(
         "c_results_prev": prev,
         "c_results_next2": next2,
         "c_days_since_results": since.clip(upper=120),
-        "c_days_to_results": until.clip(upper=60),
+        "c_days_to_results": until.where(until <= RESULTS_HORIZON),  # sessions ahead; beyond the horizon: unknown (NaN)
     }
 
 

@@ -41,6 +41,22 @@ DEFAULT_SCORES: dict[str, float] = {
     "social": 0.2,
     "unknown": 0.2,
 }
+# The blueprint's coarser source classes (exchange filing / official / company / media / social); a tier we cannot place stays unknown.
+SOURCE_CLASS: dict[str, str] = {
+    "exchange_filing": "exchange_filing",
+    "official": "official",
+    "company": "company",
+    "wire": "media",
+    "business_media": "media",
+    "aggregator": "media",
+    "social": "social",
+    "unknown": "unknown",
+}
+
+
+def source_class_of(kind: str | None) -> str:
+    """Blueprint source class of a quality tier: exchange_filing | official | company | media | social | unknown."""
+    return SOURCE_CLASS.get(str(kind or ""), "unknown")
 
 _SECOND_LEVEL = frozenset({"co", "com", "org", "net", "gov", "ac", "edu", "nic"})
 _SUFFIX_PUBLISHER = re.compile(r"^(.{12,}?)\s+[-|\u2013\u2014]\s+([^-|\u2013\u2014]{2,40})$")

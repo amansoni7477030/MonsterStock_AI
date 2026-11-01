@@ -39,7 +39,7 @@ from app import __version__, jsonutil
 from app.clock import Clock, get_clock, iso, parse_ts
 from app.config import Settings, load_settings
 from app.errors import ConfigError
-from app.logging_setup import redact, setup_logging
+from app.logging_setup import configure_from_settings, redact
 from dashboard.templates import LOW_N, render_page
 from database.store import Store
 
@@ -454,15 +454,7 @@ def performance_data(store: Store) -> dict[str, Any]:
             key=lambda m: (_GROUP_ORDER[m["group"]], m["slice"] != "all", m["slice"], m["name"]),
         )
         scopes[scope] = {"as_of_date": rows[0]["as_of_date"] if rows else None, "metrics": metrics}
-    counts = store.conn.execute(
-        "SELECT COALESCE(SUM(validated = 1), 0) AS validated, COALESCE(SUM(validated = 0), 0) AS provisional, "
-        "COUNT(DISTINCT CASE WHEN validated = 1 THEN trade_date END) AS days FROM outcomes"
-    ).fetchone()
-    return {
-        "scopes": scopes,
-        "outcomes": {"validated": counts["validated"], "provisional": counts["provisional"], "days": counts["days"]},
-        "min_reliable_n": LOW_N,
-    }
+    return {"scopes": scopes, "outcomes": store.outcome_counts(), "min_reliable_n": LOW_N}
 
 
 def overview_data(store: Store, ctx: _Context) -> dict[str, Any]:
@@ -635,7 +627,7 @@ def serve(settings: Settings) -> int:
 def main() -> int:
     """``python -m dashboard.app``: serve the dashboard from the environment configuration."""
     settings = load_settings()
-    setup_logging(settings.log_dir, settings.log_level, secrets=settings.secrets(), filename="dashboard.log")
+    configure_from_settings(settings, "dashboard.log")
     if not settings.dashboard_enabled:
         log.info("dashboard is disabled (DASHBOARD_ENABLED=false); nothing to run")
         return 0

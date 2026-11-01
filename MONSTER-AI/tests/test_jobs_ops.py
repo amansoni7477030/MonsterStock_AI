@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +67,15 @@ def test_housekeeping_runs_emergency_cleanup_when_the_disk_is_critical(env, monk
     assert any(a["code"] == "resources" and a["level"] == "error" for a in env.store.pending_alerts(10))
 
 
+def _leave_free_pages(store, rows: int = 3000) -> None:
+    """Delete a few MB of rows so the database file holds pages a VACUUM can give back."""
+    store.conn.execute("BEGIN")
+    store.conn.executemany("INSERT INTO kv (key, value, updated_at) VALUES (?, ?, '2026-11-08T00:00:00Z')",
+                           [(f"junk:{i}", "x" * 2000) for i in range(rows)])
+    store.conn.execute("COMMIT")
+    store.conn.execute("DELETE FROM kv WHERE key LIKE 'junk:%'")
+
+
 def test_housekeeping_upgrades_provisional_outcomes_and_vacuums_on_sunday(env):
     env.clock.set(datetime(2026, 11, 2, 3, 15, tzinfo=UTC))
     ctx = make_job_context(env.settings, env.store, env.clock)
@@ -82,8 +92,32 @@ def test_housekeeping_upgrades_provisional_outcomes_and_vacuums_on_sunday(env):
                                                                 "low": o * 0.99, "close": o * 1.01, "volume": 1e6}],
                               source="nse_bhavcopy", source_rank=2, quality="official")
     env.clock.set(datetime(2026, 11, 8, 18, 30, tzinfo=UTC))  # Sunday (Muhurat) evening: no trading-day requirement
+    _leave_free_pages(env.store)
     result = jobs.housekeeping(make_job_context(env.settings, env.store, env.clock, run_key="2026-11-08"))
     assert result.metrics["outcomes_validated"] > 0 and result.metrics.get("vacuum") is True
+    assert result.metrics["maintenance"]["db_mb_after"] < result.metrics["maintenance"]["db_mb"]
+
+
+def test_housekeeping_records_what_retention_removed_and_skips_a_pointless_vacuum(env):
+    env.clock.set(datetime(2026, 11, 8, 18, 30, tzinfo=UTC))  # a Sunday run
+    env.store.conn.execute("INSERT INTO live_quotes (key, received_at, price) VALUES ('old', '2024-01-01T00:00:00Z', 1)")
+    result = jobs.housekeeping(make_job_context(env.settings, env.store, env.clock, run_key="2026-11-08"))
+    assert result.metrics["removed"]["live_quotes"] == 1 and result.metrics["rows_removed"] >= 1
+    assert result.metrics["vacuum"] is False  # nothing worth reclaiming: no heavy rewrite of the database
+    assert env.store.kv_get_json("retention.last")["rows"]["live_quotes"] == 1
+    assert "retention removed" in result.message
+
+
+def test_housekeeping_raises_an_alert_when_a_retention_rule_fails(env, monkeypatch):
+    from automation import retention
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(retention, "apply_kv_policy", broken)
+    result = jobs.housekeeping(make_job_context(env.settings, env.store, env.clock))
+    assert result.status == "success"  # retention trouble never fails the nightly job
+    assert any(a["code"] == "retention" for a in env.store.pending_alerts(10))
 
 
 # ------------------------------------------------------------------------------- calendar / universe / sync
@@ -122,6 +156,13 @@ def test_model_sync_and_training_are_gated_by_mode(env):
                                          "model_signing_key": "k" * 32})
     assert jobs.train(make_job_context(external, env.store, env.clock)).status == "skipped"
     assert jobs.model_sync(make_job_context(external, env.store, env.clock)).status == "skipped"
+
+
+def test_training_waits_when_the_disk_is_at_its_critical_level(env, monkeypatch):
+    monkeypatch.setattr(jobs, "disk_info", lambda path: {"free_mb": 120.0, "total_mb": 8000.0, "used_mb": 7880.0})
+    result = jobs.train(make_job_context(env.settings, env.store, env.clock))
+    assert result.status == "failed" and "120 MB of disk is free" in result.message  # retried inside its window, alerted at the end
+    assert env.store.conn.execute("SELECT COUNT(*) FROM model_registry").fetchone()[0] == 0
 
 
 def test_train_years_fit_the_row_budget():

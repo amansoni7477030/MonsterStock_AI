@@ -26,6 +26,23 @@ def _loo_mean(block: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(loo, index=block.index, columns=block.columns)
 
 
+def _loo_std(block: pd.DataFrame) -> pd.DataFrame:
+    """Per member, the population standard deviation of the OTHER members' values (NaN with fewer than two others)."""
+    values = block.to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    count = finite.sum(axis=1, keepdims=True)
+    centre = np.where(finite, values, 0.0).sum(axis=1, keepdims=True) / np.maximum(count, 1)
+    dev = np.where(finite, values - centre, 0.0)  # centred: the sums of squares below do not cancel catastrophically
+    others = count - finite.astype(float)
+    dev_sum = dev.sum(axis=1, keepdims=True) - dev
+    sq_sum = (dev ** 2).sum(axis=1, keepdims=True) - dev ** 2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        var = sq_sum / others - (dev_sum / others) ** 2
+    std = np.sqrt(np.maximum(var, 0.0))
+    std[others < 2] = np.nan
+    return pd.DataFrame(std, index=block.index, columns=block.columns)
+
+
 def sector_loo(frame: pd.DataFrame, sectors: Mapping[str, str | None]) -> pd.DataFrame:
     """Leave-one-out sector mean of an arbitrary matrix (used for relative-gap features)."""
     out = pd.DataFrame(np.nan, index=frame.index, columns=frame.columns, dtype=float)
@@ -57,9 +74,7 @@ def sector_features(
         out["s_ret20"][members] = _loo_mean(r20)
         up = (r1 > 0).astype(float).where(r1.notna())
         out["s_breadth1"][members] = _loo_mean(up)
-        dispersion = r1.std(axis=1, ddof=0)
-        out["s_disp1"][members] = pd.DataFrame(np.repeat(dispersion.to_numpy()[:, None], len(members), axis=1),
-                                               index=r1.index, columns=members)
+        out["s_disp1"][members] = _loo_std(r1)
         out["s_range1"][members] = _loo_mean(rng[members])
         out["s_rvol1"][members] = _loo_mean(rvol1[members])
         out["s_rs1"][members] = r1 - out["s_ret1"][members]

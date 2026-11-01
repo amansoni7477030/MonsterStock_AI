@@ -64,8 +64,8 @@ def weight(sev=0.8, conf=0.9, nov=1.0, polarity=0.7):
 def test_chains_are_readable_and_built_from_the_stored_rationale(store, repo):
     out = GraphImpactEngine(store).impacts([event()], AS_OF)
     assert set(out) == {"HINDPETRO", "BPCL", "ONGC"} and all(isinstance(v, StockImpact) for v in out.values())
-    assert out["HINDPETRO"].chains[0] == "Brent +3.1% -> crude input costs -> sector:oil_marketing -> HINDPETRO"
-    assert out["ONGC"].chains[0] == "Brent +3.1% -> realisations -> sector:upstream_oil -> ONGC"
+    assert out["HINDPETRO"].chains[0] == "Brent +3.1% -> crude input costs [expert prior] -> sector:oil_marketing -> HINDPETRO"
+    assert out["ONGC"].chains[0] == "Brent +3.1% -> realisations [expert prior] -> sector:upstream_oil -> ONGC"
     assert "TCS" not in out
 
 
@@ -86,8 +86,8 @@ def test_chain_labels_without_a_percentage_or_rationale_label(store, repo):
     repo.upsert_edge("macro:usdinr", "sector:oil_marketing", "fx_translation", direction=1, sensitivity=0.3, confidence=0.4,
                      rationale="no label here", source="prior_expert")
     out = GraphImpactEngine(store).impacts([event(entities=[entity("macro:usdinr", 0.6, type="fx", name="USD/INR")])], AS_OF)
-    assert out["HINDPETRO"].chains[0] == "USD/INR up -> fx translation -> sector:oil_marketing -> HINDPETRO"
-    assert out["TCS"].chains[0] == "USD/INR up -> rupee revenue -> sector:it_services -> TCS"
+    assert out["HINDPETRO"].chains[0] == "USD/INR up -> fx translation [expert prior] -> sector:oil_marketing -> HINDPETRO"
+    assert out["TCS"].chains[0] == "USD/INR up -> rupee revenue [expert prior] -> sector:it_services -> TCS"
     assert prop._short("macro:in10y", "x") == "India 10y yield" and prop._short("macro:custom_thing", "x") == "Custom thing"
     assert prop._short("sector:x", "Nifty (index)") == "Nifty"
 
@@ -98,7 +98,8 @@ def test_strength_decays_with_causal_depth_and_depth_is_bounded(store, repo):
     opec = engine.impacts([event(entities=[entity("macro:opec", 0.7, type="institution", name="OPEC")])], AS_OF)["HINDPETRO"]
     assert abs(opec.event_effects[1]) < abs(direct.event_effects[1])
     assert opec.event_effects[1] == pytest.approx(-weight() * 0.4 * (0.4 * 0.6) * 0.9, abs=1e-4)  # second causal hop x decay
-    assert opec.chains[0] == "OPEC up -> supply policy -> macro:brent -> crude input costs -> sector:oil_marketing -> HINDPETRO"
+    assert opec.chains[0] == (
+        "OPEC up -> supply policy [expert prior] -> macro:brent -> crude input costs [expert prior] -> sector:oil_marketing -> HINDPETRO")
     assert engine.impacts([event()], AS_OF, max_depth=1) == {}
     assert set(engine.impacts([event()], AS_OF, max_depth=2)) == {"HINDPETRO", "BPCL", "ONGC"}
     assert engine.impacts([event(entities=[entity("macro:opec", 0.7, type="institution")])], AS_OF, max_depth=3) != {}
@@ -215,24 +216,90 @@ def test_zero_direction_edges_carry_nothing(store, repo):
     assert "HINDPETRO" not in out and "TCS" in out
 
 
+def mark(repo, src, dst, relation, source, **over):
+    """Re-label an edge's provenance (optionally with new values) the way graph learning would."""
+    edge = repo.get_edge(src, dst, relation)
+    values = {"direction": edge.direction, "sensitivity": edge.sensitivity, "lag_days_mean": edge.lag_days_mean,
+              "lag_days_sd": edge.lag_days_sd, "confidence": edge.confidence, "regime_dependence": edge.regime_dependence,
+              "rationale": edge.rationale, "source": source, "evidence_count": 300 if source != "prior_expert" else 0}
+    repo.upsert_edge(src, dst, relation, **{**values, **over})
+
+
 def test_basis_reports_the_provenance_of_the_edges_used(store, repo):
     engine = GraphImpactEngine(store)
     evt = [event()]
 
-    def set_source(src, dst, relation, source):
-        edge = repo.get_edge(src, dst, relation)
-        repo.upsert_edge(src, dst, relation, direction=edge.direction, sensitivity=edge.sensitivity, lag_days_mean=edge.lag_days_mean,
-                         lag_days_sd=edge.lag_days_sd, confidence=edge.confidence, regime_dependence=edge.regime_dependence,
-                         rationale=edge.rationale, source=source, evidence_count=300 if source != "prior_expert" else 0)
-
     assert engine.impacts(evt, AS_OF)["HINDPETRO"].basis == "prior"
-    set_source("macro:brent", "sector:oil_marketing", "input_cost", "measured")
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "measured")
     assert engine.impacts(evt, AS_OF)["HINDPETRO"].basis == "measured"
     mixed = engine.impacts([event(entities=[entity("macro:opec", 0.7, type="institution")])], AS_OF)["HINDPETRO"]
     assert mixed.basis == "mixed"
-    set_source("macro:brent", "sector:oil_marketing", "input_cost", "relationship_break")
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "relationship_break")
     assert engine.impacts(evt, AS_OF)["HINDPETRO"].basis == "relationship_break"
     assert engine.impacts(evt, AS_OF)["ONGC"].basis == "prior"
+
+
+def test_chains_say_for_every_edge_whether_it_is_a_measured_estimate_or_an_expert_prior(store, repo):
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "measured")
+    engine = GraphImpactEngine(store)
+    out = engine.impacts([event()], AS_OF)
+    assert out["HINDPETRO"].chains[0] == "Brent +3.1% -> crude input costs [measured] -> sector:oil_marketing -> HINDPETRO"
+    assert out["ONGC"].chains[0] == "Brent +3.1% -> realisations [expert prior] -> sector:upstream_oil -> ONGC"
+    opec = engine.impacts([event(entities=[entity("macro:opec", 0.7, type="institution", name="OPEC")])], AS_OF)["HINDPETRO"]
+    assert opec.chains[0] == (
+        "OPEC up -> supply policy [expert prior] -> macro:brent -> crude input costs [measured] -> sector:oil_marketing -> HINDPETRO")
+    assert opec.basis == "mixed"  # the tags and the basis tell the same story
+    repo.upsert_edge("macro:brent", "ONGC", "exposure", direction=1, sensitivity=0.3, confidence=0.6, rationale="direct: spot crude",
+                     source="prior")  # the default provenance of an edge nobody measured is an expert prior too
+    assert engine.impacts([event()], AS_OF)["ONGC"].chains[0].endswith("direct [expert prior] -> ONGC")
+
+
+def test_a_broken_edge_propagates_with_no_direction_and_is_labelled_broken(store, repo):
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "relationship_break", direction=0, sensitivity=None,
+         confidence=0.05)
+    out = GraphImpactEngine(store).impacts([event()], AS_OF)
+    broken = out["HINDPETRO"]
+    assert broken.chains == ["Brent +3.1% -> crude input costs [broken] -> sector:oil_marketing -> HINDPETRO"]
+    assert broken.score == 0.0 and broken.direction == 0 and broken.basis == "relationship_break"
+    assert broken.confidence <= 0.05  # the confidence floor is carried along, not hidden
+    assert broken.top_event_ids == [] and broken.event_effects == {} and broken.n_events == 0  # nothing is claimed as an effect
+    assert out["BPCL"].chains[0].endswith("[broken] -> sector:oil_marketing -> BPCL")
+    assert out["ONGC"].direction == 1 and "[broken]" not in out["ONGC"].chains[0]  # unrelated links are unaffected
+
+
+def test_a_legacy_break_row_that_still_carries_a_direction_asserts_nothing(store, repo):
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "relationship_break")  # keeps its old sign and confidence
+    assert repo.get_edge("macro:brent", "sector:oil_marketing", "input_cost").direction == -1
+    impact = GraphImpactEngine(store).impacts([event()], AS_OF)["HINDPETRO"]
+    assert impact.score == 0.0 and impact.direction == 0 and impact.event_effects == {}
+    assert impact.chains == ["Brent +3.1% -> crude input costs [broken] -> sector:oil_marketing -> HINDPETRO"]
+
+
+def test_a_shock_that_met_a_broken_link_stays_directionless_further_down(store, repo):
+    mark(repo, "macro:opec", "macro:brent", "co_movement", "relationship_break", direction=0, sensitivity=None, confidence=0.05)
+    opec = [event(entities=[entity("macro:opec", 0.7, type="institution", name="OPEC")])]
+    impact = GraphImpactEngine(store).impacts(opec, AS_OF)["HINDPETRO"]
+    assert impact.chains == [
+        "OPEC up -> supply policy [broken] -> macro:brent -> crude input costs [expert prior] -> sector:oil_marketing -> HINDPETRO"]
+    assert impact.score == 0.0 and impact.event_effects == {} and impact.basis == "mixed"
+    assert GraphImpactEngine(store).impacts(opec, AS_OF, min_weight=0.9) == {}  # a shock too weak to matter is not reported
+
+
+def test_a_broken_link_adds_nothing_next_to_a_working_one(store, repo):
+    mark(repo, "macro:brent", "sector:oil_marketing", "input_cost", "relationship_break", direction=0, sensitivity=None,
+         confidence=0.05)
+    repo.upsert_edge("macro:usdinr", "sector:oil_marketing", "fx_translation", direction=1, sensitivity=0.3, confidence=0.4,
+                     rationale="fx translation: weaker rupee", source="prior_expert")
+    both = event(entities=[entity("macro:brent", 0.7, move=3.1, name="Brent crude oil"),
+                           entity("macro:usdinr", 0.6, type="fx", name="USD/INR")])
+    impact = GraphImpactEngine(store).impacts([both], AS_OF)["HINDPETRO"]
+    expected = weight(polarity=0.6) * 0.4 * 0.9
+    assert impact.direction == 1 and impact.score == pytest.approx(math.tanh(expected), abs=1e-4)
+    assert impact.event_effects == {1: pytest.approx(expected, abs=1e-4)} and impact.top_event_ids == [1] and impact.n_events == 1
+    assert impact.chains == [
+        "USD/INR up -> fx translation [expert prior] -> sector:oil_marketing -> HINDPETRO",
+        "Brent +3.1% -> crude input costs [broken] -> sector:oil_marketing -> HINDPETRO"]
+    assert impact.basis == "mixed"
 
 
 def test_the_graph_cache_follows_edge_changes(store, repo):

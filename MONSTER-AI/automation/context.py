@@ -107,5 +107,5 @@ class JobContext:
         return self._lazy("notifier", lambda: NotificationService(self.settings, self.store, clock=self.clock))
 
     def ensure_calendar(self) -> None:
-        seed_calendar(self.store, self.settings)
+        seed_calendar(self.store, self.settings, self.clock.now())
         self.calendar.reload()

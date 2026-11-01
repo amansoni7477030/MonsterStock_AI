@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import socket
+import sqlite3
 import subprocess  # noqa: S404 - children are our own CLI, launched with a fixed argument vector (no shell)
 import sys
 from collections.abc import Callable
@@ -19,12 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from app.clock import Clock, get_clock, iso
+from app.clock import Clock, get_clock, iso, parse_ts
 from app.config import Settings
 from app.locks import FileLock, lock_dir
-from app.resources import check_resources, emergency_cleanup, memory_info
+from app.resources import check_resources, disk_info, emergency_cleanup, memory_info
 from automation.calendar import ExchangeCalendar, seed_calendar
-from automation.health import HEARTBEAT_KEY
+from automation.health import HEARTBEAT_KEY, read_heartbeat_file, write_heartbeat_file
 from automation.jobspec import JOBS
 from automation.runner import TERMINATE_REASON_KEY
 from automation.schedule import PREEMPTED, Due, ScheduleEngine
@@ -34,9 +35,11 @@ from ingestion.registry import register_all
 log = logging.getLogger(__name__)
 
 BOOTSTRAP_STATE_KEY = "bootstrap.state"
+RUN_STATE_KEY = "daemon.run_state"  # {"state": "running" | "stopped", ...}: "running" at the next start = an unclean stop
 BOOTSTRAP_RETRY_SEC = 1800
 BOOTSTRAP_MAX_ATTEMPTS_PER_DAY = 6
 HEARTBEAT_EVERY_SEC = 15.0
+HEARTBEAT_DB_WAIT_MS = 2000  # the heartbeat never waits the connection's full busy timeout for a locked database
 ALERT_FLUSH_EVERY_SEC = 60.0
 RESOURCE_CHECK_EVERY_SEC = 300.0
 TERMINATE_GRACE_SEC = 20.0
@@ -150,7 +153,8 @@ class Scheduler:
         self.tick_sec = tick_sec
         self.running: Running | None = None
         self.stop_requested = False
-        self._last = {"heartbeat": -1e9, "flush": -1e9, "resources": -1e9, "bootstrap": -1e9, "ram_warn": -1e9}
+        self._last = {"heartbeat": -1e9, "flush": -1e9, "resources": -1e9, "bootstrap": -1e9, "ram_warn": -1e9,
+                      "disk_warn": -1e9, "db_beat_warn": -1e9}
 
     @property
     def clock(self) -> Clock:
@@ -161,8 +165,9 @@ class Scheduler:
         recovered = self.engine.recover_stale(alive=pid_alive)
         if recovered:
             log.warning("recovered %d ledger rows left running by a previous process", recovered)
+        self._register_start(self.clock.now())
         self._notify("READY=1")
-        log.info("scheduler started (tick %.1fs)", self.tick_sec)
+        log.info("scheduler started (tick %.1fs, pid %d)", self.tick_sec, os.getpid())
         while not self.stop_requested:
             self.tick_safely()
             self.clock.sleep(self.tick_sec)
@@ -190,9 +195,47 @@ class Scheduler:
         if mono - self._last["heartbeat"] < HEARTBEAT_EVERY_SEC:
             return
         self._last["heartbeat"] = mono
-        self.store.kv_set(HEARTBEAT_KEY, iso(now) or "")
         status = f"running {self.running.label}" if self.running else "idle"
+        # systemd first, then the file, the database last: a long VACUUM or bulk delete holds the SQLite writer lock, and a
+        # healthy daemon must neither be killed by the watchdog nor look dead to the health check because of it
         self._notify(f"WATCHDOG=1\nSTATUS={status}")
+        write_heartbeat_file(self.settings.data_dir, now)
+        self._heartbeat_db(now, mono)
+
+    def _heartbeat_db(self, now: datetime, mono: float) -> None:
+        conn = self.store.conn
+        try:
+            wait = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            conn.execute(f"PRAGMA busy_timeout = {HEARTBEAT_DB_WAIT_MS}")
+        except sqlite3.Error:
+            wait = None
+        try:
+            self.store.kv_set(HEARTBEAT_KEY, iso(now) or "")
+        except sqlite3.OperationalError as exc:  # locked by a long write: the file heartbeat still proves liveness
+            if mono - self._last["db_beat_warn"] > 300:
+                self._last["db_beat_warn"] = mono
+                log.warning("heartbeat not stored in the database (%s); the heartbeat file is still written", exc)
+        finally:
+            if wait is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute(f"PRAGMA busy_timeout = {int(wait)}")
+
+    def _register_start(self, now: datetime) -> None:
+        """A daemon that finds the previous run still marked "running" was killed (out of memory, power loss, watchdog): systemd
+        restarts it silently, so say so - once - instead of leaving the operator to discover gaps later."""
+        previous = self.store.kv_get_json(RUN_STATE_KEY)
+        self.store.kv_set_json(RUN_STATE_KEY, {"state": "running", "pid": os.getpid(), "since": iso(now)})
+        if not (isinstance(previous, dict) and previous.get("state") == "running"):
+            return
+        last = max((b for b in (read_heartbeat_file(self.settings.data_dir), parse_ts(self.store.kv_get(HEARTBEAT_KEY)))
+                    if b is not None), default=None)
+        count = int(self.store.kv_get("daemon.unclean_restarts", "0") or 0) + 1
+        self.store.kv_set("daemon.unclean_restarts", str(count))
+        message = (f"the scheduler restarted after an unclean stop (process {previous.get('pid')} had been running since "
+                   f"{previous.get('since')}; last heartbeat {iso(last) or 'unknown'}; {count} unclean restarts so far)")
+        log.warning("%s", message)
+        self.store.add_alert("warning", "daemon_restarted", message + ". See: python -m app.cli logs --role daemon",
+                             dedupe_key="daemon-restart", dedupe_minutes=30)
 
     # ------------------------------------------------------------------------------------------- reaping
     def _reap(self, mono: float) -> None:
@@ -236,7 +279,7 @@ class Scheduler:
         if orphaned and run.reason is None:
             self.store.add_alert("error", f"job_crashed_{run.job}", f"{run.label} [{run.run_key}] {message}",
                                  dedupe_key=f"crash:{run.job}:{run.run_key}", dedupe_minutes=24 * 60)
-        log.info("job %s finished with exit code %s", run.label, code)
+        log.info("job %s finished with exit code %s after %.0f s", run.label, code, self.clock.monotonic() - run.started)
 
     # ---------------------------------------------------------------------------------------- dispatching
     def _dispatch(self, due: list[Due], now: datetime, mono: float) -> None:
@@ -253,7 +296,7 @@ class Scheduler:
                 self._terminate(self.running, f"preempted by {head.entry.label}", mono)
             return
         spec = JOBS[head.entry.job]
-        if spec.heavy and not head.critical and not self._ram_ok(mono):
+        if spec.heavy and not head.critical and not (self._ram_ok(mono) and self._disk_ok(mono)):
             return
         self._launch(head, mono)
 
@@ -269,6 +312,18 @@ class Scheduler:
         self.store.kv_delete(TERMINATE_REASON_KEY)
         self.running = Running(due.entry.label, due.entry.job, due.run_key, due.attempt, due.critical, handle, mono,
                                due.timeout_min * 60.0)
+
+    def _disk_ok(self, mono: float) -> bool:
+        """Heavy jobs (training, backfills) write a lot: with the disk at its critical level they wait for the emergency cleanup
+        and the retention to make room instead of filling the last megabytes."""
+        free = disk_info(self.settings.data_dir)["free_mb"]
+        if free >= self.settings.min_free_disk_mb_crit:
+            return True
+        if mono - self._last["disk_warn"] > 600:
+            self._last["disk_warn"] = mono
+            log.warning("deferring heavy job: only %.0f MB of disk is free (critical below %d MB)", free,
+                        self.settings.min_free_disk_mb_crit)
+        return False
 
     def _ram_ok(self, mono: float) -> bool:
         available = memory_info()["available_mb"]
@@ -358,6 +413,7 @@ class Scheduler:
             self._after_exit(run, self.launcher.poll(run.handle) or 0)
             self.running = None
         self._notify("STOPPING=1")
+        self.store.kv_set_json(RUN_STATE_KEY, {"state": "stopped", "pid": os.getpid(), "at": iso(self.clock.now())})
         log.info("scheduler stopped")
 
 

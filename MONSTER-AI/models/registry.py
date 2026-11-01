@@ -32,7 +32,8 @@ class ModelRegistry:
 
     # ------------------------------------------------------------------------------------- queries
     def baseline(self, stage: str) -> BaselineBundle:
-        return BaselineBundle(stage, self.settings.range_thresholds, self.settings.primary_threshold)
+        return BaselineBundle(stage, self.settings.range_thresholds, self.settings.primary_threshold,
+                              unusual_k=self.settings.unusual_k)
 
     def active_record(self, stage: str) -> dict[str, Any] | None:
         return self.store.active_model(stage)
@@ -47,7 +48,7 @@ class ModelRegistry:
         self.store.register_model(
             model_version=result.version, stage=result.stage, status="candidate", train_start=result.meta.get("train_start"),
             train_end=result.meta.get("train_end"), feature_schema_hash=result.meta.get("feature_schema_hash"),
-            feature_version=result.meta.get("feature_version"), code_commit=code_commit,
+            feature_version=result.meta.get("feature_version"), code_commit=code_commit or result.meta.get("code_commit"),
             metrics={"heads": result.metrics.get("heads"), "ranking": result.metrics.get("ranking"),
                      "quantiles": result.metrics.get("quantiles"), "gates": result.gates},
             artifact_path=str(result.directory), artifact_sha256=manifest_sha, notes=result.gates.get("reason"),
@@ -128,6 +129,9 @@ class ModelRegistry:
                                      dedupe_key=f"model-invalid:{record['model_version']}", dedupe_minutes=720)
                 self.store.set_model_status(record["model_version"], "retired", notes=f"artifact invalid: {msg}")
                 previous = self.rollback(stage, quiet=True)
+                if previous is None:  # nothing to fall back to: the retired model must not stay "active" (and fail every scan)
+                    self.store.conn.execute("UPDATE model_registry SET is_active = 0 WHERE model_version = ?",
+                                            (record["model_version"],))
                 record = self.active_record(stage) if previous else None
         return self.baseline(stage)
 

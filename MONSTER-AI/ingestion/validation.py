@@ -1,4 +1,9 @@
-"""Sanity validation for market data: reject impossible bars, repair rounding noise, detect re-adjusted history."""
+"""Sanity validation for market data: reject impossible bars, repair rounding noise, detect re-adjusted history.
+
+Two classes of bad-looking bars are kept apart. IMPOSSIBLE bars (missing or non-positive prices, high below open/close,
+low above open/close, negative equity volume, placeholders) cannot be real and are always rejected. EXTREME bars are internally
+consistent but have a huge intraday range: those are the days this system exists to find (limit-up listings, crashes), so
+callers that pass ``keep_extreme`` keep them, flagged ``quality = "suspect"``, instead of dropping them."""
 
 from __future__ import annotations
 
@@ -9,17 +14,23 @@ from typing import Any
 
 REPAIR_TOLERANCE = 0.0005  # 0.05%: rounding noise in vendor OHLC is repaired, larger violations are rejected
 MAX_RANGE_FRACTION = {"equity": 0.6, "index": 0.35, "global": 0.35, "fx": 0.15, "commodity": 0.6, "rate": 0.5, "volatility": 3.0}
+SUSPECT = "suspect"  # bars.quality of a consistent bar whose range exceeds the plausibility bound
 
 
 @dataclass
 class ValidationReport:
     accepted: int = 0
     repaired: int = 0
-    rejected: list[tuple[str, str]] = field(default_factory=list)  # (trade_date, reason)
+    rejected: list[tuple[str, str]] = field(default_factory=list)  # impossible bars: (trade_date, reason)
+    suspect: list[tuple[str, str]] = field(default_factory=list)  # extreme but consistent bars that were kept: (trade_date, reason)
 
     @property
     def rejected_count(self) -> int:
         return len(self.rejected)
+
+    @property
+    def suspect_count(self) -> int:
+        return len(self.suspect)
 
 
 def _finite(value: Any) -> float | None:
@@ -31,15 +42,19 @@ def _finite(value: Any) -> float | None:
 
 
 def validate_bars(
-    bars: Sequence[Mapping[str, Any]], *, kind: str = "equity", require_volume: bool = False
+    bars: Sequence[Mapping[str, Any]], *, kind: str = "equity", require_volume: bool = False, keep_extreme: bool = False
 ) -> tuple[list[dict[str, Any]], ValidationReport]:
     """Return clean ascending, de-duplicated bars plus a report.
 
-    Rules: OHLC finite and positive; ``high >= max(open, close)`` and ``low <= min(open, close)`` (tiny violations are
-    repaired); implausible intraday range rejected; NSE equity bars with zero volume are rejected (vendor placeholders
-    for non-trading days)."""
+    Impossible bars are rejected: OHLC finite and positive; ``high >= max(open, close)`` and ``low <= min(open, close)``
+    (tiny violations are repaired); no negative volume (for the series other than equities, whose volume feeds nothing, only the
+    junk volume is dropped); NSE equity bars with zero volume are vendor placeholders for non-trading days. A bar that is
+    consistent but whose intraday range exceeds the plausibility bound of its ``kind`` is rejected as "implausible range", or,
+    with ``keep_extreme``, kept with ``quality = "suspect"`` and listed in ``report.suspect`` (genuine extreme days are exactly
+    what the models learn from)."""
     report = ValidationReport()
     by_date: dict[str, dict[str, Any]] = {}
+    extreme: dict[str, str] = {}
     limit = MAX_RANGE_FRACTION.get(kind, 0.6)
     for bar in bars:
         date_key = str(bar.get("trade_date", ""))[:10]
@@ -68,12 +83,16 @@ def validate_bars(
             else:
                 report.rejected.append((date_key, "low above open/close"))
                 continue
-        if (h - low) / low > limit:
+        is_extreme = (h - low) / low > limit
+        if is_extreme and not keep_extreme:
             report.rejected.append((date_key, "implausible range"))
             continue
         volume = _finite(bar.get("volume"))
         if volume is not None and volume < 0:
-            volume = None
+            if kind == "equity":
+                report.rejected.append((date_key, "negative volume"))
+                continue
+            volume, repaired = None, True  # volume feeds no feature of the other series: keep the good price, drop the junk volume
         if kind == "equity" and (volume is None or volume <= 0) and require_volume:
             report.rejected.append((date_key, "zero volume"))
             continue
@@ -82,9 +101,15 @@ def validate_bars(
             continue
         clean = dict(bar)
         clean.update(trade_date=date_key, open=o, high=h, low=low, close=c, volume=volume)
+        if is_extreme:
+            clean["quality"] = SUSPECT
+            extreme[date_key] = "implausible range"
+        else:
+            extreme.pop(date_key, None)  # a later duplicate of the same day replaces an earlier extreme one
         by_date[date_key] = clean
         report.accepted += 1
         report.repaired += int(repaired)
+    report.suspect = [(d, extreme[d]) for d in sorted(by_date) if d in extreme]
     return [by_date[d] for d in sorted(by_date)], report
 
 

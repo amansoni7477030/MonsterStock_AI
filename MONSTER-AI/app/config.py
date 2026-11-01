@@ -102,16 +102,21 @@ VARS: tuple[Var, ...] = (
         "shadow = research output only (default, mandatory until a live shadow record exists). The system never places orders in either mode.",
         "Runtime"),
     Var("log_level", "LOG_LEVEL", "INFO", lambda v: _choice("debug", "info", "warning", "error")(v).upper(),
-        "DEBUG / INFO / WARNING / ERROR.", "Runtime"),
+        "DEBUG / INFO / WARNING / ERROR. DEBUG adds one line per HTTP request and per skipped fetch.", "Runtime"),
+    Var("log_format", "LOG_FORMAT", "text", _choice("text", "json"),
+        "text = one readable line per record; json = one JSON object per line (for log shippers).", "Runtime"),
     Var("home", "MONSTER_HOME", "{home_default}", _path, "Code root (auto-detected).", "Runtime"),
     Var("data_dir", "MONSTER_DATA_DIR", "{home}/data/runtime", _path,
         "Writable state: SQLite DB, models, cache, backups. Server: /var/lib/monster-ai.", "Runtime"),
-    Var("log_dir", "MONSTER_LOG_DIR", "{home}/logs", _path, "Rotating log files. Server: /var/log/monster-ai.", "Runtime"),
+    Var("log_dir", "MONSTER_LOG_DIR", "{home}/logs", _path,
+        "Daily log files (<role>-YYYY-MM-DD.log plus errors-YYYY-MM-DD.log). Server: /var/log/monster-ai.", "Runtime"),
     Var("db_path", "MONSTER_DB_PATH", "{data_dir}/monster.db", _path, "SQLite database file.", "Runtime"),
     Var("models_dir", "MONSTER_MODELS_DIR", "{data_dir}/models", _path, "Approved model artifacts.", "Runtime"),
     Var("cache_dir", "MONSTER_CACHE_DIR", "{data_dir}/cache", _path, "Disposable cache (size-limited).", "Runtime"),
     Var("backup_dir", "MONSTER_BACKUP_DIR", "{data_dir}/backups", _path, "Database backups.", "Runtime"),
-    Var("timezone", "MONSTER_TIMEZONE", "Asia/Kolkata", _str, "Display timezone (exchange logic is always IST).", "Runtime"),
+    Var("timezone", "MONSTER_TIMEZONE", "Asia/Kolkata", _str,
+        "Time zone of log stamps and operator-facing displays; always printed with an explicit UTC offset. The server's own "
+        "zone is never used, exchange logic is always IST and storage is always UTC.", "Runtime"),
     # -- telegram ----------------------------------------------------------------------------------
     Var("telegram_bot_token", "TELEGRAM_BOT_TOKEN", "", _opt_str, "Bot token from @BotFather.", "Telegram", True),
     Var("telegram_chat_id", "TELEGRAM_CHAT_ID", "", _opt_str,
@@ -197,6 +202,25 @@ VARS: tuple[Var, ...] = (
     # -- storage / backups -------------------------------------------------------------------------------------
     Var("backup_keep_daily", "BACKUP_KEEP_DAILY", "7", _int, "Daily backups retained.", "Storage"),
     Var("backup_keep_weekly", "BACKUP_KEEP_WEEKLY", "4", _int, "Weekly backups retained.", "Storage"),
+    Var("backup_max_mb", "BACKUP_MAX_MB", "1500", _int,
+        "Size budget of the local backup folder: the oldest backups beyond the daily / weekly policy are dropped until it fits "
+        "(the newest is always kept). 0 = no budget.", "Storage"),
+    Var("data_max_mb", "DATA_MAX_MB", "4000", _int,
+        "Size budget of the whole data directory (database, models, backups, cache). Above 80 % health warns; above 100 % "
+        "the optional data is trimmed harder. 0 = no budget.", "Storage"),
+    Var("event_retention_days", "EVENT_RETENTION_DAYS", "1100", _int,
+        "Structured news events are kept this long (about 3 years). 0 = forever.", "Storage"),
+    Var("quote_retention_days", "QUOTE_RETENTION_DAYS", "400", _int,
+        "Pre-open / live quote rows and the economic calendar are kept this long. Intermediate pre-open polls are thinned to "
+        "the last one per symbol and day after 14 days. 0 = forever.", "Storage"),
+    Var("record_retention_days", "RECORD_RETENTION_DAYS", "1825", _int,
+        "Frozen snapshots, predictions, outcomes and evaluation metrics are kept this long (5 years). 0 = forever.", "Storage"),
+    Var("ops_retention_days", "OPS_RETENTION_DAYS", "180", _int,
+        "Job runs, delivery records and undelivered alerts are kept this long (delivered alerts half of it). 0 = forever.", "Storage"),
+    Var("log_retention_days", "LOG_RETENTION_DAYS", "30", _int,
+        "Daily log files older than this are deleted (the journal keeps its own two-week window). Minimum 1.", "Storage"),
+    Var("log_max_mb", "LOG_MAX_MB", "150", _int,
+        "Size budget of the whole log directory; the oldest files go first, today's files are never removed. 0 = no budget.", "Storage"),
     Var("backup_passphrase", "BACKUP_PASSPHRASE", "", _opt_str, "If set, backups are gpg-encrypted (AES256).", "Storage", True),
     Var("s3_endpoint_url", "S3_ENDPOINT_URL", "", _opt_str, "S3-compatible endpoint (AWS, R2, B2, MinIO, Spaces).", "Storage"),
     Var("s3_bucket", "S3_BUCKET", "", _opt_str, "Bucket for off-box backups / cold archive / artifacts.", "Storage"),
@@ -223,6 +247,7 @@ class Settings:
     env: str = "production"
     mode: str = "shadow"
     log_level: str = "INFO"
+    log_format: str = "text"
     home: Path = HOME_DEFAULT
     data_dir: Path = HOME_DEFAULT / "data" / "runtime"
     log_dir: Path = HOME_DEFAULT / "logs"
@@ -289,6 +314,14 @@ class Settings:
     min_news_model_days: int = 120
     backup_keep_daily: int = 7
     backup_keep_weekly: int = 4
+    backup_max_mb: int = 1500
+    data_max_mb: int = 4000
+    event_retention_days: int = 1100
+    quote_retention_days: int = 400
+    record_retention_days: int = 1825
+    ops_retention_days: int = 180
+    log_retention_days: int = 30
+    log_max_mb: int = 150
     backup_passphrase: str | None = None
     s3_endpoint_url: str | None = None
     s3_bucket: str | None = None
@@ -489,6 +522,14 @@ def validate(s: Settings) -> list[str]:
         problems.append(f"unknown MONSTER_TIMEZONE {s.timezone!r}")
     if s.telegram_bot_token and not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", s.telegram_bot_token):
         problems.append("TELEGRAM_BOT_TOKEN does not look like a BotFather token (123456:ABC...)")
+    for name in ("backup_max_mb", "data_max_mb", "event_retention_days", "quote_retention_days", "record_retention_days",
+                 "ops_retention_days", "log_max_mb"):
+        if getattr(s, name) < 0:
+            problems.append(f"{name.upper()} must not be negative (0 = unlimited)")
+    if s.log_retention_days < 1:
+        problems.append("LOG_RETENTION_DAYS must be at least 1")
+    if s.data_max_mb and s.backup_max_mb and s.backup_max_mb >= s.data_max_mb:
+        problems.append("BACKUP_MAX_MB must be smaller than DATA_MAX_MB (the backups live inside the data directory)")
     return problems
 
 

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import hashlib
 
-FEATURE_VERSION = "fv1"
+# Bump whenever the MEANING of a feature changes (not only its name or the column set): a model trained on the old semantics
+# must never score features built with the new ones - the registry refuses it and the scan falls back to the baseline.
+# fv2: relative volume excludes the session from its baseline; similar-day features use fixed candidate and standardisation
+#      windows; stale global series are blank and ``g_cover`` counts series; ``c_days_to_results`` is capped at 10 sessions;
+#      ``s_disp1`` is leave-one-out; ``c_n`` removed.
+FEATURE_VERSION = "fv2"
 
 GROUPS: dict[str, str] = {
     "t_": "technical",

@@ -162,6 +162,92 @@ def test_unknown_available_memory_does_not_block_jobs(env, monkeypatch):
     assert env.s._ram_ok(0.0) is True
 
 
+def test_heavy_jobs_wait_for_disk_space_but_critical_ones_never_do(env, monkeypatch):
+    monkeypatch.setattr(sched, "memory_info", lambda: {"available_mb": 4000.0})
+    monkeypatch.setattr(sched, "disk_info", lambda path: {"free_mb": 100.0, "total_mb": 8000.0, "used_mb": 7900.0})
+    env.clock.set(ist(2026, 11, 1, 4, 5))  # Sunday: the caught-up weekly training (heavy) is the only job due
+    env.s.tick()
+    assert env.launcher.started == [] and env.s._last["disk_warn"] > -1e9  # deferred, and said so
+    warned_at = env.s._last["disk_warn"]
+    env.clock.advance(5)
+    env.s.tick()
+    assert env.s._last["disk_warn"] == warned_at  # the warning is rate limited
+    monkeypatch.setattr(sched, "disk_info", lambda path: {"free_mb": 5000.0, "total_mb": 8000.0, "used_mb": 3000.0})
+    env.clock.advance(5)
+    env.s.tick()
+    assert [h.due.entry.job for h in env.launcher.started] == ["train"]
+
+
+# ----------------------------------------------------------------------- heartbeat vs. a busy database
+def test_the_watchdog_and_the_heartbeat_file_survive_a_locked_database(env, monkeypatch, caplog):
+    import logging
+    import sqlite3
+
+    from automation.health import HEARTBEAT_KEY, read_heartbeat_file
+
+    real = env.store.kv_set
+
+    def locked(key, value):
+        if key == HEARTBEAT_KEY:
+            raise sqlite3.OperationalError("database is locked")  # a VACUUM holds the writer lock
+        return real(key, value)
+
+    monkeypatch.setattr(env.store, "kv_set", locked)
+    with caplog.at_level(logging.WARNING, logger="automation.scheduler"):
+        env.s.tick()  # must not raise
+        env.clock.advance(sched.HEARTBEAT_EVERY_SEC + 1)
+        env.s.tick()
+    assert sum(note.startswith("WATCHDOG=1") for note in env.notes) == 2  # systemd heard the daemon both times
+    assert read_heartbeat_file(env.s.settings.data_dir) == env.clock.now()
+    assert sum("heartbeat not stored in the database" in r.message for r in caplog.records) == 1  # rate limited
+    assert env.store.kv_get(HEARTBEAT_KEY) is None
+
+
+def test_the_database_heartbeat_never_waits_the_full_busy_timeout(env, monkeypatch):
+    from automation.health import HEARTBEAT_KEY
+
+    seen = {}
+    real = env.store.kv_set
+
+    def spy(key, value):
+        if key == HEARTBEAT_KEY:
+            seen["during"] = env.store.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        return real(key, value)
+
+    before = env.store.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    monkeypatch.setattr(env.store, "kv_set", spy)
+    env.s.tick()
+    assert seen["during"] == sched.HEARTBEAT_DB_WAIT_MS < before
+    assert env.store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == before  # restored for everything else
+    assert env.store.kv_get(HEARTBEAT_KEY) == "2026-11-01T23:30:00Z"  # Monday 05:00 IST
+
+
+# ------------------------------------------------------------------------------------ unclean restarts
+def test_an_unclean_stop_is_reported_once_and_a_clean_one_is_not(env):
+    s, store = env.s, env.store
+    s._register_start(env.clock.now())
+    assert store.pending_alerts(10) == [] and store.kv_get_json(sched.RUN_STATE_KEY)["state"] == "running"  # first ever start
+
+    env.clock.advance(3600)
+    s._register_start(env.clock.now())  # the previous process never marked itself stopped
+    alerts = [a for a in store.pending_alerts(10) if a["code"] == "daemon_restarted"]
+    assert len(alerts) == 1 and "unclean stop" in alerts[0]["message"] and "1 unclean restarts" in alerts[0]["message"]
+    assert store.kv_get("daemon.unclean_restarts") == "1"
+
+    env.clock.advance(60)
+    s._register_start(env.clock.now())  # a crash loop: counted, but the alert is deduplicated
+    assert store.kv_get("daemon.unclean_restarts") == "2"
+    assert len([a for a in store.pending_alerts(10) if a["code"] == "daemon_restarted"]) == 1
+
+    s.stop_requested = True
+    s.run_forever()  # starts (running -> alert path), loops zero times, shuts down cleanly
+    assert store.kv_get_json(sched.RUN_STATE_KEY)["state"] == "stopped"
+    store.conn.execute("DELETE FROM alerts")
+    s._register_start(env.clock.now())  # after a clean stop nothing is reported
+    assert store.pending_alerts(10) == []
+    assert "READY=1" in env.notes and "STOPPING=1" in env.notes
+
+
 def test_a_job_that_cannot_be_started_is_recorded_as_failed(env):
     class Broken(FakeLauncher):
         def start(self, due):

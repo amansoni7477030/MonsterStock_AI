@@ -31,6 +31,10 @@ from features.technical import TRADING_DAYS, ema, stock_features
 
 log = logging.getLogger(__name__)
 
+# Features that describe the whole market (one value per date): they form ``FeatureSet.market`` next to the per-stock matrix.
+MARKET_PREFIXES = ("m_", "g_", "c_dow", "c_month")
+MARKET_NAMES = ("x_sim_dist_mean", "x_sim_n")  # similar-day match quality and number of matches (x_sim_nvalid is per stock)
+
 
 @dataclass
 class Panel:
@@ -200,7 +204,9 @@ def build_feature_set(
 
     # --- static descriptors ---------------------------------------------------------------------------------------
     cols.add("u_sector_code", np.tile(np.array([sector_code(panel.sectors.get(s)) for s in symbols], dtype=np.float32), len(out_dates)))
-    cols.add("u_is_fno", np.tile(np.array([float(panel.is_fno.get(s, 0)) for s in symbols], dtype=np.float32), len(out_dates)))
+    pit_fno = getattr(panel, "is_fno_pit", None)  # point-in-time membership from the loader; hand-built panels keep the static flag
+    cols.add("u_is_fno", _f32(pit_fno, rows).reshape(-1) if pit_fno is not None
+             else np.tile(np.array([float(panel.is_fno.get(s, 0)) for s in symbols], dtype=np.float32), len(out_dates)))
     cov250 = ret1.rolling(TRADING_DAYS, min_periods=120).cov(mkt_ret1)
     var250 = mkt_ret1.rolling(TRADING_DAYS, min_periods=120).var()
     add_stock("u_beta250", cov250.div(var250, axis=0))
@@ -224,8 +230,7 @@ def build_feature_set(
     volreg = market_arrays.get("m_volreg")
     target_rows = list(range(rows.start or 0, rows.stop if rows.stop is not None else n_dates)) if row_slice else None
     sim_stock, sim_market = sd.similar_day_features(
-        full_vectors, label_arrays, k=30, min_history=120, volreg=volreg.to_numpy(dtype=np.float32) if volreg is not None else None,
-        rows=target_rows,
+        full_vectors, label_arrays, volreg=volreg.to_numpy(dtype=np.float32) if volreg is not None else None, rows=target_rows,
     )
     for name, matrix in sim_stock.items():
         cols.add(name, matrix[rows].reshape(-1))
@@ -240,7 +245,7 @@ def build_feature_set(
         label_frame = pd.DataFrame({k: _f32(v, rows).reshape(-1) for k, v in labels.items()}, index=index)
 
     market_frame = pd.DataFrame({name: cols.per_date(name) for name in cols.names
-                                 if name.startswith(("m_", "g_", "c_dow", "c_month", "x_sim_d"))}, index=out_dates)
+                                 if name.startswith(MARKET_PREFIXES) or name in MARKET_NAMES}, index=out_dates)
     return FeatureSet(x, label_frame, market_frame, stage)
 
 

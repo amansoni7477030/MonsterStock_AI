@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -13,10 +15,18 @@ from app.config import Settings
 from app.resources import release_memory
 from automation.calendar import ExchangeCalendar
 from database.store import Store
-from features.builder import FeatureSet, build_feature_set
+from features import similar_day
+from features.builder import FeatureSet, Panel, build_feature_set
+from features.calendar_features import RESULTS_HORIZON, next_trading_days
 from features.loader import load_panel
 
-LIVE_HISTORY_DAYS = 560  # calendar days: covers 252-session windows plus similar-day matching warm-up
+log = logging.getLogger(__name__)
+
+# NSE holds ~248 sessions in 365 days (1.47 calendar days each); the margin covers holiday clusters and the sessions the loader drops
+CALENDAR_DAYS_PER_SESSION = 1.6
+# Calendar days a live scan loads: enough sessions for every date's similar-day features to equal the ones training computes
+# from the full history (see similar_day.HISTORY_SESSIONS), which also covers every 252-session rolling window.
+LIVE_HISTORY_DAYS = math.ceil(similar_day.HISTORY_SESSIONS * CALENDAR_DAYS_PER_SESSION)
 
 
 def cutoff_hhmm(settings: Settings, stage: str) -> str:
@@ -33,6 +43,15 @@ class LiveFeatures:
     X_pre: pd.DataFrame | None = None  # same stocks without pre-open features (fallback for names lacking a gap)
     market: dict[str, Any] = field(default_factory=dict)
     last_bar: str | None = None
+
+
+def _with_results_horizon(panel: Panel, calendar: ExchangeCalendar) -> Panel:
+    """Make the panel carry ``RESULTS_HORIZON`` upcoming sessions: ``c_days_to_results`` looks that far ahead, in training and
+    in live scans alike (the loader supplies only a few)."""
+    if len(panel.dates) and len(panel.future_dates) < RESULTS_HORIZON:
+        panel.future_dates = next_trading_days(panel.dates[-1].date(), RESULTS_HORIZON, calendar.is_trading_day)
+        panel.next_after_last = panel.future_dates[0]
+    return panel
 
 
 def build_live_features(
@@ -55,6 +74,11 @@ def build_live_features(
     panel = load_panel(store, start=start, end=end, symbols=symbols, today=trade_date, live_open=live_open, calendar=calendar)
     if not len(panel.dates) or panel.dates[-1].date() != trade_date:
         raise ValueError("panel has no row for the trade date")
+    if len(panel.dates) - 1 < similar_day.HISTORY_SESSIONS:
+        log.warning("only %d sessions of history before %s (similar-day features need %d to match training's): "
+                    "they will differ from the ones the model was trained on", len(panel.dates) - 1, trade_date,
+                    similar_day.HISTORY_SESSIONS)
+    _with_results_horizon(panel, calendar)
     last_row = slice(len(panel.dates) - 1, len(panel.dates))
     fs = build_feature_set(panel, stage=stage, thresholds=settings.range_thresholds, unusual_k=settings.unusual_k,
                            cutoff_hhmm=cutoff_hhmm(settings, stage), with_labels=False, row_slice=last_row)
@@ -76,9 +100,13 @@ def build_training_features(
 
     The market-data panel is released before returning: only the feature matrix is needed afterwards, and on the 1 GB
     server both cannot be resident while the models train."""
+    # 420 days (~290 sessions) of history behind the first emitted row: every 252-session window is full. The similar-day features of
+    # the first ~240 rows then see a shallower pool and shorter statistics than ``similar_day.HISTORY_SESSIONS`` (a live scan
+    # always has the full amount; later rows are identical). Loading the rest costs ~35 MB of peak memory at 5 years x 220 stocks,
+    # which the 1 GB server cannot spare, so that small warm-up difference is accepted.
     start = (end - timedelta(days=int(years * 365.25) + 420)).isoformat()
-    panel = load_panel(store, start=start, end=end.isoformat(), calendar=calendar,
-                       fno_start=(end - timedelta(days=int(years * 365.25) + 420)).isoformat())
+    panel = load_panel(store, start=start, end=end.isoformat(), calendar=calendar, fno_start=start)
+    _with_results_horizon(panel, calendar)
     keep_from = max(0, len(panel.dates) - int(years * 252))
     fs = build_feature_set(panel, stage=stage, thresholds=settings.range_thresholds, unusual_k=settings.unusual_k,
                            cutoff_hhmm=cutoff_hhmm(settings, stage), with_labels=True, row_slice=slice(keep_from, len(panel.dates)))

@@ -5,10 +5,11 @@ from __future__ import annotations
 import csv
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.clock import get_clock, ist_date
 from app.config import Settings
 from app.errors import DataUnavailable
 from database.store import Store
@@ -16,6 +17,8 @@ from ingestion.nse import NseArchive
 from ingestion.registry import tracked
 
 log = logging.getLogger(__name__)
+
+LIQUIDITY_WINDOW_DAYS = 45  # calendar days of traded value that rank names when the universe has to be capped
 
 
 @dataclass
@@ -75,7 +78,8 @@ def select_symbols(rows: list[dict[str, Any]], settings: Settings) -> list[str]:
 def build_universe(
     store: Store, settings: Settings, archive: NseArchive | None, as_of: date,
 ) -> UniverseResult:
-    """Refresh instruments and the active universe. Source order: NSE official lists, shipped seed, existing DB."""
+    """Refresh instruments and the active universe. Source order: NSE official lists, shipped seed, existing DB.
+    ``as_of`` is the IST date the refresh is for; membership history and the liquidity ranking are anchored on it."""
     notes: list[str] = []
     rows: list[dict[str, Any]] = []
     source = "nse"
@@ -112,20 +116,25 @@ def build_universe(
     active = {r["symbol"] for r in store.list_instruments(kind="equity", status="active")}
     selected = [s for s in selected if s in active]
     if len(selected) > settings.universe_max_size:
-        selected = _cap_by_liquidity(store, selected, settings.universe_max_size, rows)
+        selected = _cap_by_liquidity(store, selected, settings.universe_max_size, rows, as_of)
         notes.append(f"universe capped at {settings.universe_max_size}")
     summary = store.set_universe(selected, as_of=as_of.isoformat())
     log.info("universe: %d symbols (%s) added=%d removed=%d", len(selected), source, summary["added"], summary["removed"])
     return UniverseResult(sorted(selected), source, summary["added"], summary["removed"], notes)
 
 
-def _cap_by_liquidity(store: Store, symbols: list[str], cap: int, rows: list[dict[str, Any]]) -> list[str]:
-    """Keep the most liquid names (20-day median traded value) and fall back to F&O / Nifty 100 membership."""
+def _cap_by_liquidity(
+    store: Store, symbols: list[str], cap: int, rows: list[dict[str, Any]], as_of: date | None = None
+) -> list[str]:
+    """Keep the most liquid names (mean traded value over the ``LIQUIDITY_WINDOW_DAYS`` calendar days up to ``as_of``) and fall
+    back to F&O / Nifty 100 membership. ``as_of`` is an IST trading date; without one the injected clock's IST date is used.
+    The SQL clock is never consulted: it ignores both the injected clock and the server timezone."""
     flags = {r["symbol"]: (r["nifty100"], r["is_fno"]) for r in rows}
     turnover: dict[str, float] = {}
+    since = ((as_of or ist_date(get_clock().now())) - timedelta(days=LIQUIDITY_WINDOW_DAYS)).isoformat()
     for row in store.conn.execute(
         "SELECT i.symbol AS symbol, AVG(b.turnover) AS t FROM bars_daily b JOIN instruments i USING (instrument_id) "
-        "WHERE i.kind = 'equity' AND b.turnover IS NOT NULL AND b.trade_date >= date('now', '-45 day') GROUP BY i.symbol"
+        "WHERE i.kind = 'equity' AND b.turnover IS NOT NULL AND b.trade_date >= ? GROUP BY i.symbol", (since,)
     ).fetchall():
         turnover[row["symbol"]] = float(row["t"] or 0.0)
     return sorted(symbols, key=lambda s: (-turnover.get(s, 0.0), -int(flags.get(s, (False, False))[0]),

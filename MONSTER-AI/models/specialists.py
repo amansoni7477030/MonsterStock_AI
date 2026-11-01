@@ -51,7 +51,7 @@ SPECIALIST_BY_NAME = {s.name: s for s in SPECIALISTS}
 META_CONTEXT = (
     "t_atr14_pct", "t_range_mean20", "t_range_med20", "t_rv20", "t_range_prev", "m_volreg", "m_trend", "m_risk",
     "u_sector_code", "u_is_fno", "t_log_tv", "c_dow", "m_expiry_share", "x_sim_hit2", "x_sim_hit3", "x_sim_unusual",
-    "x_sim_range_mean", "x_sim_range_q90", "x_sim_dist_mean", "p_gap_abs", "p_gap_atr",
+    "x_sim_range_mean", "x_sim_range_q90", "x_sim_dist_mean", "x_sim_nvalid", "p_gap_abs", "p_gap_atr",
 )
 
 

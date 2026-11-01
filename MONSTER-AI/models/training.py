@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.clock import iso
+from app.clock import get_clock, iso, to_utc
 from app.resources import release_memory
 from backtesting import metrics as M
 from features.builder import FeatureSet
@@ -333,10 +333,12 @@ def train_stage(
     reliability: dict[str, Any] = {}
     head_metrics: dict[str, Any] = {}
     base_rates: dict[str, float] = {}
+    first_hold = int(hold_days[0])
     for head in cls_heads:
-        y_all = mlabels["y_unusual" if head == "unusual" else f"y_{head}"]
+        label = "y_unusual" if head == "unusual" else f"y_{head}"
+        y_all = mlabels[label]
         p = meta_oof[f"cls:{head}"]
-        base_rates[head] = float(np.nanmean(labels["y_unusual" if head == "unusual" else f"y_{head}"]))
+        base_rates[head] = prior_base_rate(labels[label], day_ids, first_hold)
         cal_eval = fit_calibrator(p[fit_part], y_all[fit_part])
         head_metrics[head] = M.summarize_binary(cal_eval.transform(p[hold]), y_all[hold], base_rates[head])
         head_metrics[head]["calibrator"] = cal_eval.kind
@@ -349,11 +351,11 @@ def train_stage(
         known = np.isfinite(p_up) & np.isfinite(y_up)
         f2, h2 = known & fit_part, known & hold
         cal_up = fit_calibrator(p_up[f2], y_up[f2]) if f2.sum() >= 300 else Calibrator("identity")
-        head_metrics["up"] = M.summarize_binary(cal_up.transform(p_up[h2]), y_up[h2], float(np.nanmean(labels["y_up"])))
+        base_rates["up"] = prior_base_rate(labels["y_up"], day_ids, first_hold)
+        head_metrics["up"] = M.summarize_binary(cal_up.transform(p_up[h2]), y_up[h2], base_rates["up"])
         head_metrics["up"]["accuracy"] = float(np.mean((cal_up.transform(p_up[h2]) > 0.5) == (y_up[h2] > 0.5))) if h2.any() else float("nan")
         cal_deploy["up"] = fit_calibrator(p_up[known], y_up[known])
         reliability["up"] = M.reliability_table(cal_up.transform(p_up[h2]), y_up[h2]).to_dict("records")
-        base_rates["up"] = float(np.nanmean(labels["y_up"]))
 
     quant_metrics: dict[str, Any] = {}
     for key, pred in meta_oof.items():
@@ -397,8 +399,7 @@ def train_stage(
         score=meta_oof[f"cls:{primary}"], to_p=cal_deploy[primary].transform, day=mday, hold=hold, std=std, spread=spread,
         dist_all=dist, meta_rows=meta_rows, Xv=Xv, names=names, stats=stats, scales=unc_scales, top_n=cfg.top_n))
 
-    created = iso(now) if now else iso(datetime.now().astimezone())
-    version = f"m-{(now or datetime.now().astimezone()).strftime('%Y%m%d-%H%M%S')}-{cfg.stage}"
+    created, version = version_stamp(cfg.stage, now)
     flat_rate = float(np.nanmean(np.abs(labels["y_dir"]) < 1e-9)) if "y_dir" in labels else 0.0
     meta = {
         "version": version, "stage": cfg.stage, "status": status, "created_at": created, "feature_version": FEATURE_VERSION,
@@ -420,6 +421,19 @@ def train_stage(
                  feature_stats=stats)
     say("done", 1.0)
     return TrainResult(version, cfg.stage, status, out_dir / version, metrics, gates, meta, time.monotonic() - started, notes)
+
+
+def version_stamp(stage: str, now: datetime | None = None) -> tuple[str, str]:
+    """(created_at, version) of a model trained at ``now`` (default: the application clock). Both are UTC, so the same
+    instant gives the same version on any server whatever its time zone. A naive ``now`` is rejected, not guessed."""
+    moment = to_utc(now if now is not None else get_clock().now())
+    return iso(moment) or "", f"m-{moment:%Y%m%d-%H%M%S}-{stage}"
+
+
+def prior_base_rate(label: np.ndarray, day_ids: np.ndarray, first_holdout_day: int) -> float:
+    """Base rate of a 0/1 label over the TRAINING days, those strictly before the holdout: the climatology a forecaster had when
+    the holdout began. Brier skill is measured against it, so the holdout's own frequency must not shape the reference."""
+    return float(np.nanmean(label[day_ids < first_holdout_day]))
 
 
 def _p(values: np.ndarray, pct: float, default: float) -> float:

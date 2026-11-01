@@ -8,6 +8,7 @@ to say "no high-conviction setup" instead of forcing five names.
 
 from __future__ import annotations
 
+import logging
 import math
 import zlib
 from collections import Counter
@@ -22,6 +23,8 @@ from app.config import Settings
 from ranking.costs import estimate_round_trip_cost_pct
 from ranking.signals import confirmations, contradictions, data_quality_notes, priced_in
 from ranking.types import TIER_ORDER, Candidate, Catalyst
+
+log = logging.getLogger(__name__)
 
 TIER_BY_RANK = {v: k for k, v in TIER_ORDER.items()}
 
@@ -45,6 +48,9 @@ class RankInput:
     explainer: Any = None  # callable(symbol) -> list[str]
     # symbol -> (STRONG, MODERATE) uncertainty ceilings learned by the model that scored it; absent = configured constants
     uncertainty_ceilings: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+    # symbol -> the specialist-disagreement limit of the model that scored it (models.inference.disagreement_limit);
+    # absent = the fixed default of ranking.signals
+    spec_std_limits: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -147,10 +153,11 @@ def describe_blockers(blockers: Mapping[str, int], total: int, cfg: Settings) ->
     return "; ".join(f"{BLOCKER_TEXT[key].format(moderate_p=cfg.tier_moderate_p)} ({n} of {total})" for key, n in ordered)
 
 
-def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> RankResult:
-    top_n = top_n or settings.top_n
-    feats, preds = inp.features, inp.preds.reindex(inp.features.index)
-    elig, reasons = eligibility(feats, inp.last_close, settings)
+def _candidate_pool(feats: pd.DataFrame, preds: pd.DataFrame, last_close: Mapping[str, float], settings: Settings,
+                    ) -> tuple[pd.DataFrame, pd.Series, dict[str, int], pd.DataFrame, pd.Series]:
+    """The names a report may list, best first: eligible (liquid, priced, enough history), cheap enough to trade relative to their
+    expected range, with a probability. Returns (table, eligibility, exclusion counts, ordered pool, turnover)."""
+    elig, reasons = eligibility(feats, last_close, settings)
     excluded: dict[str, int] = reasons[~elig].value_counts().to_dict()
     table = pd.DataFrame(index=feats.index)
     table["p_primary"] = preds["p_primary"]
@@ -171,6 +178,22 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
     pool = table[in_pool].copy()
     pool["raw"] = preds.get("p_raw_primary", preds["p_primary"]).reindex(pool.index)
     pool = pool.sort_values(["p_primary", "raw", "rng_q50", "uncertainty"], ascending=[False, False, False, True], kind="mergesort")
+    return table, elig, excluded, pool, turnover
+
+
+def enrichment_pool(features: pd.DataFrame, preds: pd.DataFrame, last_close: Mapping[str, float], settings: Settings,
+                    n: int) -> list[str]:
+    """The ``n`` best names the ranking can actually list - the ones worth the (slow) news / event-graph enrichment. Taken AFTER
+    the eligibility and cost filters: picking the best-scored names first would spend the enrichment on illiquid stocks the
+    ranking then drops, and leave the final top names without catalysts."""
+    pool = _candidate_pool(features, preds.reindex(features.index), last_close, settings)[3]
+    return list(pool.index[:n])
+
+
+def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> RankResult:
+    top_n = top_n or settings.top_n
+    feats, preds = inp.features, inp.preds.reindex(inp.features.index)
+    table, elig, excluded, pool, turnover = _candidate_pool(feats, preds, inp.last_close, settings)
 
     candidates: list[Candidate] = []
     blockers: Counter[str] = Counter()
@@ -181,7 +204,8 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
         pr = preds.loc[symbol]
         events = inp.catalysts.get(symbol, [])
         spec_std = _round(preds.loc[symbol].get("sp_std_unusual"), 4) if "sp_std_unusual" in preds else None
-        contra = contradictions(row, events, _round(pr["uncertainty"], 3), spec_std)
+        contra = contradictions(row, events, _round(pr["uncertainty"], 3), spec_std,
+                                spec_std_limit=inp.spec_std_limits.get(symbol))
         notes = data_quality_notes(row, bool(inp.instruments.get(symbol, {}).get("is_fno")), inp.stage)
         dq_warning = bool(notes) or inp.quality_status != "ok"
         p_symbol, unc_symbol, ceilings = float(pr["p_primary"]), float(pr["uncertainty"]), inp.uncertainty_ceilings.get(symbol)
@@ -203,7 +227,9 @@ def rank(inp: RankInput, settings: Settings, *, top_n: int | None = None) -> Ran
         if inp.explainer is not None:
             try:
                 drivers = list(inp.explainer(symbol))
-            except Exception:  # noqa: BLE001 - explanations are diagnostic; never block a report
+            except Exception as exc:  # noqa: BLE001 - explanations are diagnostic; never block a report
+                log.warning("explanation unavailable for %s (%s: %s); the report lists it without drivers", symbol,
+                            type(exc).__name__, exc)
                 drivers = []
         p_dict, range_dict = p_and_range(pr)
         candidates.append(

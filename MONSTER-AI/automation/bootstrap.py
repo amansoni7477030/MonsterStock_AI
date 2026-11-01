@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from app.clock import IST, iso
+from app.clock import IST, iso, ist_date
 from app.errors import DataUnavailable
 from app.logging_setup import redact
 from automation import jobs, scan
@@ -94,7 +94,7 @@ def run_bootstrap(ctx: JobContext, *, resume: bool = True, skip_train: bool = Fa
         return "done", f"{written} calendar rows seeded"
 
     def universe() -> tuple[str, str]:
-        result = build_universe(store, s, ctx.nse_archive() if s.nse_enabled else None, ctx.clock.now().date())
+        result = build_universe(store, s, ctx.nse_archive() if s.nse_enabled else None, ist_date(ctx.clock.now()))
         graph = ctx.intel().reseed_graph()  # sector memberships follow the instrument master
         note = f"{len(result.symbols)} symbols from {result.source}"
         if graph:
@@ -154,7 +154,7 @@ def run_bootstrap(ctx: JobContext, *, resume: bool = True, skip_train: bool = Fa
     def board_meetings() -> tuple[str, str]:
         if not s.nse_enabled:
             return "skipped", "NSE_ENABLED=false"
-        today = ctx.clock.now().date()
+        today = ist_date(ctx.clock.now())
         symbols = set(jobs.universe_symbols(ctx))
         total = 0
         start = today - timedelta(days=3 * 365)

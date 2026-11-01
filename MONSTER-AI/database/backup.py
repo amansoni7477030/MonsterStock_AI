@@ -1,7 +1,8 @@
 """Consistent, verified, rotated SQLite backups.
 
 Uses SQLite's online backup API (safe while the writer is active), verifies the copy with a full
-``integrity_check`` before accepting it, writes a SHA-256 sidecar, and rotates daily + weekly generations.
+``integrity_check`` before accepting it, writes a SHA-256 sidecar, and rotates daily + weekly generations (plus an optional
+total size budget, so a growing database can never fill the disk with backups).
 Restore verifies before touching the live database and keeps the bad file aside for forensics.
 """
 
@@ -105,6 +106,35 @@ def retained_names(names: list[str], keep_daily: int, keep_weekly: int) -> set[s
     return {p.name for p in _retention(paths, keep_daily, keep_weekly)}
 
 
+def _backup_size(path: Path) -> int:
+    sidecar = path.with_name(path.name + ".sha256")
+    return path.stat().st_size + (sidecar.stat().st_size if sidecar.exists() else 0)
+
+
+def enforce_budget(backup_dir: str | Path, max_mb: float, *, keep_newest: int = 1, dry_run: bool = False) -> list[str]:
+    """Drop the oldest backups until the folder fits ``max_mb`` (0 = no budget). The newest ``keep_newest`` are never removed,
+    even when they alone exceed the budget (a too-small budget must not leave the server without any backup)."""
+    if max_mb <= 0:
+        return []
+    backups = list_backups(backup_dir)  # oldest first
+    sizes = {p: _backup_size(p) for p in backups if p.exists()}
+    total = sum(sizes.values()) / 1048576.0
+    removable = backups[:-keep_newest] if keep_newest > 0 else backups
+    removed: list[str] = []
+    for path in removable:
+        if total <= max_mb:
+            break
+        if not dry_run:
+            for victim in (path, path.with_name(path.name + ".sha256")):
+                with contextlib.suppress(OSError):
+                    victim.unlink()
+        total -= sizes.get(path, 0) / 1048576.0
+        removed.append(path.name)
+    if total > max_mb:
+        log.warning("backups use %.0f MB, above the %.0f MB budget, but the newest %d must stay", total, max_mb, keep_newest)
+    return removed
+
+
 def backup_database(
     db_path: str | Path,
     backup_dir: str | Path,
@@ -113,6 +143,7 @@ def backup_database(
     keep_weekly: int = 4,
     passphrase: str | None = None,
     clock: Clock | None = None,
+    max_total_mb: float = 0.0,
 ) -> BackupResult:
     source = Path(db_path)
     target_dir = Path(backup_dir)
@@ -173,6 +204,7 @@ def backup_database(
                 with contextlib.suppress(OSError):
                     victim.unlink()
             pruned.append(path.name)
+    pruned += enforce_budget(target_dir, max_total_mb)
     log.info("backup written %s (%d bytes, encrypted=%s, pruned=%d)", final.name, final.stat().st_size, encrypted, len(pruned))
     return BackupResult(final, final.stat().st_size, digest, encrypted, pruned)
 

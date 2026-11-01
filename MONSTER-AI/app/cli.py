@@ -10,6 +10,8 @@ import argparse
 import contextlib
 import json
 import logging
+import os
+import platform
 import shutil
 import subprocess  # noqa: S404 - only journalctl with a fixed argument vector
 import sys
@@ -19,9 +21,10 @@ from pathlib import Path
 from typing import Any
 
 from app import __version__
-from app.clock import get_clock, ist_date
+from app.clock import get_clock, ist_date, pin_process_timezone
 from app.config import ConfigError, Settings, env_example_text, load_settings
-from app.logging_setup import redact, register_secrets, setup_logging
+from app.logging_setup import configure_from_settings, redact, register_secrets
+from app.release import release_id
 
 log = logging.getLogger("app.cli")
 
@@ -36,7 +39,10 @@ def _settings(args: argparse.Namespace) -> Settings:
 
 
 def _logging(settings: Settings, filename: str) -> None:
-    setup_logging(settings.log_dir, settings.log_level, filename=filename, secrets=settings.secrets())
+    configure_from_settings(settings, filename)
+    log.info("start %s: monster-ai %s pid=%d python=%s on %s; env=%s mode=%s; logs in %s (display zone %s, server zone pinned "
+             "to UTC and never used)", Path(filename).stem, release_id(), os.getpid(), platform.python_version(),
+             platform.system(), settings.env, settings.mode, settings.log_dir, settings.timezone)
 
 
 def _open_store(settings: Settings) -> Any:
@@ -56,7 +62,8 @@ def _print_json(payload: Any) -> None:
 
 # --------------------------------------------------------------------------------------------- commands
 def cmd_version(_args: argparse.Namespace) -> int:
-    print(f"monster-ai {__version__}")
+    print(f"monster-ai {__version__}")  # the installer reads only this first line
+    print(f"release {release_id()}")
     return EXIT_OK
 
 
@@ -301,6 +308,96 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return EXIT_OK if result.status == "success" else EXIT_FAIL
 
 
+def cmd_storage(args: argparse.Namespace) -> int:
+    """Where the disk space goes, the retention windows, and (with --prune) a retention run right now."""
+    from app.locks import job_lock
+    from automation.retention import run_retention, storage_json, storage_report, storage_text
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    store = _open_store(settings)
+    try:
+        if args.prune or args.dry_run:
+            lock = job_lock(settings.data_dir, "housekeeping")
+            if not lock.acquire(blocking=False):
+                print("the nightly housekeeping is running right now; try again in a few minutes", file=sys.stderr)
+                return EXIT_BUSY
+            try:
+                report = run_retention(store, settings, dry_run=args.dry_run, force_vacuum=args.vacuum)
+            finally:
+                lock.release()
+            print(report.summary())
+            for note in report.notes:
+                print(f"  ! {note}")
+            if args.vacuum and not args.dry_run:
+                print(f"  maintenance: {report.maintenance}")
+            print()
+        print(storage_json(storage_report(store, settings)) if args.json else storage_text(storage_report(store, settings)))
+        return EXIT_OK
+    finally:
+        store.close()
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Read the daily log files without knowing where they are or how they are named."""
+    from app import logview
+
+    settings = _settings(args)  # no logging setup: reading must not create files
+    files = logview.list_log_files(settings.log_dir)
+    if args.list:
+        print(logview.summary(files))
+        return EXIT_OK
+    selected = logview.select_files(files, role=args.role, day=args.date)
+    if not selected:
+        print(f"no '{args.role}' log files" + (f" for {args.date}" if args.date else "") + f" in {settings.log_dir}"
+              + (" (nothing at WARNING or above has been logged yet - good)" if args.role == logview.ERRORS_ROLE else ""))
+        return EXIT_OK
+    since = logview.parse_since(args.since, get_clock().now()) if args.since else None
+    filters = {"min_level": args.level, "job": args.job, "grep": args.grep, "since": since}
+    for record in logview.read_records(selected, limit=args.lines, **filters):
+        print(record.text)
+    if args.follow:
+        keep = _line_filter(args.level, args.grep)
+        with contextlib.suppress(KeyboardInterrupt):
+            logview.follow(lambda: logview.select_files(logview.list_log_files(settings.log_dir), role=args.role, day=args.date),
+                           lambda line: print(line) if keep(line) else None)
+    return EXIT_OK
+
+
+def _line_filter(level: str | None, grep: str | None) -> Any:
+    """Line-level filter for ``--follow``: a continuation line (traceback) follows the decision made for its header."""
+    from app import logview
+
+    floor = logview.LEVELS.index(level.upper()) if level else 0
+    needle = grep.lower() if grep else None
+    state = {"show": True}
+
+    def keep(line: str) -> bool:
+        match = logview.HEADER.match(line)
+        if match:
+            state["show"] = (match["level"] in logview.LEVELS and logview.LEVELS.index(match["level"]) >= floor
+                             and (needle is None or needle in line.lower()))
+        return state["show"]
+
+    return keep
+
+
+def cmd_diag(args: argparse.Namespace) -> int:
+    """One redacted archive with everything needed to understand a failure (versions, doctor, health, jobs, logs)."""
+    from app.diagnostics import build_bundle
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    store = _open_store(settings)
+    try:
+        path = build_bundle(settings, store)
+    finally:
+        store.close()
+    print(path)
+    print("attach this file to the bug report; every secret in it is masked")
+    return EXIT_OK
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     from automation.health import HealthReport, evaluate_health
 
@@ -363,7 +460,9 @@ def cmd_alert_unit(args: argparse.Namespace) -> int:
             return EXIT_OK if outcome.ok or outcome.status == "withheld" else EXIT_FAIL
         finally:
             store.close()
-    except Exception:  # noqa: BLE001 - database problems must not stop the alert
+    except Exception as exc:  # noqa: BLE001 - database problems must not stop the alert
+        log.warning("alert-unit %s: the database path failed (%s: %s); sending the alert directly", unit,
+                    type(exc).__name__, redact(str(exc))[:160])
         client = TelegramClient(settings)
         if client.configured and settings.alert_chat_id:
             client.send_message(settings.alert_chat_id, text)
@@ -492,6 +591,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("health", cmd_health, "system health (exit 0 ok, 1 warnings, 2 critical)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--notify", action="store_true", help="queue and send alerts for problems")
+    p = add("storage", cmd_storage, "disk usage, row counts, retention windows (and --prune to apply them now)")
+    p.add_argument("--prune", action="store_true", help="apply the retention rules now (the nightly housekeeping does this too)")
+    p.add_argument("--dry-run", action="store_true", help="with --prune: only count what would be removed")
+    p.add_argument("--vacuum", action="store_true", help="with --prune: also VACUUM the database to return freed pages")
+    p.add_argument("--json", action="store_true")
+    p = add("logs", cmd_logs, "read the daily logs (default: today's warnings and errors of every process)")
+    p.add_argument("--role", default="errors", help="errors (default), all, daemon, jobs, cli, health, train, bootstrap, dashboard")
+    p.add_argument("--date", help="YYYY-MM-DD in the display zone (default: the newest day)")
+    p.add_argument("-n", "--lines", type=int, default=60, help="how many records (default 60)")
+    p.add_argument("--level", choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), type=str.upper)
+    p.add_argument("--job", help="only records of this job (substring of the job tag)")
+    p.add_argument("--grep", help="only records containing this text (case-insensitive)")
+    p.add_argument("--since", help="only records newer than e.g. 90m, 2h, 1d or an ISO date")
+    p.add_argument("--follow", "-f", action="store_true", help="keep printing new lines (Ctrl-C to stop)")
+    p.add_argument("--list", action="store_true", help="list the log files and their sizes")
+    add("diag", cmd_diag, "write a redacted diagnostics bundle for a bug report")
     p = add("alert-unit", cmd_alert_unit, "send a Telegram alert for a failed systemd unit")
     p.add_argument("unit")
     p = add("telegram-setup", cmd_telegram_setup, "discover the Telegram chat id")
@@ -505,6 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    pin_process_timezone()  # the code never reads the server's zone; this makes any library that does deterministic too
     for stream in (sys.stdout, sys.stderr):  # a legacy console codepage must never crash a command on a "₹" in a headline
         with contextlib.suppress(AttributeError, OSError, ValueError):
             stream.reconfigure(errors="replace")

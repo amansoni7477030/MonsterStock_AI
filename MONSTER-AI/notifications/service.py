@@ -18,7 +18,7 @@ from typing import Any
 from app import jsonutil
 from app.clock import Clock, at_ist, get_clock, iso, parse_date
 from app.errors import DataUnavailable
-from app.logging_setup import redact, register_secret
+from app.logging_setup import exception_site, redact, register_secret
 from notifications import report
 from notifications.telegram import MAX_MESSAGE_CHARS, DeadlineExceeded, TelegramClient, split_message
 from ranking.types import EveningSummary, ReportContext
@@ -310,6 +310,7 @@ class NotificationService:
                 sent_ids.extend(getattr(exc, "message_ids", []))
             except Exception as exc:  # delivery problems must never raise into the scheduler
                 status, reason = "failed", _safe_reason(exc)
+                log.warning("delivery %s [%s] failed unexpectedly: %s at %s", kind, key, reason, exception_site(exc))
             attempts += self._attempts_used()
             if status != "sent":
                 break

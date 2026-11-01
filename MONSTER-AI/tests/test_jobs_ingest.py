@@ -89,6 +89,34 @@ def test_collect_news_reports_unreadable_registry(env, monkeypatch):
     assert jobs.collect_news(ctx_for(env)).status == "failed"
 
 
+def test_filings_window_reaches_back_over_weekends_and_holidays(env):
+    def window(run_key):
+        ctx = ctx_for(env, run_key)
+        ctx.ensure_calendar()
+        return tuple(d.isoformat() for d in jobs.filings_window(ctx))
+
+    assert window("2026-11-02") == ("2026-10-29", "2026-11-02")  # Monday: Friday's after-hours filings are included
+    assert window("2026-11-03") == ("2026-11-01", "2026-11-03")  # Tuesday: from the day before Monday's session
+    assert window("2026-10-31") == ("2026-10-29", "2026-10-31")  # a Saturday run: previous session Friday 30 Oct
+    assert window("2026-11-11") == ("2026-11-08", "2026-11-11")  # Diwali (10 Nov) is no session: Monday 9 Nov is the anchor
+
+
+def test_collect_news_asks_for_the_whole_window(env, monkeypatch):
+    from ingestion import news_sources
+
+    class Recording(FakeNews):
+        def collect_filings(self, nse, start, end, symbols):
+            self.window = (start.isoformat(), end.isoformat())
+            return 3
+
+    monkeypatch.setattr(news_sources, "load_feed_registry", lambda path: ([object()], [{"id": "q"}]))
+    ctx = ctx_for(env, "2026-11-02")
+    ctx._cache["news"] = recording = Recording()
+    result = jobs.collect_news(ctx)
+    assert recording.window == ("2026-10-29", "2026-11-02")
+    assert result.metrics["filings_new"] == 3 and result.metrics["filings_window"] == "2026-10-29..2026-11-02"
+
+
 # --------------------------------------------------------------------------------------------- collect_india
 def test_collect_india_is_a_noop_when_the_session_is_complete(env, monkeypatch):
     monkeypatch.setattr(jobs, "refresh_daily_bars", lambda *a, **k: IngestReport(ok=3))
