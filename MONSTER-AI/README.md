@@ -316,9 +316,10 @@ How to think about them:
 Groq's `gpt-oss` models can search the web through a built-in, server-side tool (`browser_search`). MONSTER AI uses it for one
 purpose: to settle whether an unconfirmed-looking company story is true, denied or old, before the extraction and Jev judge it.
 
-- **Which items.** Company news that is not first-hand (never an exchange filing, an official statement or the company's own release)
-  and that is either a rumour the rules already flagged or a deal, order, fund-raising, court / regulator or management story with
-  enough severity to matter. Macro and sector news, results and dividends are reported everywhere and are never searched for.
+- **Which items.** News about a listed company that is not first-hand (never an exchange filing, an official statement or the company's
+  own release) and that is either a rumour the rules already flagged or a deal, order, fund-raising, court / regulator or management
+  story with enough severity to matter. Macro and sector news, a story in which no listed company is named, results and dividends
+  are reported everywhere or have nothing to look up, and are never searched for.
 - **What it returns.** A small JSON brief, validated field by field before it is used: do independent outlets report the same
   facts (yes / no / unclear), how many, was a denial or correction found, was the event already public, up to three short facts and
   the host names relied on. The brief is checked against what the search really did: Groq returns the pages the tool read, and a
@@ -450,6 +451,9 @@ tests/          hermetic tests built on real captured provider responses
   make that news evidence more accurate; they do not change the calibrated forecast. They were verified against live Groq and Jev keys
   (see the CHANGELOG) and the size of the LLM's direction is noisy even so; run `sudo monster-ai ai-test` after adding the keys on a
   server.
+- The rules that read news are keywords and patterns. Words found only in an article's body can no longer make a high-severity event
+  (see [the architecture notes](docs/ARCHITECTURE.md#news-intelligence-and-the-optional-ai-services)), but a headline the rules misread
+  outright still gets a wrong type; the optional AI services correct what their budgets cover, and none of it reaches the model.
 - The live evidence base starts empty: statistics are shown with sample sizes and intervals and the "VALIDATED" label has to be earned.
   The measured edge over the best simple baseline is real but modest.
 - The Linux installer and systemd units were validated by static analysis, stubs and ShellCheck on a Windows development machine, and

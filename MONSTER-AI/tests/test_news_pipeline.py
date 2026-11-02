@@ -876,6 +876,18 @@ def test_exchange_filings_are_never_searched_for(store, groq_settings, fake_cloc
     assert events(store) and sessions.web.calls == [] and stats.web_used == 0 and stats.web_skipped_budget == 0
 
 
+def test_a_story_about_no_listed_company_is_not_searched_for_however_company_like_its_type(store, groq_settings, fake_clock):
+    title = "French billionaire to acquire 16% stake in a telecom operator in a Rs 54,000 crore deal"
+    body = "The investor will pay Rs 54,000 crore for the stake, people familiar with the matter said."
+    assert pl._wants_web(classify_rules(title, body, category=None, source_kind="business_media"), "media")  # type and size ask for it
+    pipe, sessions = ai_pipe(store, groq_settings, fake_clock, web=[web_reply()])
+    add_article(store, 0, title, body, source="Mint", feed="mint", url="https://www.livemint.com/telco")
+    stats = pipe.process_pending()
+    assert events(store) and sessions.web.calls == [] and stats.web_used == 0 and stats.web_skipped_budget == 0
+    add_rumour(store, 1)  # a story about a company the matcher knows is still searched for, with the budget untouched
+    assert pipe.process_pending().web_used == 1 and len(sessions.web.calls) == 1
+
+
 @pytest.mark.parametrize(("title", "body"), [
     ("RBI cuts repo rate by 25 bps", "The monetary policy committee cut the policy rate to support growth."),  # macro
     ("Coal India board approves interim dividend of Rs 15 per share", "The dividend will be paid next month."),  # not settled by a search

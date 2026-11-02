@@ -118,12 +118,22 @@ class Intel:
                 if handled < PROCESS_BATCH or counts.get("errors", 0):
                     break  # drained, or something is wrong: do not hammer a failing database
             totals["batches"] = batches
+            if batches > 1:
+                self._save_last_run(totals)
         except Exception as exc:  # noqa: BLE001
             log.exception("news processing failed")
             self._degrade(f"news processing failed ({type(exc).__name__})")
             return {"error": type(exc).__name__}
         totals["reactions"] = self.refresh_reactions(self._now())
         return totals
+
+    def _save_last_run(self, totals: dict[str, Any]) -> None:
+        """The pipeline saves ``news.last_run`` after every batch, so once a backlog took several it would describe only the last,
+        usually small one, with the AI budgets already spent. The diagnostics should show what the whole job did."""
+        try:
+            self.store.kv_set_json("news.last_run", {"at": iso(self._now()), **totals})
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never fails the job
+            log.warning("could not save the totals of the news job (%s)", type(exc).__name__)
 
     def refresh_reactions(self, as_of: datetime) -> int:
         """Fill in whether the market already reacted to recent company events (feeds the "already priced in" logic)."""

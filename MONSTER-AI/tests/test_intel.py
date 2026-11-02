@@ -121,6 +121,31 @@ def test_a_backlog_is_drained_in_bounded_batches_and_the_counts_are_summed(intel
     assert totals["articles_in"] == 1450 and totals["events_created"] == 725 and totals["batches"] == 3 and totals["reactions"] == 3
 
 
+def test_after_a_backlog_the_last_run_record_describes_the_whole_job_not_its_last_batch(intel, store):
+    store.kv_set_json("news.last_run", {"at": "stale", "articles_in": 250, "llm_used": 0})  # what the pipeline saved after its last batch
+    intel.pipeline = Batches([600, 600, 250])
+    totals = intel.process()
+    saved = store.kv_get_json("news.last_run")
+    assert saved["articles_in"] == totals["articles_in"] == 1450 and saved["batches"] == 3 and saved["at"].endswith("Z")
+    assert saved["at"] != "stale" and "reactions" not in saved
+
+
+def test_a_job_of_one_batch_keeps_the_pipelines_own_last_run_record(intel, store):
+    store.kv_set_json("news.last_run", {"at": "own", "articles_in": 7})
+    intel.pipeline = Batches([7])
+    assert intel.process()["batches"] == 1
+    assert store.kv_get_json("news.last_run") == {"at": "own", "articles_in": 7}
+
+
+def test_failing_to_save_the_job_totals_never_fails_the_job(intel, monkeypatch, caplog):
+    intel.pipeline = Batches([600, 10])
+    monkeypatch.setattr(intel.store, "kv_set_json", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+    with caplog.at_level(logging.WARNING):
+        totals = intel.process()
+    assert totals["batches"] == 2 and totals["articles_in"] == 610 and "error" not in totals
+    assert intel.coverage_note() is None and "could not save the totals of the news job (OperationalError)" in caplog.text
+
+
 def test_draining_is_capped_so_one_job_cannot_run_forever(intel):
     from automation import intel as intel_module
 

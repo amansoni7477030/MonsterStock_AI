@@ -145,6 +145,61 @@ def test_routine_filings_are_flagged_not_dropped():
     assert not strong.routine and strong.event_type in ("government_contract", "order_win")
 
 
+@pytest.mark.parametrize(("title", "category"), [
+    ("Newspaper Publication of Unaudited Financial Results for the quarter and half year ended September 30, 2026",
+     "Copy of Newspaper Publication"),
+    ("PB Fintech Limited has informed the Exchange about Copy of Newspaper Publication of Financial Results", "Copy of Newspaper Publication"),
+    ("Newspaper Advertisement for unaudited (Standalone and Consolidated) Financial Results", "Copy of Newspaper Publication"),
+    ("Transcript of the discussion on the Unaudited Financial Results (Consolidated and Standalone)",
+     "Analysts/Institutional Investor Meet/Con. Call Updates"),
+    ("Audio recording of the discussion on the Unaudited Financial Results of the Company", "Analysts/Institutional Investor Meet/Con. Call Updates"),
+    ("Pidilite Industries Limited has informed the Exchange regarding 'Audio Recording Q2FY27 Earnings Call'", "Updates"),
+    ("Intimation", "Copy of Newspaper Publication"),  # the category alone says what it is
+])
+def test_a_filing_that_only_republishes_an_earlier_disclosure_is_routine_whatever_the_results_it_repeats(title, category):
+    draft = ev.classify_rules(title, "The unaudited financial results show net profit up 25% and a record dividend",
+                              category=category, source_kind="exchange_filing")
+    assert draft.routine and draft.event_type == "other" and draft.severity <= 0.05
+
+
+def test_the_results_themselves_are_not_republications_and_the_rule_is_for_filings_only():
+    for title, text, category in [
+        ("Q2 PAT up 25%", "ABC Ltd reports 25% growth in Q2 PAT", "Press Release"),
+        ("Outcome of Board Meeting", "The Board approved the unaudited financial results for the quarter", "Outcome of Board Meeting"),
+    ]:
+        draft = ev.classify_rules(title, text, category=category, source_kind="exchange_filing")
+        assert not draft.routine and draft.event_type == "earnings_result" and draft.severity > 0.3
+    article = ev.classify_rules("Newspaper publication of results shows Reliance Q2 net profit up 12%", "", source_kind="business_media")
+    assert not article.routine and article.event_type == "earnings_result"  # a news article is judged by what it says
+
+
+def test_a_type_resting_on_passing_words_in_the_body_cannot_be_a_headline_event():
+    # "escalation" of demand, "divest" for FII selling, "attack" on a crypto exchange: found in the body only, by one or two rules
+    cases = [
+        ("India's power consumption rises 21.88% to 159.76 billion units in October",
+         "A spike in commercial and industrial activity led to a peak demand escalation to 260.73 GW."),
+        ("FII retreat deepens: almost every second Nifty stock sees stake cuts",
+         "Foreign investors divest nearly Rs 3 lakh crore in Indian equities over three quarters."),
+        ("Binance resumes withdrawals after record hack", "The FBI has attributed the attack to a North Korean hacking group."),
+    ]
+    for title, body in cases:
+        draft = ev.classify_rules(title, body, source_kind="business_media")
+        assert draft.event_type != "other" and draft.severity <= ev.WEAK_EVIDENCE_SEVERITY, (title, draft.severity)
+        assert ev.WEAK_EVIDENCE_RULE in draft.rules
+
+
+def test_the_same_words_keep_their_weight_in_the_headline_or_with_more_evidence_or_from_a_first_hand_source():
+    headline = ev.classify_rules("Russia launches missile strikes as war escalates", "", source_kind="business_media")
+    assert headline.severity > ev.WEAK_EVIDENCE_SEVERITY and ev.WEAK_EVIDENCE_RULE not in headline.rules
+    body = "War, missile strikes and rising tensions around the strait of Hormuz keep investors nervous."
+    backed = ev.classify_rules("Markets wobble", body, source_kind="business_media")
+    assert backed.event_type == "geopolitical_conflict" and backed.severity > ev.WEAK_EVIDENCE_SEVERITY
+    passing = "Peak demand escalation to 260.73 GW during the festive phase."
+    assert ev.WEAK_EVIDENCE_RULE in ev.classify_rules("Power demand rises 21%", passing, source_kind="business_media").rules
+    for first_hand in ("official", "company", "exchange_filing"):
+        assert ev.WEAK_EVIDENCE_RULE not in ev.classify_rules("Power demand rises 21%", passing, source_kind=first_hand).rules
+
+
 def test_severity_grows_with_magnitude():
     small = ev.classify_rules("Firm bags order worth Rs 50 crore")
     large = ev.classify_rules("Firm bags order worth Rs 9,000 crore")

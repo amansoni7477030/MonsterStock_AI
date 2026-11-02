@@ -258,11 +258,11 @@ is ever made.
 
 ```mermaid
 flowchart TB
-    RAW[("news_raw + filings<br/>unprocessed rows")] --> RULES["Rules, always<br/>language, routine filter, entities, event type,<br/>rumour / denial, severity, direction"]
+    RAW[("news_raw + filings<br/>unprocessed rows")] --> RULES["Rules, always<br/>language, routine and re-published filings dropped,<br/>entities, event type, rumour / denial, severity,<br/>direction (weak evidence capped)"]
     RULES --> WORTH{"an event type<br/>or a known company?"}
     WORTH -- "no: nothing is spent" --> DROP["skipped as irrelevant"]
     WORTH -- yes --> CTX["Context for the readers, always<br/>when, by whom, which company and sector<br/>(never prices or the rules' verdict)"]
-    CTX --> GATE{"company news, not first-hand,<br/>a rumour or a deal that matters?"}
+    CTX --> GATE{"news about a listed company,<br/>not first-hand, a rumour<br/>or a deal that matters?"}
     GATE -- no --> GROQ["Groq LLM, optional<br/>structured extraction + verbatim quote"]
     GATE -- yes --> WEB["Groq web check, optional<br/>browser_search, validated brief"]
     WEB -->|"the brief joins the context; a sourced denial<br/>makes a refuted rumour, half the severity"| GROQ
@@ -273,6 +273,17 @@ flowchart TB
     RULES -.->|"the fallback when an AI step has no answer"| EV
     EV --> USE["catalysts in the report, event-graph propagation,<br/>'already priced in' check"]
 ```
+
+**What the rules decide first, before any AI is asked** (`news_intelligence/events.py`): an exchange filing that only re-publishes an
+earlier one (the newspaper copy of the results, the audio recording or the transcript of the call) is dropped, because the first-hand
+filing is the event and the copy only repeats its words; so is a routine notice (trading window, record date, schedule of a meet) that
+says nothing specific. A type that rests on passing words in the body alone (nothing in the headline, no filing category behind it, and
+less than `WEAK_EVIDENCE_SCORE` (3.0) of rule weight, i.e. one or two rules) keeps its type, which may still be right, but its severity
+is capped at `WEAK_EVIDENCE_SEVERITY` (0.35) and it is marked `weak_evidence` in the event's rules. Both came out of a live run on real
+feeds and filings: of 178 filings that became events, 31 were such copies and recordings (typed `earnings_result`, severity up to 0.6,
+and a third of Jev's calls), and about one article in seven carried a type from a stray word ("escalation" in a power-demand story
+typed as a geopolitical conflict at severity 0.95, "divest" in a story about FII selling typed as an acquisition at 0.9). Sources that
+speak for themselves (exchange filings, official statements, a company's own release) are never capped.
 
 All three services (the extraction, the web check and Jev) run behind the same safety rails (`news_intelligence/remote.py`), each with
 its own budget, circuit breaker, cooldown, cache and health row, so a slow, rate-limited or broken provider can only make the rules
@@ -331,7 +342,7 @@ sequenceDiagram
 | What it is | a text model: reads the article and returns structured JSON | Groq's built-in, server-side web search (powered by Exa) driven by a gpt-oss model. A request of its own, because Groq documents that browser search cannot be combined with structured outputs | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
 | Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | do independent outlets report the same facts, did anyone deny or correct them, was the event already public; up to three facts and the hosts relied on | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
 | Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** (it names a reputable publisher of the source registry: an exchange, an official body, a wire or a business newspaper) whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
-| Never | invents evidence | raises a severity or a confidence, clears a flag, runs for an exchange filing, an official statement or a company's own release, for macro or sector news, or in a replay or backtest | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
+| Never | invents evidence | raises a severity or a confidence, clears a flag, runs for an exchange filing, an official statement or a company's own release, for macro or sector news or a story about no listed company, or in a replay or backtest | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
 | Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | the one thing the text cannot tell: is the rumour or the unverified deal true, denied or old | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
 | Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text and context | per news job: `LLM_WEB_MAX_PER_RUN` (8) and per IST day `LLM_WEB_MAX_PER_DAY` (16), 30 % of the LLM time box, a 1-day cache; HTTP 413 or a rejected tool backs it off for 6 h | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, context, company and source class |
 
@@ -360,8 +371,8 @@ How it is observed: `monster-ai ai-test` sends one made-up item through the real
 what came back or why not; `monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` /
 `llmweb.*` / `jev.*` (calls, failures, tokens, cooldown) are in `kv` and in `monster-ai diag`; every service has a row in
 `source_health`, so the health check warns after repeated failures; the report's coverage note names a degraded extraction or Jev;
-every run's counts (used, cached, failed, skipped by budget, retyped, rumours, denials, web checks and refutations) are in
-`news.last_run`, and what the web check found is kept in the event's evidence.
+every job's counts (used, cached, failed, skipped by budget, retyped, rumours, denials, web checks and refutations; summed over
+the batches of a drained backlog) are in `news.last_run`, and what the web check found is kept in the event's evidence.
 
 ## Packages
 

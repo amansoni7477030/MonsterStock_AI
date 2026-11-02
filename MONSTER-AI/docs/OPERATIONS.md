@@ -298,7 +298,7 @@ every configured service answers; a web check that cannot run is only a `WARN`, 
 
 **Where to look.** `monster-ai logs --grep "jev failed"` (also `"llm failed"`, `"llmweb failed"`; WARNING lines carry the reason, never the
 key); `monster-ai diag` lists the counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.cooldown_until` and the
-same with `llmweb.` and `jev.` (plus `llmweb.day`, the web checks made today as `<date>:<count>`); the `news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`,
+same with `llmweb.` and `jev.` (plus `llmweb.day`, the web checks made today as `<date>:<count>`); the `news.last_run` state key holds the counts of the latest news job, summed over the batches of a drained backlog (`llm_used`, `llm_cached`, `llm_failed`,
 `llm_skipped_budget` and the `web_*` and `jev_*` equivalents, plus `web_refuted`, `jev_retyped`, `jev_rumours`, `jev_denials`); an
 event's evidence shows what the web check found (`web`), and its `extraction_method` says which services contributed (`rules+web+llm+jev`).
 

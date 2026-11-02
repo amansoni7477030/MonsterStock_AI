@@ -174,6 +174,11 @@ def _consensus(direction: float, other: float) -> float:
     return round((direction + other) / 2.0, 3) if direction * other > 0 else 0.0
 
 
+def _has_company(entities: Iterable[Entity]) -> bool:
+    """True when a listed company (not a foreign ``global:`` one) is among the entities: whom a company event is about."""
+    return any(e.type == "company" and not e.id.startswith("global:") for e in entities)
+
+
 def _wants_web(draft: EventDraft, source_class: str) -> bool:
     """Which items deserve a web check: company news of a kind a search can settle (``WEB_CHECK_TYPES``) that could matter
     (``WEB_MIN_SEVERITY``), and any company story the rules already read as an unconfirmed rumour. Exchange filings, official
@@ -512,7 +517,7 @@ class NewsPipeline:
             log.warning("withholding an item from %s from the AI services: its text contains %s",
                         (context.domain or context.source or "an unknown source") if context else "an unknown source", reason)
         context = self._complete_context(context or NewsContext(), entities, symbol, company)
-        brief = self._web_check(title, body, draft, context, source_kind, worth_asking, stats)
+        brief = self._web_check(title, body, draft, entities, context, source_kind, worth_asking, stats)
         if brief is not None:
             method, context = "rules+web", context.with_web(brief)
         result = self.llm.extract(title, body, context) if self.llm is not None and worth_asking else None
@@ -554,12 +559,13 @@ class NewsPipeline:
         return sector.name if sector is not None else None
 
     def _web_check(
-        self, title: str, body: str, draft: EventDraft, context: NewsContext, source_kind: str, worth_asking: bool,
-        stats: ProcessStats,
+        self, title: str, body: str, draft: EventDraft, entities: Sequence[Entity], context: NewsContext, source_kind: str,
+        worth_asking: bool, stats: ProcessStats,
     ) -> WebBrief | None:
         """The web brief for an item that deserves one (see :func:`_wants_web`), else ``None``. A brief that finds the report denied
-        elsewhere turns the draft into a refuted rumour (a confirmation changes nothing by itself: it only informs the readers)."""
-        if self.web is None or not worth_asking or not _wants_web(draft, source_class_of(source_kind)):
+        elsewhere turns the draft into a refuted rumour (a confirmation changes nothing by itself: it only informs the readers).
+        An item about no listed company has nothing to look up: whatever its type, a search would only spend the budget."""
+        if self.web is None or not worth_asking or not _has_company(entities) or not _wants_web(draft, source_class_of(source_kind)):
             return None
         brief = self.web.research(title, body, context)
         if brief is not None and brief.refutes and apply_refutation(draft):
@@ -630,8 +636,7 @@ class NewsPipeline:
     @staticmethod
     def _scope_for(draft: EventDraft, entities: Sequence[Entity]) -> str:
         scope = draft.scope
-        has_company = any(e.type == "company" and not e.id.startswith("global:") for e in entities)
-        if scope == "company" and not has_company:
+        if scope == "company" and not _has_company(entities):
             if any(e.type == "sector" for e in entities):
                 return "sector"
             if entities:

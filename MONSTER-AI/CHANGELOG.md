@@ -147,6 +147,29 @@ server with native systemd (no containers).
   - Jev lists only the aliases `jev-latest` and `jev-preview`; the pinned `jev-1.14.0` answers although it is not listed, and
     `ai-test` no longer warns about it.
   - The size of the direction the LLM returned varied between identical requests (its sign was stable): the scale is anchored now.
+- **Found by a live news run on real feeds and filings, and fixed** (`news_intelligence/events.py`, `pipeline.py`, `automation/intel.py`):
+  one `collect_news` job (44 of 44 feeds, 1 098 new items, 316 s, 144 MB peak) produced 855 events from 970 items (792 articles and
+  178 filings), and reading them showed what the offline tests could not.
+  - **Re-published filings are dropped.** 31 of the 178 filings that became events were newspaper copies of results, audio recordings
+    and transcripts of the call: typed `earnings_result` at severity up to 0.6, "new", and 9 of Jev's 26 judged events (35 %). The
+    routine-category rule only applied when the text rules found nothing, and the words of the results made them find something. A
+    filing whose subject or category says it is a newspaper publication or advertisement, an audio / video recording or a transcript
+    is now routine whatever it repeats (`_REPUBLICATION`); the first-hand filing remains the event.
+  - **A type resting on passing body words cannot be a headline event.** About one article in seven (111 of 792) was typed by one or
+    two rules that matched only in the body: "escalation" in a power-demand story became a geopolitical conflict at severity 0.95,
+    "divest" in a story about FII selling an acquisition at 0.9, "attack" on a crypto exchange a conflict at 0.95. Such a type is kept
+    (it may be right) but its severity is capped at 0.35 and the event's rules say `weak_evidence`; headline matches, filing
+    categories, first-hand sources and body evidence of 3.0 rule weight or more are untouched. The average severity of the affected
+    items fell from 0.63 to 0.35.
+  - **The web check needs a listed company.** One of the two searches of that job went to a market-wide FII story typed as an
+    acquisition; a story with no listed company has nothing to look up, whatever its type.
+  - **`news.last_run` describes the whole job.** A backlog is drained in batches under one AI budget, and the pipeline saved the
+    counts of the last batch only (`llm_used` 0, `jev_skipped_budget` 241) beside a job message that said "llm 9 used, jev 30
+    used". The job now saves its summed totals.
+  - Not changed, on purpose: GDELT timed out on every query from this network (6 queries failed, then its circuit opened and the rest
+    failed at once, about two minutes in all) and the job carried on with the feeds and filings, as designed; Groq's daily token
+    quota ran out part-way (earlier tests of the same day had spent it) and the extraction fell back to the rules for the rest of
+    the job with a 353 s cooldown.
 - **Credential hygiene for the LLM endpoint** (`app/config.py`): `GROQ_API_KEY` is sent only to a URL that is exactly
   `https://api.groq.com...` (a look-alike such as `https://api.groq.com.evil.example` or a URL with credentials or a backslash is
   not Groq's: it is refused at load or treated as another provider that never gets the key), and plain `http` is accepted for

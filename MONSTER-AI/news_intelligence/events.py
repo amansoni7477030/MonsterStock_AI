@@ -94,6 +94,12 @@ EVENT_DESCRIPTIONS: dict[str, str] = {
 RUMOUR_SEVERITY = 0.85  # an unconfirmed report is worth this share of the severity of a confirmed one
 DENIAL_SEVERITY = 0.5  # a denial or a refuted report, this share
 REFUTED_RULE = "web_refuted"  # recorded in ``EventDraft.rules`` when a web check found the report denied elsewhere
+# A type that no headline words, no filing category and no more than a rule or two in the body support is usually a passing word
+# ("escalation" in a power-demand story, "divest" for FII selling). It keeps its type, which may still be right, but it cannot be
+# a headline event on its own. A rule weighs 0.8-2.3 and a match in the title counts 1.5 times.
+WEAK_EVIDENCE_SCORE = 3.0
+WEAK_EVIDENCE_SEVERITY = 0.35
+WEAK_EVIDENCE_RULE = "weak_evidence"  # recorded in ``EventDraft.rules`` when that cap applied
 
 # Tie-break order when two types score equally (more specific / more consequential first).
 _PRIORITY = (
@@ -450,6 +456,13 @@ _ROUTINE_CATEGORIES = (
     "statement of deviation", "monitoring agency", "investor presentation", "investor grievance", "share transfer",
     "e-voting", "esop", "employee stock", "shareholders meeting", "transcript", "audio recording", "schedule of",
 )
+# A filing that only re-publishes what the company disclosed first (a newspaper copy of the results, the recording or the
+# transcript of the call) carries no news, whatever words it repeats: the first-hand filing is the event.
+_REPUBLICATION = re.compile(
+    r"\b(?:newspaper\s+(?:publications?|advertisements?|advts?|notices?|clippings?)|copy of newspapers?|(?:audio|video)\s+recordings?|transcripts?)\b",
+    re.IGNORECASE,
+)
+_FIRST_HAND_KINDS = frozenset({"exchange_filing", "official", "company"})  # their own words, wherever in the text the news is
 
 _RUMOUR_STRONG = re.compile(
     r"\b(?:reportedly|according to (?:sources|reports?|people)|sources? (?:said|say|told|close|familiar|aware)|people (?:familiar|aware|close)"
@@ -616,11 +629,19 @@ def classify_rules(
         best_score = scores.get(best, best_score)
 
     info = EVENT_TYPES[best]
-    routine = bool(routine_cat and rules_best < 3.0 and source_kind == "exchange_filing" and best in ("other", "board_meeting"))
+    republished = source_kind == "exchange_filing" and any(_REPUBLICATION.search(text) for text in (title, category or ""))
+    routine = republished or bool(
+        routine_cat and rules_best < 3.0 and source_kind == "exchange_filing" and best in ("other", "board_meeting")
+    )
     if routine:
         best, info = "other", EVENT_TYPES["other"]
 
     official = source_kind in ("exchange_filing", "official")
+    weak = (
+        not routine and best != "other" and source_kind not in _FIRST_HAND_KINDS and cat_type != best
+        and not title_hits.get(best) and best_score < WEAK_EVIDENCE_SCORE
+    )
+
     strong_rumour = len(_RUMOUR_STRONG.findall(title)) + len(_RUMOUR_STRONG.findall(body))
     weak_rumour = len(_RUMOUR_WEAK.findall(title)) * 2 + len(_RUMOUR_WEAK.findall(body))
     is_rumour = (not official) and (strong_rumour >= 1 or weak_rumour >= 2)
@@ -640,6 +661,9 @@ def classify_rules(
     if best == "rating_action" and "analyst_rating" in names and "credit_rating" not in names:
         base_severity = 0.30
     severity = 0.02 if routine else _severity(base_severity, best, full, rule_sev.get(best, 0.0), is_rumour, denial)
+    if weak:
+        severity = min(severity, WEAK_EVIDENCE_SEVERITY)
+        names.append(WEAK_EVIDENCE_RULE)
 
     if routine or not scores:
         confidence = 0.35 if routine else 0.25
