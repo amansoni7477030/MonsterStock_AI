@@ -199,9 +199,9 @@ def collect_news(ctx: JobContext) -> JobResult:
         return JobResult("failed", redact(str(exc)))
     rss = collector.collect_rss(feeds, deadline=deadline)
     metrics.update(rss_ok=rss.ok, rss_failed=rss.failed, rss_new=rss.new_items, rss_not_modified=rss.not_modified)
-    if s.gdelt_enabled:
+    if s.gdelt_enabled or s.gdelt_fallback:
         gdelt = collector.collect_gdelt(queries, deadline=deadline)
-        metrics.update(gdelt_ok=gdelt.ok, gdelt_new=gdelt.new_items)
+        metrics.update(gdelt_ok=gdelt.ok, gdelt_new=gdelt.new_items, gdelt_fallback=gdelt.fallback)
     if s.nse_enabled:
         start, end = filings_window(ctx)
         metrics["filings_new"] = collector.collect_filings(ctx.nse_api(), start, end, set(universe_symbols(ctx)))

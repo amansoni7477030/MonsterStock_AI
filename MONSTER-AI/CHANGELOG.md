@@ -16,6 +16,10 @@ the other records.
 - **New dependency `Pillow==12.3.0`** (binary wheels for linux x86-64 and aarch64, CPython 3.10-3.13; the installer and the CI wheel
   guard cover it, because both read `requirements.txt`). It only draws the chart images: without it the reports go out as text.
   **New setting `SEND_CHARTS`** (true) switches the images off; the tables are part of the text and need nothing.
+- **New setting `GDELT_FALLBACK`** (true): when GDELT does not deliver a topic, the news job reads it from Google News search instead
+  (no key, no new dependency). `GDELT_ENABLED=false` now means "skip GDELT, use Google News search alone"; set both to `false` for no
+  global news discovery at all. The 44 RSS feeds do not depend on either. A new source `gnews_search` is registered by the next job (or
+  `monster-ai init`); it is listed in `docs/DATA_SOURCES.md` and, if it keeps failing, in `monster-ai health`.
 - **New jobs and schedule entries** (picked up when the scheduler restarts): `collect_news` at 13:40 (slot `midday`), `closing_scan`
   at 14:30 (a try every minute for the whole window until 15:00) and `evaluate_ideas` after `ingest_eod`. Run `sudo monster-ai jobs`
   to see them.
@@ -43,11 +47,27 @@ the other records.
   drawing error or a refused upload leaves the delivered report untouched (the failure is logged). `telegram-preview` sends the
   samples with a red SAMPLE strip on every image. The client's `send_photo` has the retries, rate-limit waits, chat migration and
   plain-caption fallback of `send_message`.
+- **Google News search as the alternative to GDELT** (`ingestion/news_sources.py`: `collect_gdelt`, `gnews_search`, `read_gnews`;
+  setting `GDELT_FALLBACK`). The global topic queries (oil, rates and inflation, geopolitics, China, India macro, the Middle East,
+  semiconductors, markets) are asked of GDELT first; a topic it does not deliver, GDELT switched off, or the rest of a run once
+  GDELT has failed two queries in a row (it was timing out, so the first run through all eight topics used to spend several minutes
+  waiting) is read from Google News search with the same query: boolean operators, groups and quoted phrases carry over, GDELT's own
+  operators (`sourcelang:eng`) are dropped and `when:Nd` limits the age. The India topic asks the Indian edition (`"edition": "IN"` in
+  `data/seeds/feeds.json`), because a word such as RBI is a baseball statistic in the US edition. The answer is stored like the other
+  Google News feeds (`gn_topic:<id>`, an aggregator: the publisher is split off each title and the source-quality cap of 0.6 applies,
+  where a GDELT link to the publisher itself rates 0.75). An answer without a single item (a consent or block page parses as an empty
+  feed) is an error, never a success. A topic counts as answered when either source answered it, so `source_health` for `gdelt` only
+  warns when neither does, and `gnews_search` has a row of its own. Run live on 2026-11-02 with GDELT timing out: 8 of 8 topics
+  covered in 51 s, 421 new items, and the news pipeline turned them into 301 events (geopolitical conflict, central bank, commodity
+  supply, sanctions and tariffs, market stress ...) exactly as it does for GDELT items. `sources-check` probes both and `--only gdelt`
+  shows which one is down.
 - **`monster-ai sources-check [--only SECTION ...] [--json]`** (`app/sourcecheck.py`): the endpoint audit as a command. It reads every
-  endpoint the system uses through the production clients (the NSE JSON API, the NSE archive files, Yahoo, all RSS feeds, GDELT) and
+  endpoint the system uses through the production clients (the NSE JSON API, the NSE archive files, Yahoo, all RSS feeds, GDELT and
+  its Google News fallback) and
   prints ok / warn / FAIL with the reason of each one, so a retired or renamed endpoint (NSE did it once already in 2026) is found
-  before a scan stumbles on it; exit code 1 when an endpoint the system needs does not answer, while GDELT and a single feed are only
-  warnings. It reads, never writes. Run against the live services on 2026-11-02 it reported every endpoint ok except GDELT (a timeout).
+  before a scan stumbles on it; exit code 1 when an endpoint the system needs does not answer, while GDELT, its fallback and a single
+  feed are only warnings. It reads, never writes. Run against the live services on 2026-11-02 it reported every endpoint ok except
+  GDELT (a timeout).
   The GDELT client now lives in one function (`ingestion.news_sources.gdelt_client`), used by the news job and by the check.
 - **`doctor` checks the NSE JSON API** (the cookie handshake and the F&O live-quote list the closing scan reads, so a retired endpoint
   name shows up as a warning with its reason before 14:30) **and the chart library**.
@@ -107,8 +127,9 @@ the other records.
   minutes to 88 hours old; the RBI, SEBI and Nikkei feeds carry dates feedparser cannot read, which the collector already tolerates);
   Telegram (`getMe`, real messages and photos), Groq (key, all three models and the web search) and Jev answer.
   **GDELT**, an optional discovery source, is up but was slow and throttling that day (HTTP 429 "one request every 5 seconds" on most
-  tries, 14-36 s to first byte, once an empty answer); its URL is current, raising the client's timeouts cannot help a rate limit, and
-  its failures were already isolated (counted, the source marked unhealthy, the 44 feeds unaffected), so it is left as it is.
+  tries, 14-36 s to first byte, once an empty answer, and later timeouts on every query); its URL is current and raising the client's
+  timeouts cannot help a rate limit. Its failures were already isolated (counted, the 44 feeds unaffected), but every run waited
+  minutes on it, so it now has the Google News search alternative described above.
   `NseApi.live_equities` also works with the client's default `Referer`.
 - **curl on Windows**: `curl.exe` uses Schannel, which fails behind a network that blocks the certificate-revocation check
   (`CRYPT_E_NO_REVOCATION_CHECK`); add `--ssl-no-revoke` for diagnosis. The project's own client (BoringSSL via curl_cffi) is not

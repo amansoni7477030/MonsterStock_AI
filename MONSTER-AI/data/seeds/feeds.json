@@ -52,7 +52,7 @@
     {"id": "fed_inflation", "query": "(\"Federal Reserve\" OR inflation OR \"interest rates\" OR \"Treasury yields\") sourcelang:eng", "category": "macro"},
     {"id": "geopolitics", "query": "(sanctions OR tariffs OR \"trade war\" OR \"Red Sea\" OR \"Strait of Hormuz\") sourcelang:eng", "category": "geopolitics"},
     {"id": "china", "query": "(China economy OR \"China stimulus\" OR \"China property\") sourcelang:eng", "category": "china_economy"},
-    {"id": "india_macro", "query": "(RBI OR \"Indian economy\" OR \"India GDP\" OR \"India inflation\") sourcelang:eng", "category": "india_macro"},
+    {"id": "india_macro", "query": "(RBI OR \"Indian economy\" OR \"India GDP\" OR \"India inflation\") sourcelang:eng", "category": "india_macro", "edition": "IN"},
     {"id": "middle_east", "query": "(\"Middle East\" OR Iran OR Israel OR Gaza) (oil OR shipping OR conflict) sourcelang:eng", "category": "geopolitics"},
     {"id": "semis", "query": "(semiconductor OR Taiwan OR TSMC OR Nvidia) sourcelang:eng", "category": "technology"},
     {"id": "markets", "query": "(\"stock market\" OR \"Wall Street\" OR \"Asian markets\") (selloff OR rally OR plunge) sourcelang:eng", "category": "markets"}

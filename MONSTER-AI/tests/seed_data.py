@@ -261,7 +261,7 @@ class FakeNews:
         from ingestion.news_sources import CollectReport
 
         self.calls.append("gdelt")
-        return CollectReport(attempted=2, ok=2, new_items=7)
+        return CollectReport(attempted=2, ok=2, new_items=7, fallback=1)
 
     def collect_board_meetings(self, *a: Any, **k: Any) -> int:
         self.calls.append("meetings")

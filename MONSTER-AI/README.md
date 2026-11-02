@@ -84,7 +84,8 @@ flowchart TB
 ```
 
 - **Data**: Yahoo daily bars (unofficial) and NSE official files (bhavcopy, UDiFF F&O, index lists, pre-open API), news from
-  RSS/GDELT/NSE filings. Every source is registered with timestamp meaning, rate limits, licence notes, transport and failure
+  RSS/GDELT/NSE filings (Google News search takes over for GDELT when it is slow or down). Every source is registered with
+  timestamp meaning, rate limits, licence notes, transport and failure
   behaviour ([docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)).
 - **Point-in-time by construction**: one feature builder serves training and live scoring; price/volume/F&O features are shifted
   by one session, global series use each market's own close-availability time at the scan cutoff, prices are on one split-adjusted
@@ -216,7 +217,7 @@ flowchart TB
 | Time | Job | Purpose |
 |---|---|---|
 | 06:00-08:30 | `collect_global` | US/Europe/Asia closes, FX, commodities, rates, VIX, GIFT Nifty (retries) |
-| 06:30, 08:10, 13:40 | `collect_news` | RSS (conditional GET) + GDELT + NSE filings, entity/event extraction, market-reaction check; the 13:40 pass gives the closing scan fresh catalysts |
+| 06:30, 08:10, 13:40 | `collect_news` | RSS (conditional GET) + GDELT (Google News search as its fallback) + NSE filings, entity/event extraction, market-reaction check; the 13:40 pass gives the closing scan fresh catalysts |
 | 08:00 | `collect_india` | previous-session completeness (official bhavcopy first), results calendar |
 | 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (indicative/final equilibrium prices) |
@@ -309,7 +310,7 @@ are on, and `sudo monster-ai telegram-preview` sends a sample of everything (eve
 |---------|---------|
 | `init` | create directories, migrate the database, seed the calendar |
 | `doctor [--offline] [--json]` | verify the machine: configuration, permissions, disk, RAM, clock, feed reachability, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
-| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read every data endpoint (NSE API, NSE archive files, Yahoo, the feeds, GDELT) through the production clients and say which still answer, with the reason of each failure; exit 1 when one the system needs does not answer |
+| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read every data endpoint (NSE API, NSE archive files, Yahoo, the feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure; exit 1 when one the system needs does not answer |
 | `bootstrap [--resume] [--skip-train]` | first-run setup (resumable) |
 | `daemon` | run the scheduler (systemd does this) |
 | `run-job NAME [--key K] [--force] [--dry-run] [--opt K=V]`, `jobs` | run one job now; show the timetable and recent runs |
@@ -341,7 +342,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Prediction | `PRIMARY_THRESHOLD` (3.0), `TOP_N` (5), `RANGE_THRESHOLDS`, `UNUSUAL_K`, tier probabilities (`TIER_*_P`) |
 | Schedule | `PRELIM_SCAN_TIME`, `FINAL_SCAN_TIME`, `REPORT_CUTOFF_TIME`, `REPORT_DEADLINE_TIME` |
 | Closing-hour ideas | `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true), `IDEAS_REPORT_DEADLINE_TIME` (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5 per list), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS` (true) |
-| Network | `HTTP_TRANSPORT` (auto: curl_cffi, falls back to requests), `HTTP_IMPERSONATE` (chrome), `HTTP_TIMEOUT_SEC` (30), `HTTP_MAX_ATTEMPTS` (4), `HTTP_MAX_RESPONSE_MB` (40), `YAHOO_MIN_INTERVAL_SEC` (1.0), `NSE_MIN_INTERVAL_SEC` (1.0), `NSE_ENABLED`, `GDELT_ENABLED` |
+| Network | `HTTP_TRANSPORT` (auto: curl_cffi, falls back to requests), `HTTP_IMPERSONATE` (chrome), `HTTP_TIMEOUT_SEC` (30), `HTTP_MAX_ATTEMPTS` (4), `HTTP_MAX_RESPONSE_MB` (40), `YAHOO_MIN_INTERVAL_SEC` (1.0), `NSE_MIN_INTERVAL_SEC` (1.0), `NSE_ENABLED`, `GDELT_ENABLED`, `GDELT_FALLBACK` (true: Google News search when GDELT does not deliver a topic) |
 | Time | `MONSTER_TIMEZONE` (Asia/Kolkata) - the zone of **log stamps only**; market logic is always IST and the process zone is UTC |
 | Retention and storage | `DATA_MAX_MB` (4000), `NEWS_RETENTION_DAYS` (45), `EVENT_RETENTION_DAYS` (1100), `QUOTE_RETENTION_DAYS` (400), `RECORD_RETENTION_DAYS` (1825), `OPS_RETENTION_DAYS` (180), `BACKUP_KEEP_DAILY` (7), `BACKUP_KEEP_WEEKLY` (4), `BACKUP_MAX_MB` (1500) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
@@ -543,7 +544,7 @@ tests/          hermetic tests built on real captured provider responses
 
 ## Limitations
 
-- Free endpoints (Yahoo, NSE JSON, public RSS/GDELT) are unofficial: they can change, rate-limit or block datacentre IPs. curl_cffi
+- Free endpoints (Yahoo, NSE JSON, public RSS/GDELT/Google News search) are unofficial: they can change, rate-limit or block datacentre IPs. curl_cffi
   makes the client look like a browser but is no guarantee. The system degrades visibly (data-quality banner, preliminary model,
   abstention) instead of guessing. Confirm provider terms before any commercial use and prefer a licensed feed for production.
 - The universe is today's F&O + Nifty 100 membership plus the delisted or quarantined names the database holds; names it never

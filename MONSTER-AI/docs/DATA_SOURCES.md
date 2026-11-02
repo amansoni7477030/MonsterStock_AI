@@ -13,7 +13,8 @@ Generated from `ingestion/registry.py` (run `python scripts/generate_docs.py`). 
 | `nse_announcements` | important | NSE corporate announcements API | rss_news |
 | `nse_live_quotes` | optional | NSE public JSON API (equity-stockIndex / equity-stock-indices, allIndices) | - |
 | `rss_news` | important | Publisher RSS/Atom feeds (data/seeds/feeds.json) | gdelt |
-| `gdelt` | optional | GDELT Project DOC 2.0 API | rss_news |
+| `gdelt` | optional | GDELT Project DOC 2.0 API | gnews_search |
+| `gnews_search` | optional | Google News search (RSS output) | gdelt |
 | `llm_extraction` | optional | Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API | rules |
 | `llm_web` | optional | Groq built-in browser_search tool (web search run on Groq's servers) on a gpt-oss model | llm_extraction |
 | `jev_judgment` | optional | TypeSafe AI - Jev (System One decision model) | rules |
@@ -154,10 +155,23 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Update frequency:** 15 minutes
 - **History depth:** Rolling ~3 months via API
 - **Rate limits:** <= 1 request per 5 s; 429 on bursts
-- **Transport and request strategy:** client `gdelt`: one request per configured query, 6 s apart, back-off on 429.
+- **Transport and request strategy:** client `gdelt`: one request per configured query, 6 s apart, back-off on 429; after 2 failed queries in a row the rest of the run is read from the fallback.
 - **Licensing:** Free research use; discovery only - verify facts against primary sources.
-- **Failure behaviour:** Backoff on 429; skipped queries recorded as coverage gap
-- **Backup source:** rss_news
+- **Failure behaviour:** Backoff on 429; after two failed queries in a row the rest of the run goes to the Google News search fallback (`gnews_search`), and a topic GDELT answers with nothing is read from there too; a topic neither answers is recorded as a coverage gap
+- **Backup source:** gnews_search
+
+## `gnews_search` - Google News search (RSS output)
+
+- **Endpoint:** `https://news.google.com/rss/search?q=<query> when:Nd&hl=en-US&gl=US&ceid=US:en`
+- **Coverage:** The same global topics as GDELT (oil, rates and inflation, geopolitics, China, India macro, the Middle East, semiconductors, markets): headlines, publisher and time; no article text
+- **Timestamp meaning:** the item's publication time as Google News reports it (UTC); first_seen_at is recorded separately
+- **Update frequency:** Minutes
+- **History depth:** The `when:` window of the run (about 36 h); a search returns up to 100 items and the first 60 are kept
+- **Rate limits:** Undocumented; one request per topic and run (eight a run), well inside what a browser makes
+- **Transport and request strategy:** client `rss` (browser-grade transport, 0.4 s spacing): one `news.google.com/rss/search` request per topic that GDELT did not deliver, in the English edition of the topic's country (`US`; `IN` for the India topic). The GDELT query is translated: boolean operators, groups and quoted phrases carry over, GDELT's own operators (`sourcelang:eng`) are dropped and `when:Nd` limits the age. Items are stored like the Google News feeds (`gn_topic:<id>`, an aggregator: the publisher is split off the title).
+- **Licensing:** Headlines and links only, as for the other aggregator feeds; no key. Not an official API: Google may change the feed or ask for consent, in which case the answer is rejected as unreadable and the topic is a coverage gap.
+- **Failure behaviour:** The topic is skipped and counted as a coverage gap; the news job and the RSS feeds go on
+- **Backup source:** gdelt
 
 ## `llm_extraction` - Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API
 

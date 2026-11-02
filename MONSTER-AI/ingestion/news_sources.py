@@ -10,7 +10,8 @@ import calendar
 import hashlib
 import json
 import logging
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,10 @@ FEED_FULL_REFRESH_HOURS = 6  # conditional GETs are trusted for this long; then 
 MAX_ITEMS_PER_FEED = 60
 TRACKING_PARAMS = {"fbclid", "gclid", "ref", "ocid", "cmpid", "taid", "mc_cid", "mc_eid", "guccounter", "guce_referrer"}
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+GNEWS_URL = "https://news.google.com/rss/search"
+GDELT_GIVE_UP_AFTER = 2  # queries GDELT fails in a row before the rest of a run is left to Google News search
+# GDELT's own query operators: Google would look for them as words and find nothing (``sourcelang:eng`` alone empties a search)
+_GDELT_OPERATOR = re.compile(r'(?<![\w"])(?:sourcelang|sourcecountry|theme|tone|toneabs|domain|domainis)\s*[:<>][^\s()"]*', re.IGNORECASE)
 
 
 def gdelt_client(settings: Settings, clock: Clock | None = None) -> HttpClient:
@@ -43,6 +48,39 @@ def gdelt_client(settings: Settings, clock: Clock | None = None) -> HttpClient:
     return HttpClient.from_settings(
         "gdelt", settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=6.0, timeout=(8.0, 25.0),
         max_attempts=2, backoff_base=7.0, clock=clock, max_bytes=4 * 1024 * 1024)
+
+
+def gnews_search(query: str, hours: int) -> str:
+    """The Google News search that answers a GDELT query. Boolean operators, groups and quoted phrases mean the same in both, so
+    they carry over; GDELT's own operators (``sourcelang:eng``) are dropped, and ``when:`` limits the age to what a collection run
+    looks back (in whole days). Empty when nothing is left to search for."""
+    text = _GDELT_OPERATOR.sub(" ", query or "")
+    text = re.sub(r"\(\s+", "(", re.sub(r"\s+\)", ")", text))
+    text = " ".join(text.split())
+    if not re.search(r"\w", text):
+        return ""
+    return f"{text} when:{max(1, -(-int(hours) // 24))}d"
+
+
+def gnews_params(search: str, edition: str = "US") -> dict[str, str]:
+    """The query string of one Google News search, in the English-language edition of a country (``US``, ``IN``, ``GB`` ...): the
+    edition decides which publishers answer, and a word such as RBI means a bank in India and a baseball statistic elsewhere."""
+    country = str(edition or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        country = "US"
+    return {"q": search, "hl": f"en-{country}", "gl": country, "ceid": f"{country}:en"}
+
+
+def read_gnews(http: HttpClient, search: str, edition: str = "US") -> list[Any]:
+    """The items of one Google News search through ``http``. An answer without a single item is an error, not an empty result: the
+    searches are broad (a topic over a day or two) and a consent or block page parses as a feed without items, so "nothing" would
+    otherwise pass for success. ``DataUnavailable`` says which of the two it was."""
+    response = http.get(GNEWS_URL, params=gnews_params(search, edition))
+    parsed = feedparser.parse(response.content)
+    if not parsed.entries:
+        raise DataUnavailable("gnews", "the answer is not a readable feed" if getattr(parsed, "bozo", 0) else "the search returned no items",
+                              retryable=True)
+    return list(parsed.entries)
 
 
 @dataclass
@@ -62,6 +100,7 @@ class CollectReport:
     failed: int = 0
     skipped: int = 0
     not_modified: int = 0  # feeds answered with 304: nothing new, nothing downloaded
+    fallback: int = 0  # topics whose items came from the fallback source (Google News search) instead of GDELT
     new_items: int = 0
     notes: list[str] = field(default_factory=list)
 
@@ -220,6 +259,10 @@ class NewsCollector:
             summary = _clean(entry.get("summary") or entry.get("description"), 1500)
             rows.append((feed.publisher or feed.id, feed.id, link, _hash(canonical_url(link)), _hash(f"{title}|{summary[:300]}"), title,
                          summary or None, iso(published), now_iso, feed.region, feed.category))
+        return self._insert_rows(rows)
+
+    def _insert_rows(self, rows: list[tuple[Any, ...]]) -> int:
+        """Store raw news rows (a URL already stored is ignored); returns how many were new."""
         if not rows:
             return 0
         before = self.store.conn.total_changes
@@ -229,50 +272,99 @@ class NewsCollector:
                 "first_seen_at, region, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         return self.store.conn.total_changes - before
 
-    # ------------------------------------------------------------------------------------------ GDELT
+    # ------------------------------------------------------------------------------- GDELT and its fallback
     def collect_gdelt(self, queries: Iterable[dict[str, str]], *, lookback_hours: int | None = None,
                       deadline: float | None = None) -> CollectReport:
-        """GDELT DOC API (discovery only: titles, domains, times). Honours the 1-request-per-5-seconds rule."""
+        """Global news discovery for the topic queries (titles, domains and times only). The GDELT DOC API answers first (it allows one
+        request in five seconds); a topic it does not deliver (an error, an empty answer, or GDELT switched off, or skipped for the rest
+        of the run once it has failed twice in a row) is read from Google News search instead, unless ``GDELT_FALLBACK`` is off. A
+        topic counts as answered when either source answered it; ``fallback`` says how many Google News supplied."""
         report = CollectReport()
-        if not self.settings.gdelt_enabled:
+        cfg = self.settings
+        if not (cfg.gdelt_enabled or cfg.gdelt_fallback):
             return report
-        client = gdelt_client(self.settings, self.clock)
+        client = gdelt_client(cfg, self.clock) if cfg.gdelt_enabled else None
         clk = self.clock or get_clock()
-        hours = lookback_hours or self.settings.news_lookback_hours
+        hours = lookback_hours or cfg.news_lookback_hours
         now_iso = iso(self._now())
+        failures, gave_up = 0, False  # GDELT queries that failed one after the other; no more tries this run
+        google_tried = google_ok = 0
         for q in queries:
             if deadline is not None and clk.monotonic() > deadline:
                 report.note("deadline reached")
                 break
             report.attempted += 1
-            try:
-                payload = client.get(GDELT_URL, params={
-                    "query": q["query"], "mode": "artlist", "format": "json", "maxrecords": "60", "timespan": f"{hours}h",
-                    "sort": "datedesc"}).json()
-            except (DataUnavailable, CircuitOpen) as exc:
+            rows: list[tuple[Any, ...]] | None = None  # None: GDELT gave no answer
+            if client is not None and not gave_up:
+                try:
+                    payload = client.get(GDELT_URL, params={
+                        "query": q["query"], "mode": "artlist", "format": "json", "maxrecords": "60", "timespan": f"{hours}h",
+                        "sort": "datedesc"}).json()
+                except (DataUnavailable, CircuitOpen) as exc:
+                    failures += 1
+                    report.note(f"{q.get('id')}: {redact(str(exc))}")
+                    if cfg.gdelt_fallback and failures >= GDELT_GIVE_UP_AFTER:
+                        gave_up = True
+                        report.note("GDELT is not answering: the remaining topics go to Google News search")
+                else:
+                    failures = 0
+                    rows = self._gdelt_rows(payload, q, now_iso)
+                    report.new_items += self._insert_rows(rows)
+            answered = rows is not None
+            if not rows and cfg.gdelt_fallback:
+                google_tried += 1
+                try:
+                    report.new_items += self._gnews_topic(q, hours)
+                except DataUnavailable as exc:  # includes CircuitOpen
+                    report.note(f"{q.get('id')}: Google News search: {redact(str(exc))}")
+                except Exception as exc:  # noqa: BLE001 - one malformed answer must never abort the discovery
+                    log.warning("google news search %s: unexpected %s; the topic is skipped this round", q.get("id"),
+                                type(exc).__name__, exc_info=True)
+                    report.note(f"{q.get('id')}: Google News search: {type(exc).__name__}")
+                else:
+                    google_ok += 1
+                    report.fallback += 1
+                    answered = True
+            if answered:
+                report.ok += 1
+            else:
                 report.failed += 1
-                report.note(f"{q.get('id')}: {redact(str(exc))}")
-                continue
-            report.ok += 1
-            rows = []
-            for article in (payload.get("articles") or []) if isinstance(payload, dict) else []:
-                url = str(article.get("url") or "")
-                title = _clean(article.get("title"), 300)
-                if not title or not url.startswith(("https://", "http://")) or str(article.get("language", "English")) != "English":
-                    continue
-                seen = parse_ts(article.get("seendate"))
-                rows.append((str(article.get("domain") or "gdelt"), f"gdelt:{q.get('id')}", url, _hash(canonical_url(url)),
-                             _hash(f"{title}|"), title, None, iso(seen), now_iso, "global", q.get("category")))
-            if rows:
-                before = self.store.conn.total_changes
-                with self.store.tx():
-                    self.store.conn.executemany(
-                        "INSERT OR IGNORE INTO news_raw (source, feed, url, url_hash, content_hash, title, summary, published_at, "
-                        "first_seen_at, region, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-                report.new_items += self.store.conn.total_changes - before
-        self.store.record_source_result("gdelt", report.success_ratio >= 0.5 or report.attempted == 0,
-                                        error=None if report.success_ratio >= 0.5 else "queries failing (rate limit?)")
+        healthy = report.success_ratio >= 0.5 or report.attempted == 0
+        error = ("queries failing (rate limit?)" if not cfg.gdelt_fallback else "Google News search is not answering" if client is None
+                 else "GDELT and Google News search are not answering")
+        self.store.record_source_result("gdelt", healthy, error=None if healthy else error)
+        if google_tried:
+            self.store.record_source_result("gnews_search", google_ok * 2 >= google_tried,
+                                            error=None if google_ok * 2 >= google_tried else "Google News search is not answering")
+        if report.fallback:
+            (log.info if healthy else log.warning)(
+                "global news discovery: Google News search supplied %d of %d topics (GDELT %s)", report.fallback, report.attempted,
+                "is switched off" if client is None else "did not deliver them")
         return report
+
+    @staticmethod
+    def _gdelt_rows(payload: Any, q: Mapping[str, Any], now_iso: str | None) -> list[tuple[Any, ...]]:
+        """The usable articles of a GDELT answer as ``news_raw`` rows: English, http(s), with a title."""
+        rows = []
+        for article in (payload.get("articles") or []) if isinstance(payload, dict) else []:
+            url = str(article.get("url") or "")
+            title = _clean(article.get("title"), 300)
+            if not title or not url.startswith(("https://", "http://")) or str(article.get("language", "English")) != "English":
+                continue
+            seen = parse_ts(article.get("seendate"))
+            rows.append((str(article.get("domain") or "gdelt"), f"gdelt:{q.get('id')}", url, _hash(canonical_url(url)),
+                         _hash(f"{title}|"), title, None, iso(seen), now_iso, "global", q.get("category")))
+        return rows
+
+    def _gnews_topic(self, q: Mapping[str, Any], hours: int) -> int:
+        """One GDELT topic read from Google News search and stored like any RSS feed: as ``gn_topic:<id>``, an aggregator, so the
+        pipeline splits the publisher off each title exactly as it does for the Google News feeds. Returns the new rows."""
+        search = gnews_search(str(q.get("query") or ""), hours)
+        if not search:
+            raise DataUnavailable("gnews", "the query has nothing left to search for", retryable=False)
+        entries = read_gnews(self.http, search, str(q.get("edition") or "US"))
+        feed = FeedSpec(f"gn_topic:{q.get('id')}", GNEWS_URL, "Google News", "global", str(q.get("category") or ""), "aggregator")
+        return self._store_entries(feed, entries[:MAX_ITEMS_PER_FEED], self._now() - timedelta(hours=hours))
 
     # --------------------------------------------------------------------------------- NSE filings etc.
     def collect_filings(self, nse: NseApi, start: date, end: date, symbols: set[str]) -> int:

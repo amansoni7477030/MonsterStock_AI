@@ -4,8 +4,9 @@ answer with data.
 A provider renames or retires an endpoint now and then (NSE retired ``equity-stockIndices`` in 2026). This is the command that finds
 that out before a scan does, and it names the reason of every failure. It only reads: nothing is stored and no report is touched.
 Sections: ``nse`` (the JSON API behind www.nseindia.com), ``archive`` (the end-of-day files), ``yahoo``, ``rss`` (the news feeds) and
-``gdelt`` (optional). An endpoint the system cannot do without that does not answer is ``fail``; one that is optional (GDELT), one of
-many (a single feed) or merely not published yet is ``warn``.
+``gdelt`` (global news discovery: GDELT and the Google News search that stands in for it). An endpoint the system cannot do without
+that does not answer is ``fail``; one that is optional (GDELT, its fallback), one of many (a single feed) or merely not published
+yet is ``warn``.
 """
 
 from __future__ import annotations
@@ -178,18 +179,30 @@ def check_rss(report: DoctorReport, s: Settings) -> None:
 
 
 def check_gdelt(report: DoctorReport, s: Settings) -> None:
-    if not s.gdelt_enabled:
-        report.add("GDELT DOC API", "ok", "off (GDELT_ENABLED=false)")
-        return
-    from ingestion.news_sources import GDELT_URL, gdelt_client
+    """Global news discovery: the GDELT DOC API and the Google News search that stands in for it. Both are optional: a topic is lost
+    only when neither answers, and the RSS feeds do not depend on either."""
+    from ingestion.news_sources import GDELT_URL, NewsCollector, gdelt_client, gnews_search, read_gnews
 
-    client = gdelt_client(s)
-    params = {"query": "Nifty sourcelang:eng", "mode": "artlist", "format": "json", "maxrecords": "5", "timespan": "24h", "sort": "datedesc"}
+    query = "Nifty sourcelang:eng"
+    if s.gdelt_enabled:
+        client = gdelt_client(s)
+        params = {"query": query, "mode": "artlist", "format": "json", "maxrecords": "5", "timespan": "24h", "sort": "datedesc"}
+        try:
+            _probe(report, "GDELT DOC API (optional)", lambda: client.get(GDELT_URL, params=params).json(),
+                   lambda r: _count(len(r.get("articles") or []) if isinstance(r, dict) else 0, "articles", empty="warn"), optional=True)
+        finally:
+            client.close()
+    else:
+        report.add("GDELT DOC API", "ok", "off (GDELT_ENABLED=false)")
+    if not s.gdelt_fallback:
+        report.add("Google News search (GDELT fallback)", "ok", "off (GDELT_FALLBACK=false)")
+        return
+    http = NewsCollector(None, s).http  # the very client (headers, spacing, size cap) the news job uses
     try:
-        _probe(report, "GDELT DOC API (optional)", lambda: client.get(GDELT_URL, params=params).json(),
-               lambda r: _count(len(r.get("articles") or []) if isinstance(r, dict) else 0, "articles", empty="warn"), optional=True)
+        _probe(report, "Google News search (GDELT fallback)", lambda: read_gnews(http, gnews_search(query, 24)),
+               lambda r: _count(len(r), "items", empty="warn"), optional=True)
     finally:
-        client.close()
+        http.close()
 
 
 # --------------------------------------------------------------------------------------------- runner

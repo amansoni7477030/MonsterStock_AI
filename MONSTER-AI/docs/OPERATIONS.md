@@ -98,7 +98,7 @@ calibrated"* and caps every name at WATCH.
 | `health [--json]` | exit 0 ok / 1 warnings / 2 critical; every problem with its explanation |
 | `jobs` | the timetable and the last runs of every job |
 | `doctor` | full preflight: configuration, permissions, disk, RAM, clock, reachability of every data feed, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
-| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read **every** data endpoint (NSE API, NSE archive files, Yahoo, the 44 feeds, GDELT) through the production clients and say which still answer, with the reason of each failure (exit 1 when one fails); run it after an NSE or Yahoo change and when a report is missing data, see [Checking an endpoint by hand](#checking-an-endpoint-by-hand-curl) |
+| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read **every** data endpoint (NSE API, NSE archive files, Yahoo, the 44 feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure (exit 1 when one fails); run it after an NSE or Yahoo change and when a report is missing data, see [Checking an endpoint by hand](#checking-an-endpoint-by-hand-curl) |
 | `logs [...]` | read, filter and follow the logs, see [Logs and diagnostics](#logs-and-diagnostics) |
 | `diag` | write a redacted diagnostics bundle for a bug report |
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
@@ -140,7 +140,7 @@ Knobs you may want, all with safe defaults:
 | Closing-hour trade ideas | `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true: false = compute, freeze and evaluate without sending), `IDEAS_REPORT_DEADLINE_TIME` (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5 per list), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS` (true). The scan reuses `MIN_PRICE`, `MIN_MEDIAN_TURNOVER_CR` and `MAX_COST_TO_RANGE_RATIO` for its liquidity, price and cost gates |
 | Storage budget and retention | `DATA_MAX_MB` (4000), `NEWS_RETENTION_DAYS` (45), `EVENT_RETENTION_DAYS` (1100), `QUOTE_RETENTION_DAYS` (400), `RECORD_RETENTION_DAYS` (1825), `OPS_RETENTION_DAYS` (180), `BACKUP_KEEP_DAILY` (7), `BACKUP_KEEP_WEEKLY` (4), `BACKUP_MAX_MB` (1500) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (`text` or `json`), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150), `MONSTER_TIMEZONE` (log stamps only) |
-| Network | `HTTP_TRANSPORT` (`auto`, `curl_cffi`, `requests`), `HTTP_IMPERSONATE` (`chrome`), `HTTP_TIMEOUT_SEC`, `HTTP_MAX_ATTEMPTS`, `HTTP_MAX_RESPONSE_MB`, `YAHOO_MIN_INTERVAL_SEC`, `NSE_MIN_INTERVAL_SEC`, `NSE_ENABLED`, `GDELT_ENABLED` |
+| Network | `HTTP_TRANSPORT` (`auto`, `curl_cffi`, `requests`), `HTTP_IMPERSONATE` (`chrome`), `HTTP_TIMEOUT_SEC`, `HTTP_MAX_ATTEMPTS`, `HTTP_MAX_RESPONSE_MB`, `YAHOO_MIN_INTERVAL_SEC`, `NSE_MIN_INTERVAL_SEC`, `NSE_ENABLED`, `GDELT_ENABLED`, `GDELT_FALLBACK` (Google News search when GDELT does not deliver a topic) |
 | Disk and memory guards | `MIN_FREE_DISK_MB_WARN`, `MIN_FREE_DISK_MB_CRIT`, `JOB_MAX_RSS_MB` |
 
 Optional capabilities, all off by default:
@@ -242,6 +242,21 @@ See [Network, scraping and rate limits](#network-scraping-and-rate-limits). Shor
 (the client slows down and retries); `monster-ai logs --role all --grep 429 --since 1d` and the `network:` line at the end of each job
 show how
 often it happened.
+
+### GDELT is slow or down
+
+GDELT (global news discovery: oil, rates, geopolitics, China, India macro, the Middle East, semiconductors, markets) is optional and often
+slow or rate-limited. **Nothing to do:** the news job tries GDELT first, gives up on it after two failed queries in a row and reads the
+remaining topics from **Google News search** with the same queries (`GDELT_FALLBACK`, on by default; no key). The job log says what it did,
+`global news discovery: Google News search supplied N of M topics (GDELT did not deliver them)`
+(`sudo monster-ai logs --role jobs --job collect_news --grep "news discovery" --since 1d`; the line is a warning when most topics stayed
+unanswered), and `sudo monster-ai sources-check --only gdelt` shows which of the two answers right now. `monster-ai health` warns
+(`source_gdelt`, after five news runs in a row in which most topics were answered by neither source) only when **both** are down; then
+check `api.gdeltproject.org` and `news.google.com` from the server. A Google consent or block page is rejected as unreadable, never
+counted as an empty result. Fallback items are aggregator-grade evidence (their link is Google's redirect, so they rate 0.4, or 0.6 once
+the publisher is known, against 0.75 for a GDELT link to the publisher itself), which is why GDELT stays first. `GDELT_ENABLED=false`
+skips GDELT and uses Google alone (no waiting on timeouts); `GDELT_FALLBACK=false` turns the alternative off; both `false` stop global
+discovery (the 44 RSS feeds go on).
 
 ### NSE blocks the server (HTTP 403)
 
@@ -531,7 +546,8 @@ Yahoo `spark` request per 20 global series, conditional GET (`ETag` / 304) for R
 `[ ok ]`, `[warn]` or `[FAIL]` for each with the reason: the NSE JSON API (market status, GIFT Nifty, the pre-open book, all indices, the
 live-quote lists of your universe, announcements, board meetings, holidays), the NSE archive files (bhavcopy, the UDiFF F&O file, the
 four index lists, lot sizes), Yahoo (the bulk `spark` probe for all 33 series, the charts, the live-context quotes), every RSS feed and
-GDELT. It exits 1 when something the system needs does not answer; GDELT and a single feed are only warnings. `--only nse yahoo` limits
+GDELT with its Google News search fallback. It exits 1 when something the system needs does not answer; GDELT, its fallback and a single
+feed are only warnings. `--only nse yahoo` limits
 it to some sections. It changes nothing. `sudo monster-ai doctor` proves the main ones in a few seconds and
 `sudo monster-ai ideas --dry-run` proves the whole live-quote path. To see an endpoint with your own eyes, use `curl`. These commands
 were run against the live services on 2026-11-02 and answered `200` with data:
@@ -557,7 +573,8 @@ How to read the result: `200` with JSON is healthy. **`404`** means the endpoint
 **`403`** on the API from curl but `200` from `monster-ai doctor` is normal: the project's client has a real browser TLS fingerprint
 and plain curl has not; if both get `403`, the provider blocks this address range (see the playbook above). **`429`** is a rate limit
 (GDELT allows one request every 5 seconds and is slow and throttling at times; it is optional, and a failing GDELT never stops a
-report). On Windows `curl.exe` may fail with `CRYPT_E_NO_REVOCATION_CHECK` behind a network that blocks the certificate-revocation
+report: its topics are read from Google News search instead, see [GDELT is slow or down](#gdelt-is-slow-or-down)). On Windows
+`curl.exe` may fail with `CRYPT_E_NO_REVOCATION_CHECK` behind a network that blocks the certificate-revocation
 check: add `--ssl-no-revoke` for the test (the project's own client is not affected).
 
 ## Backups and recovery

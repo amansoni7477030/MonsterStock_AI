@@ -204,7 +204,7 @@ flowchart TB
 | Time | Job | Purpose |
 |------|-----|---------|
 | 06:00 | `collect_global` | global closes, live context, GIFT Nifty (retried until 08:30) |
-| 06:30 / 08:10 / 13:40 | `collect_news` | RSS (conditional GET), GDELT, filings, board meetings, event extraction; the 13:40 pass gives the closing scan fresh catalysts |
+| 06:30 / 08:10 / 13:40 | `collect_news` | RSS (conditional GET), global topic discovery (GDELT, with Google News search as its fallback), filings, board meetings, event extraction; the 13:40 pass gives the closing scan fresh catalysts |
 | 07:50 | `health_check` | operational alerts (also 20:00) |
 | 08:00 | `collect_india` | previous session completeness: official file first, Yahoo as repair |
 | 08:45 | `prelim_scan` | preliminary report (**critical**); first repairs the previous session when `collect_india` left it below 90 % coverage |
@@ -742,7 +742,7 @@ flowchart TB
 | F&O | one UDiFF zip per day (all contracts), parsed once |
 | RSS feeds | **conditional GET** (`ETag` / `Last-Modified`): an unchanged feed costs one tiny 304; one unconditional fetch every 6 h; a feed that fails 6 times is parked for 24 h |
 | NSE API | one pre-open call returns the whole book; GIFT Nifty comes from the market-status call already needed for the session state |
-| GDELT | minimum spacing 6 s, a few queries per run |
+| GDELT, then Google News search | GDELT: minimum spacing 6 s, one query per topic (eight a run), given up after two failed queries in a row; Google News search: one query per topic GDELT did not deliver, through the RSS client (0.4 s spacing) |
 
 ```mermaid
 flowchart TB
@@ -939,7 +939,8 @@ flowchart TB
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
 | Telegram down | reports and alerts are queued in the ledger and flushed when it returns; late final reports are withheld |
 | Pillow missing, a chart that cannot be drawn, or Telegram refusing an image | the text report is delivered and recorded first and stays as it is; the images are skipped, the reason is logged (`chart images stopped` / `charts skipped`) and `doctor` shows a `charts` warning when Pillow is missing |
-| GDELT slow or rate limited (it often is: HTTP 429, 14-36 s to first byte) | its queries are counted as failed and `source_health` (`gdelt`) warns; the 44 RSS feeds and everything else are unaffected, since GDELT is discovery only |
+| GDELT slow or rate limited (it often is: HTTP 429, 14-36 s to first byte, timeouts) | after two failed queries in a row the rest of the run is read from **Google News search** (`GDELT_FALLBACK`, on by default) with the same topic queries, and a topic GDELT answers with nothing is read from there too; a topic counts as answered when either source answered it, so `source_health` (`gdelt`) warns only when neither does (`gnews_search` has its own row). Fallback items are aggregator-grade evidence (capped at 0.6; a GDELT link to the publisher rates 0.75). The 44 RSS feeds and everything else are unaffected either way, since the discovery only adds headlines |
+| Google News search consent or block page, or no items | the answer is rejected as unreadable (a page without items would otherwise pass for an empty feed); the topic is a coverage gap, never an empty success, and `sources-check --only gdelt` shows the reason |
 | Process killed / reboot | systemd restarts the daemon; the ledger resumes; SQLite WAL recovery; `daemon_restarted` alert |
 | Database locked while the daemon lives | the heartbeat file proves liveness; `heartbeat_db_stale` warns instead of a false "daemon dead" |
 | Disk low | emergency cleanup of caches, logs and temp files; heavy jobs deferred and training refused; critical alert; retention windows shrink |

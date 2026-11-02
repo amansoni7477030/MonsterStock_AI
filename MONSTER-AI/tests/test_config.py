@@ -35,6 +35,16 @@ def test_the_charts_have_one_switch(tmp_path):
         _load(tmp_path, SEND_CHARTS="sometimes")
 
 
+def test_global_news_discovery_has_two_switches_and_the_fallback_is_on_by_default(tmp_path):
+    default = _load(tmp_path)
+    assert default.gdelt_enabled is True and default.gdelt_fallback is True
+    off = _load(tmp_path, GDELT_ENABLED="false", GDELT_FALLBACK="no")
+    assert off.gdelt_enabled is False and off.gdelt_fallback is False
+    assert _load(tmp_path, GDELT_ENABLED="false").gdelt_fallback is True  # GDELT off: Google News search takes over alone
+    with pytest.raises(ConfigError, match="GDELT_FALLBACK"):
+        _load(tmp_path, GDELT_FALLBACK="maybe")
+
+
 def test_env_overrides_and_paths_follow_data_dir(tmp_path):
     s = _load(tmp_path, MONSTER_DATA_DIR=str(tmp_path / "d"), TOP_N="7", SEND_PRELIM_REPORT="yes")
     assert s.db_path == tmp_path / "d" / "monster.db"

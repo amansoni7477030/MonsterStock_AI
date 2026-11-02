@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -44,7 +45,10 @@ GOOD = rss(
 @pytest.fixture()
 def collector(store, settings, fake_clock):
     fake_clock.set(NOW)
-    return NewsCollector(store, settings, clock=fake_clock)
+    news = NewsCollector(store, settings, clock=fake_clock)
+    # hermetic: a test that needs the feed client scripts its own (with_session); an unscripted request fails instead of going out
+    news.http = HttpClient("guard", session=FakeSession([]), clock=fake_clock, max_attempts=1)
+    return news
 
 
 def with_session(collector, fake_clock, script):
@@ -198,6 +202,7 @@ def test_gdelt_keeps_english_http_articles_and_deduplicates(collector, store, fa
 
 def test_gdelt_outages_are_reported_and_a_disabled_source_is_skipped(collector, store, fake_clock, monkeypatch):
     patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(429, b"slow down"))
+    sources_only(collector, gdelt_fallback=False)  # GDELT alone: the fallback has its own tests below
     report = collector.collect_gdelt([{"id": "oil", "query": "crude"}, {"id": "fx", "query": "rupee"}])
     assert report.failed == 2 and report.ok == 0 and source_row(store, "gdelt")["consecutive_failures"] == 1
 
@@ -211,8 +216,223 @@ def test_gdelt_outages_are_reported_and_a_disabled_source_is_skipped(collector, 
 
 def test_a_gdelt_reply_that_is_not_a_mapping_stores_nothing(collector, fake_clock, monkeypatch):
     patch_http(monkeypatch, fake_clock, lambda url, kw: FakeResponse(200, [1, 2, 3]))
+    sources_only(collector, gdelt_fallback=False)
     report = collector.collect_gdelt([{"id": "oil", "query": "crude"}])
     assert report.ok == 1 and report.new_items == 0
+
+
+# ------------------------------------------------------------------- Google News search as the GDELT fallback
+@pytest.mark.parametrize(("query", "hours", "expected"), [
+    ("(oil OR crude OR OPEC OR Brent) sourcelang:eng", 36, "(oil OR crude OR OPEC OR Brent) when:2d"),
+    ('("Middle East" OR Iran) (oil OR shipping) sourcelang:eng', 24, '("Middle East" OR Iran) (oil OR shipping) when:1d'),
+    ("sourcelang:eng Nifty sourcecountry:india tone<-5 toneabs>3 theme:ECON_STOCKMARKET", 1, "Nifty when:1d"),
+    ("( RBI OR \"India GDP\" ) sourcelang:eng", 48, '(RBI OR "India GDP") when:2d'),
+    ("domain:reuters.com domainis:ft.com oil", 49, "oil when:3d"),
+    ("a theme park OR a tone poem", 24, "a theme park OR a tone poem when:1d"),  # a word that only looks like an operator is kept
+])
+def test_a_gdelt_query_becomes_the_google_news_search_that_asks_the_same(query, hours, expected):
+    assert ns.gnews_search(query, hours) == expected
+
+
+@pytest.mark.parametrize("query", ["", "   ", None, "sourcelang:eng", "() sourcelang:eng", "tone<-5 theme:X"])
+def test_a_query_with_nothing_left_to_search_for_gives_no_search(query):
+    assert ns.gnews_search(query, 24) == ""
+
+
+@pytest.mark.parametrize(("hours", "days"), [(1, 1), (24, 1), (25, 2), (36, 2), (48, 2), (49, 3), (0, 1)])
+def test_the_age_limit_is_in_whole_days_and_never_below_one(hours, days):
+    assert ns.gnews_search("oil", hours) == f"oil when:{days}d"
+
+
+def test_the_edition_is_the_english_language_edition_of_a_country_and_falls_back_to_the_us():
+    assert ns.gnews_params("oil when:1d") == {"q": "oil when:1d", "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    assert ns.gnews_params("rbi", "IN") == ns.gnews_params("rbi", "in") == {"q": "rbi", "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
+    for bad in ("", None, "india", "U1", "  ", "IN&gl=XX"):
+        assert ns.gnews_params("oil", bad)["gl"] == "US", bad
+
+
+def google_items(search: str, n: int = 2, *, age_h: int = 2) -> bytes:
+    """A Google News answer whose items depend on the search, so two topics never share a link."""
+    slug = re.sub(r"\W+", "-", search).strip("-")[:30]
+    return rss(*((f"Headline {i} of {slug} - Reuters", f"https://news.google.com/rss/articles/{slug}-{i}?oc=5",
+                  NOW - timedelta(hours=age_h + i), "") for i in range(n)))
+
+
+TOPICS = [{"id": "oil", "query": "(oil OR crude) sourcelang:eng", "category": "energy"},
+          {"id": "india_macro", "query": '(RBI OR "India GDP") sourcelang:eng', "category": "india_macro", "edition": "IN"},
+          {"id": "semis", "query": "(semiconductor OR TSMC) sourcelang:eng", "category": "technology"}]
+GDELT_DOWN = FakeResponse(429, b"Please limit requests to one every 5 seconds")
+
+
+def route(collector, fake_clock, monkeypatch, *, gdelt, google=lambda url, kw: FakeResponse(200, google_items(kw["params"]["q"]))):
+    """GDELT answers as ``gdelt`` says and Google News as ``google`` says; returns (GDELT sessions, the Google session)."""
+    sessions = patch_http(monkeypatch, fake_clock, gdelt)
+    with_session(collector, fake_clock, google)
+    return sessions, collector.http.session
+
+
+def sources_only(collector, **over):
+    import dataclasses
+
+    collector.settings = dataclasses.replace(collector.settings, **over)
+    return collector
+
+
+def test_when_gdelt_answers_google_is_never_asked(collector, store, fake_clock, monkeypatch):
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: FakeResponse(200, GDELT))
+    report = collector.collect_gdelt(TOPICS)
+    assert (report.attempted, report.ok, report.failed, report.fallback) == (3, 3, 0, 0) and report.new_items == 1
+    assert len(gdelt[0].calls) == 3 and google.calls == []
+    assert {row["feed"] for row in stored(store)} == {"gdelt:oil"} and source_row(store, "gdelt")["consecutive_failures"] == 0
+
+
+def test_after_two_failed_queries_in_a_row_the_rest_of_the_run_goes_to_google(collector, store, fake_clock, monkeypatch):
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN)
+    report = collector.collect_gdelt(TOPICS)
+    assert (report.attempted, report.ok, report.failed, report.fallback) == (3, 3, 0, 3) and report.new_items == 6
+    assert len(gdelt[0].calls) == 2  # the third topic never waits for a GDELT that is not answering
+    assert [kw["params"]["q"] for _, _, kw in google.calls] == ["(oil OR crude) when:2d", '(RBI OR "India GDP") when:2d',
+                                                               "(semiconductor OR TSMC) when:2d"]
+    assert any("remaining topics go to Google News search" in note for note in report.notes)
+    row = stored(store)[0]
+    assert (row["feed"], row["source"], row["region"], row["category"]) == ("gn_topic:oil", "Google News", "global", "energy")
+    assert row["url"].startswith("https://news.google.com/rss/articles/") and row["title"].endswith(" - Reuters")
+    assert row["published_at"].startswith("2026-11-02T01:00")
+    assert source_row(store, "gdelt")["consecutive_failures"] == 0 and source_row(store, "gnews_search")["consecutive_failures"] == 0
+
+
+def test_the_request_to_google_names_the_edition_and_the_age_and_has_no_gdelt_operator(collector, fake_clock, monkeypatch):
+    _gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN)
+    collector.collect_gdelt(TOPICS)
+    assert {url for _, url, _ in google.calls} == {ns.GNEWS_URL}
+    assert [kw["params"] for _, _, kw in google.calls] == [
+        {"q": "(oil OR crude) when:2d", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+        {"q": '(RBI OR "India GDP") when:2d', "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},  # the India topic asks the Indian edition
+        {"q": "(semiconductor OR TSMC) when:2d", "hl": "en-US", "gl": "US", "ceid": "US:en"}]
+    assert "sourcelang" not in " ".join(kw["params"]["q"] for _, _, kw in google.calls)
+
+
+def test_one_failed_query_does_not_end_gdelt_for_the_run_and_a_topic_gdelt_answers_with_nothing_is_read_from_google(
+        collector, store, fake_clock, monkeypatch):
+    answers = iter([GDELT_DOWN, FakeResponse(200, {"articles": []}), GDELT_DOWN])
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: next(answers))
+    report = collector.collect_gdelt(TOPICS)
+    assert len(gdelt[0].calls) == 3  # never two failures in a row: GDELT is tried for every topic
+    assert len(google.calls) == 3 and (report.ok, report.failed, report.fallback) == (3, 0, 3)
+    assert not any("remaining topics" in note for note in report.notes)
+
+
+def test_a_topic_gdelt_answered_is_not_asked_again_and_the_failure_count_starts_over(collector, store, fake_clock, monkeypatch):
+    answers = iter([GDELT_DOWN, FakeResponse(200, GDELT), GDELT_DOWN])
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: next(answers))
+    report = collector.collect_gdelt(TOPICS)
+    assert len(gdelt[0].calls) == 3 and len(google.calls) == 2 and report.fallback == 2
+    assert {row["feed"] for row in stored(store)} == {"gn_topic:oil", "gdelt:india_macro", "gn_topic:semis"}
+
+
+def test_with_gdelt_switched_off_google_search_does_the_discovery_alone(collector, store, fake_clock, monkeypatch):
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: pytest.fail("GDELT must not be asked"))
+    report = sources_only(collector, gdelt_enabled=False).collect_gdelt(TOPICS)
+    assert gdelt == [] and len(google.calls) == 3  # not even a GDELT client was built
+    assert (report.attempted, report.ok, report.failed, report.fallback) == (3, 3, 0, 3)
+    assert source_row(store, "gdelt")["consecutive_failures"] == 0
+
+
+def test_with_the_fallback_switched_off_gdelt_behaves_as_it_always_did(collector, store, fake_clock, monkeypatch):
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN)
+    report = sources_only(collector, gdelt_fallback=False).collect_gdelt(TOPICS)
+    assert (report.attempted, report.ok, report.failed, report.fallback) == (3, 0, 3, 0) and report.new_items == 0
+    assert len(gdelt[0].calls) == 3 and google.calls == []  # no give-up either: every topic gets its try
+    row = source_row(store, "gdelt")
+    assert row["consecutive_failures"] == 1 and row["last_error"] == "queries failing (rate limit?)"
+    assert store.conn.execute("SELECT COUNT(*) FROM source_health WHERE source_id = 'gnews_search'").fetchone()[0] == 0  # never used
+
+
+def test_with_both_switched_off_nothing_is_asked(collector, fake_clock, monkeypatch):
+    gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: pytest.fail("no request expected"),
+                          google=lambda url, kw: pytest.fail("no request expected"))
+    report = sources_only(collector, gdelt_enabled=False, gdelt_fallback=False).collect_gdelt(TOPICS)
+    assert report.attempted == 0 and gdelt == [] and google.calls == []
+
+
+def test_a_topic_that_neither_source_answers_is_a_coverage_gap_and_the_reason_is_kept(collector, store, fake_clock, monkeypatch):
+    _gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN,
+                           google=lambda url, kw: FakeResponse(500, b"oops"))
+    report = collector.collect_gdelt(TOPICS)
+    assert (report.attempted, report.ok, report.failed, report.fallback) == (3, 0, 3, 0)
+    assert sum("Google News search:" in note for note in report.notes) == 3
+    gdelt_row, google_row = source_row(store, "gdelt"), source_row(store, "gnews_search")
+    assert gdelt_row["consecutive_failures"] == 1 and gdelt_row["last_error"] == "GDELT and Google News search are not answering"
+    assert google_row["consecutive_failures"] == 1 and google_row["last_error"] == "Google News search is not answering"
+    assert len(google.calls) == 3
+
+
+def test_a_page_that_is_not_a_feed_and_an_empty_feed_are_failures_not_successes(collector, store, fake_clock, monkeypatch):
+    for answer in (b"<html><body>Before you continue to Google</body></html>", rss(), b"\x00\x01 not xml at all <<<", b""):
+        route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: pytest.fail("off"), google=lambda url, kw, a=answer: FakeResponse(200, a))
+        report = sources_only(collector, gdelt_enabled=False).collect_gdelt(TOPICS[:1])
+        assert (report.ok, report.failed) == (0, 1), answer
+        assert "Google News search:" in report.notes[0] and ("no items" in report.notes[0] or "not a readable feed" in report.notes[0]), report.notes
+    assert stored(store) == []
+
+
+def test_google_answers_one_topic_and_fails_the_next_without_ending_the_run(collector, store, fake_clock, monkeypatch):
+    def google(url, kw):
+        return FakeResponse(500, b"x") if "RBI" in kw["params"]["q"] else FakeResponse(200, google_items(kw["params"]["q"]))
+
+    route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN, google=google)
+    report = collector.collect_gdelt(TOPICS)
+    assert (report.ok, report.failed, report.fallback) == (2, 1, 2) and source_row(store, "gdelt")["consecutive_failures"] == 0
+    assert {row["feed"] for row in stored(store)} == {"gn_topic:oil", "gn_topic:semis"}
+
+
+def test_an_unexpected_error_in_one_google_topic_is_contained(collector, store, fake_clock, monkeypatch, caplog):
+    calls = []
+
+    def google(url, kw):
+        calls.append(kw["params"]["q"])
+        if len(calls) == 1:
+            raise ValueError("boom")
+        return FakeResponse(200, google_items(kw["params"]["q"]))
+
+    route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN, google=google)
+    with caplog.at_level(logging.WARNING):
+        report = collector.collect_gdelt(TOPICS)
+    assert len(calls) == 3 and (report.ok, report.failed) == (2, 1)
+    assert "ValueError" in " ".join(report.notes) and "unexpected ValueError" in caplog.text
+
+
+def test_google_items_older_than_the_lookback_are_dropped_and_a_second_run_adds_nothing(collector, store, fake_clock, monkeypatch):
+    def google(url, kw):
+        return FakeResponse(200, rss(("Fresh - Reuters", "https://news.google.com/rss/articles/f1?oc=5", NOW - timedelta(hours=2), ""),
+                                      ("Stale - Reuters", "https://news.google.com/rss/articles/s1?oc=5", NOW - timedelta(days=5), "")))
+
+    route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN, google=google)
+    first = collector.collect_gdelt(TOPICS[:1], lookback_hours=12)
+    assert first.new_items == 1 and [row["title"] for row in stored(store)] == ["Fresh - Reuters"]
+    assert collector.collect_gdelt(TOPICS[:1], lookback_hours=12).new_items == 0
+    assert collector.http.session.calls[0][2]["params"]["q"] == "(oil OR crude) when:1d"  # 12 hours is asked as one day
+
+
+def test_a_deadline_ends_the_fallback_too(collector, fake_clock, monkeypatch):
+    _gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: GDELT_DOWN)
+    late = collector.collect_gdelt(TOPICS, deadline=fake_clock.monotonic() - 1)
+    assert late.attempted == 0 and late.notes == ["deadline reached"] and google.calls == []
+
+
+def test_a_topic_whose_query_is_only_gdelt_operators_cannot_be_searched_and_is_reported(collector, fake_clock, monkeypatch):
+    _gdelt, google = route(collector, fake_clock, monkeypatch, gdelt=lambda url, kw: pytest.fail("off"))
+    report = sources_only(collector, gdelt_enabled=False).collect_gdelt([{"id": "bare", "query": "sourcelang:eng"}])
+    assert (report.ok, report.failed) == (0, 1) and "nothing left to search for" in report.notes[0] and google.calls == []
+
+
+def test_the_fallback_items_are_aggregator_grade_like_the_google_news_feeds():
+    from news_intelligence import source_quality as sq
+
+    assert sq.quality_for("Google News", "gn_topic:oil", None) == (0.4, "aggregator")
+    link = "https://news.google.com/rss/articles/a1?oc=5"
+    assert sq.quality_for("Reuters", "gn_topic:oil", link) == (0.6, "business_media")  # a publisher behind the redirect is capped
+    assert sq.quality_for("reuters.com", "gdelt:oil", "https://www.reuters.com/x")[1] == "wire"  # GDELT links the publisher itself
 
 
 # ------------------------------------------------------------------------------------- filings, meetings

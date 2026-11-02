@@ -51,7 +51,7 @@ def world(monkeypatch, settings, tmp_path):
     w = World()
     feeds = tmp_path / "feeds.json"
     feeds.write_text(json.dumps({"feeds": [{"id": f"f{n}", "url": f"https://feeds.example/{n}.xml"} for n in range(4)]}), encoding="utf-8")
-    w.cfg = dataclasses.replace(settings, news_feeds_file=feeds, gdelt_enabled=True, nse_enabled=True)
+    w.cfg = dataclasses.replace(settings, news_feeds_file=feeds, gdelt_enabled=True, gdelt_fallback=True, nse_enabled=True)
     for n in range(4):
         w.feeds[f"https://feeds.example/{n}.xml"] = FEED
 
@@ -118,7 +118,9 @@ def world(monkeypatch, settings, tmp_path):
             return w.answer(f"quote:{symbol}", {"price": 10.0})
 
     class Http:
-        def get(self, url, **_):
+        def get(self, url, params=None, **_):
+            if url == news.GNEWS_URL:  # the Google News search that stands in for GDELT
+                return SimpleNamespace(content=w.answer("gnews", FEED))
             value = w.feeds[url]
             if isinstance(value, Exception):
                 raise value
@@ -159,10 +161,12 @@ def test_every_endpoint_that_answers_is_ok_and_every_client_is_closed(world):
     for name in ("NSE market status", "NSE GIFT Nifty", "NSE pre-open book", "NSE all indices", "NSE live quotes (SECURITIES IN F&O)",
                  "NSE announcements", "NSE board meetings", "NSE trading holidays", "NSE bhavcopy (cash market)",
                  "NSE bhavcopy (F&O, UDiFF)", "NSE index list nifty500", "NSE F&O lot sizes", "Yahoo spark (bulk probe)",
-                 "Yahoo chart ^NSEI", "Yahoo chart RELIANCE.NS", "Yahoo live-context quotes", "RSS feeds", "GDELT DOC API (optional)"):
+                 "Yahoo chart ^NSEI", "Yahoo chart RELIANCE.NS", "Yahoo live-context quotes", "RSS feeds", "GDELT DOC API (optional)",
+                 "Google News search (GDELT fallback)"):
         assert name in got and got[name][0] == "ok", name
     assert got["RSS feeds"][1] == "4 of 4 answer" and got["NSE live quotes (SECURITIES IN F&O)"][1].startswith("200 stocks, answer stamped")
-    assert sorted(world.closed) == ["archive", "gdelt", "nse", "rss", "yahoo"]
+    assert got["Google News search (GDELT fallback)"][1] == "1 items"
+    assert sorted(world.closed) == ["archive", "gdelt", "nse", "rss", "rss", "yahoo"]  # the feeds and the Google search each close theirs
 
 
 def test_the_windows_and_lists_are_the_ones_the_scans_use(world):
@@ -265,11 +269,32 @@ def test_a_registry_without_feeds_or_that_cannot_be_read_is_reported(world, tmp_
 def test_gdelt_is_optional_a_failure_is_only_a_warning_and_it_can_be_off(world):
     world.answers["gdelt"] = DataUnavailable("gdelt", "HTTP 429: one request every 5 seconds")
     report = run_checks(world.cfg, ["gdelt"], today=TODAY)
-    assert rows(report) == {"GDELT DOC API (optional)": ("warn", "[gdelt] HTTP 429: one request every 5 seconds")} and not report.failed
+    assert rows(report) == {"GDELT DOC API (optional)": ("warn", "[gdelt] HTTP 429: one request every 5 seconds"),
+                            "Google News search (GDELT fallback)": ("ok", "1 items")} and not report.failed
     world.answers["gdelt"] = {}
     assert rows(run_checks(world.cfg, ["gdelt"], today=TODAY))["GDELT DOC API (optional)"] == ("warn", "answered with no articles")
     assert rows(run_checks(dataclasses.replace(world.cfg, gdelt_enabled=False), ["gdelt"], today=TODAY)) == {
-        "GDELT DOC API": ("ok", "off (GDELT_ENABLED=false)")}
+        "GDELT DOC API": ("ok", "off (GDELT_ENABLED=false)"), "Google News search (GDELT fallback)": ("ok", "1 items")}
+
+
+def test_the_fallback_is_probed_too_and_a_discovery_without_either_source_is_shown_as_such(world):
+    world.answers["gdelt"] = DataUnavailable("gdelt", "Timeout after 2 attempts")
+    world.answers["gnews"] = DataUnavailable("gnews", "HTTP 503")
+    report = run_checks(world.cfg, ["gdelt"], today=TODAY)
+    assert rows(report) == {"GDELT DOC API (optional)": ("warn", "[gdelt] Timeout after 2 attempts"),
+                            "Google News search (GDELT fallback)": ("warn", "[gnews] HTTP 503")}
+    assert not report.failed  # both are optional: the feeds carry on
+    for page, why in ((b"<html><body>consent</body></html>", "the search returned no items"), (b"", "the search returned no items")):
+        world.answers["gnews"] = page
+        assert rows(run_checks(world.cfg, ["gdelt"], today=TODAY))["Google News search (GDELT fallback)"] == (
+            "warn", f"[gnews] {why}"), page
+
+
+def test_the_fallback_can_be_switched_off_and_is_then_not_asked(world):
+    world.answers["gnews"] = DataUnavailable("gnews", "must not be asked")
+    got = rows(run_checks(dataclasses.replace(world.cfg, gdelt_fallback=False), ["gdelt"], today=TODAY))
+    assert got == {"GDELT DOC API (optional)": ("ok", "2 articles"), "Google News search (GDELT fallback)": ("ok", "off (GDELT_FALLBACK=false)")}
+    assert "rss" not in world.closed  # no Google client was even opened
 
 
 # ---------------------------------------------------------------------------------- selection and output

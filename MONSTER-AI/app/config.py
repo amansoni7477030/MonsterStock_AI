@@ -258,6 +258,9 @@ VARS: tuple[Var, ...] = (
         "Browser profile curl_cffi impersonates: chrome, safari, firefox, edge or a pinned version such as chrome131 "
         "(empty = no impersonation). Proxies: set HTTPS_PROXY in the environment file.", "Providers"),
     Var("gdelt_enabled", "GDELT_ENABLED", "true", _bool, "Use the GDELT DOC API for global news discovery.", "Providers"),
+    Var("gdelt_fallback", "GDELT_FALLBACK", "true", _bool,
+        "When GDELT does not answer a topic (or is switched off), read that topic from Google News search instead: no key, the "
+        "same queries. Both false = no global news discovery (the RSS feeds are not affected).", "Providers"),
     Var("news_feeds_file", "NEWS_FEEDS_FILE", "{home}/data/seeds/feeds.json", _path, "RSS/Atom feed registry.", "Providers"),
     Var("news_lookback_hours", "NEWS_LOOKBACK_HOURS", "36", _int, "How far back a collection run looks.", "Providers"),
     Var("news_retention_days", "NEWS_RETENTION_DAYS", "45", _int, "Raw article text retention (structured events are kept).", "Providers"),
@@ -427,6 +430,7 @@ class Settings:
     http_transport: str = "auto"
     http_impersonate: str = "chrome"
     gdelt_enabled: bool = True
+    gdelt_fallback: bool = True
     news_feeds_file: Path = HOME_DEFAULT / "data" / "seeds" / "feeds.json"
     news_lookback_hours: int = 36
     news_retention_days: int = 45

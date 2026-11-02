@@ -75,9 +75,24 @@ def test_collect_news_tolerates_partial_feed_failure(env, monkeypatch):
     ctx = ctx_for(env)
     result = jobs.collect_news(ctx)
     assert result.status == "success" and "9/10 feeds ok" in result.message
-    assert result.metrics["rss_new"] == 25 and result.metrics["gdelt_new"] == 7
+    assert result.metrics["rss_new"] == 25 and result.metrics["gdelt_new"] == 7 and result.metrics["gdelt_fallback"] == 1
     ctx._cache["news"] = FakeNews(rss_ok=2, rss_failed=8)
     assert jobs.collect_news(ctx).status == "failed"
+
+
+@pytest.mark.parametrize(("gdelt", "fallback", "discovery_runs"), [(True, True, True), (True, False, True), (False, True, True),
+                                                                   (False, False, False)])
+def test_collect_news_runs_the_global_discovery_when_either_source_is_on(env, monkeypatch, gdelt, fallback, discovery_runs):
+    import dataclasses
+
+    from ingestion import news_sources
+
+    monkeypatch.setattr(news_sources, "load_feed_registry", lambda path: ([object()], [{"id": "q"}]))
+    ctx = ctx_for(env)
+    ctx.settings = dataclasses.replace(ctx.settings, gdelt_enabled=gdelt, gdelt_fallback=fallback)
+    result = jobs.collect_news(ctx)
+    assert result.status == "success"
+    assert ("gdelt" in ctx.news().calls) is discovery_runs and ("gdelt_new" in result.metrics) is discovery_runs
 
 
 def test_the_news_job_says_what_the_ai_services_contributed(env, monkeypatch):

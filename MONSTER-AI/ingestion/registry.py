@@ -118,7 +118,18 @@ SOURCES: tuple[dict[str, Any], ...] = (
         coverage="Global news discovery (titles, domains, time, language)", timestamp_meaning="seendate (UTC)",
         update_frequency="15 minutes", history_depth="Rolling ~3 months via API", rate_limits="<= 1 request per 5 s; 429 on bursts",
         license_notes="Free research use; discovery only - verify facts against primary sources.",
-        failure_behavior="Backoff on 429; skipped queries recorded as coverage gap", backup_source="rss_news", criticality="optional",
+        failure_behavior="Backoff on 429; after two failed queries in a row the rest of the run goes to the Google News search fallback "
+                         "(`gnews_search`), and a topic GDELT answers with nothing is read from there too; a topic neither answers is "
+                         "recorded as a coverage gap", backup_source="gnews_search", criticality="optional",
+    ),
+    dict(
+        source_id="gnews_search", provider="Google News search (RSS output)", endpoint="https://news.google.com/rss/search?q=<query> when:Nd&hl=en-US&gl=US&ceid=US:en",
+        coverage="The same global topics as GDELT (oil, rates and inflation, geopolitics, China, India macro, the Middle East, semiconductors, markets): headlines, publisher and time; no article text",
+        timestamp_meaning="the item's publication time as Google News reports it (UTC); first_seen_at is recorded separately",
+        update_frequency="Minutes", history_depth="The `when:` window of the run (about 36 h); a search returns up to 100 items and the first 60 are kept",
+        rate_limits="Undocumented; one request per topic and run (eight a run), well inside what a browser makes",
+        license_notes="Headlines and links only, as for the other aggregator feeds; no key. Not an official API: Google may change the feed or ask for consent, in which case the answer is rejected as unreadable and the topic is a coverage gap.",
+        failure_behavior="The topic is skipped and counted as a coverage gap; the news job and the RSS feeds go on", backup_source="gdelt", criticality="optional",
     ),
     dict(
         source_id="llm_extraction", provider="Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API",
@@ -166,7 +177,12 @@ def _fetch_strategy() -> dict[str, str]:
     """How each source is requested (transport, spacing, batching), phrased from the code's own constants (lazy imports keep this
     module light for the callers that only need ``tracked``)."""
     from app.config import GROQ_EXTRA_FALLBACK_MODELS, GROQ_FALLBACK_MODEL, GROQ_MODEL
-    from ingestion.news_sources import FEED_DISABLE_AFTER, FEED_DISABLE_HOURS, FEED_FULL_REFRESH_HOURS
+    from ingestion.news_sources import (
+        FEED_DISABLE_AFTER,
+        FEED_DISABLE_HOURS,
+        FEED_FULL_REFRESH_HOURS,
+        GDELT_GIVE_UP_AFTER,
+    )
     from ingestion.pipeline import PROBE_MAX_AGE
     from ingestion.yahoo import SPARK_MAX_SYMBOLS
     from news_intelligence.jev import JEV_BASE_URL, JEV_PATH
@@ -210,7 +226,13 @@ def _fetch_strategy() -> dict[str, str]:
             "client `rss`: 0.4 s spacing, 2 attempts, 6 MB cap. Conditional GET (`ETag` / `Last-Modified`): an unchanged feed costs "
             f"one 304; one unconditional fetch every {FEED_FULL_REFRESH_HOURS} h; a feed that fails {FEED_DISABLE_AFTER} times in a "
             f"row is parked for {FEED_DISABLE_HOURS} h; collection is deadline-bounded."),
-        "gdelt": "client `gdelt`: one request per configured query, 6 s apart, back-off on 429.",
+        "gdelt": ("client `gdelt`: one request per configured query, 6 s apart, back-off on 429; after "
+                  f"{GDELT_GIVE_UP_AFTER} failed queries in a row the rest of the run is read from the fallback."),
+        "gnews_search": ("client `rss` (browser-grade transport, 0.4 s spacing): one `news.google.com/rss/search` request per topic that "
+                         "GDELT did not deliver, in the English edition of the topic's country (`US`; `IN` for the India topic). The "
+                         "GDELT query is translated: boolean operators, groups and quoted phrases carry over, GDELT's own operators "
+                         "(`sourcelang:eng`) are dropped and `when:Nd` limits the age. Items are stored like the Google News feeds "
+                         "(`gn_topic:<id>`, an aggregator: the publisher is split off the title)."),
         "llm_extraction": (
             "not scraped: the provider's own API through a `requests` session. `GROQ_API_KEY` selects Groq "
             f"(`{GROQ_MODEL}`, then `{GROQ_FALLBACK_MODEL}`, then {', '.join(f'`{name}`' for name in GROQ_EXTRA_FALLBACK_MODELS)}; "
