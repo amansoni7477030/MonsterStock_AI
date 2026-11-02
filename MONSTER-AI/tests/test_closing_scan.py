@@ -3,16 +3,22 @@ delivery and retries, and every way the scan must refuse to guess."""
 
 from __future__ import annotations
 
+import html
 import json
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from app.clock import at_ist
 from automation import ideas as scan
 from automation import jobs
 from automation.context import JobContext
+from ingestion import nse
+from ingestion.http import HttpClient
+from notifications.ideas import LATE_BANNER
 from notifications.service import NotificationService
+from tests.helpers import FakeResponse, FakeSession
 from tests.ideas_data import catalyst
 from tests.seed_data import (
     LIVE_STAMP,
@@ -80,7 +86,7 @@ def build_env(settings, store, clock, panel, telegram=None, **over):
         ctx = JobContext.create(cfg, store, run_key=run_key, clock=clock, **kw)
         ctx.ensure_calendar()
         api = FakeNseApi(live=default if live is None else live, indices=index_quotes(panel) if indices is None else indices,
-                         fail=nse_fail, live_ts=live_ts)
+                         fail=nse_fail, live_ts=live_ts, clock=clock)  # with a clock it refuses a deadline that has passed
         ctx._cache.update(notifier=NotificationService(cfg, store, client=telegram, clock=clock), intel=intel or FakeIntel(),
                           nse_api=api)
         return ctx
@@ -182,34 +188,50 @@ def test_a_dry_run_freezes_and_sends_nothing(env):
     assert env.store.kv_get_json(scan.run_key(DAY)) is None and env.telegram.sent == []
 
 
-def test_a_forced_scan_after_the_report_was_delivered_leaves_the_record_alone(env):
+def test_a_forced_run_after_delivery_sends_nothing_new_and_leaves_the_record_alone(env):
     assert scan.run_closing_scan(env.make()).status == "success"
     kept, delivered = env.store.kv_get_json(scan.run_key(DAY)), len(env.telegram.sent)
-    other = live_rows(env.panel, moves={env.star: -1.0})
 
-    again = env.make(live=other, force=True)
+    again = env.make(live=live_rows(env.panel, moves={env.star: -1.0}), force=True)
     result = scan.run_closing_scan(again)
-    assert result.status == "skipped" and "stays the record" in result.message
+    assert result.status == "success" and "duplicate" in result.message
     assert env.store.kv_get_json(scan.run_key(DAY)) == kept and len(env.telegram.sent) == delivered
-    assert again.nse_api().live_calls == []  # NSE is not even asked
+    assert again.nse_api().live_calls == []  # NSE is not even asked: what was said is the record
 
-    preview = scan.run_closing_scan(env.make(live=other, force=True, dry_run=True))  # a fresh look is still possible
+
+def test_a_dry_run_after_delivery_still_previews_a_fresh_scan_and_changes_nothing(env):
+    assert scan.run_closing_scan(env.make()).status == "success"
+    kept, delivered = env.store.kv_get_json(scan.run_key(DAY)), len(env.telegram.sent)
+    preview = scan.run_closing_scan(env.make(live=live_rows(env.panel, moves={env.star: -1.0}), dry_run=True))
     assert preview.status == "success" and not star_btst(preview.metrics["report"], env)
-    assert env.store.kv_get_json(scan.run_key(DAY)) == kept
+    assert env.store.kv_get_json(scan.run_key(DAY)) == kept and len(env.telegram.sent) == delivered
 
 
-def test_a_forced_scan_replaces_a_frozen_report_that_nobody_received(env):
+def test_a_forced_run_sends_the_frozen_report_marked_late_and_never_scans_again(env):
     env.telegram.fail = True
-    assert scan.run_closing_scan(env.make()).status == "failed"
-    before = frozen(env.store)
-    assert star_btst(before, env) and env.telegram.sent == []
+    assert scan.run_closing_scan(env.make()).status == "failed"  # frozen at 14:31, but nobody received it
+    kept = env.store.kv_get_json(scan.run_key(DAY))
+    assert star_btst(frozen(env.store), env) and env.telegram.sent == []
 
     env.telegram.fail = False
-    result = scan.run_closing_scan(env.make(live=live_rows(env.panel, moves={env.star: -1.0}), force=True))
+    env.clock.set(LATE_TIME)
+    plain = scan.run_closing_scan(env.make(nse_fail=True))
+    assert plain.status == "success" and "withheld" in plain.message and env.telegram.sent == []  # too late for a plain retry
+
+    forced = env.make(nse_fail=True, force=True)  # with NSE down a new scan could not succeed: none is attempted
+    result = scan.run_closing_scan(forced)
     assert result.status == "success", result.message
-    after = frozen(env.store)
-    assert after != before and not star_btst(after, env)
-    assert env.telegram.sent  # what is now the record is what was sent
+    assert forced.nse_api().live_calls == [] and env.store.kv_get_json(scan.run_key(DAY)) == kept
+    assert frozen(env.store)["late"] is False  # it was built on time: it still counts for the record
+    assert LATE_BANNER in html.unescape(said(env)) and env.star in said(env)
+
+
+def test_a_forced_run_with_nothing_frozen_scans_and_sends_the_report_marked_late(env):
+    env.clock.set(LATE_TIME)
+    late_live = live_rows(env.panel, moves={env.star: 2.6}, strength={env.star: 0.95}, volume={env.star: 1.8}, stamp=LATE_STAMP)
+    result = scan.run_closing_scan(env.make(live=late_live, live_ts=LATE_STAMP, force=True))
+    assert result.status == "success" and "withheld" not in result.message, result.message
+    assert frozen(env.store)["late"] is True and LATE_BANNER in html.unescape(said(env))
 
 
 # ------------------------------------------------------------------------------------ refusing to guess

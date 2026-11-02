@@ -3,7 +3,7 @@
 The same guarantees as ``notifications.report``, all covered by tests: every dynamic value is escaped, missing or non-finite numbers
 render as ``n/a`` and are never invented, every message is at most 3900 characters with balanced tags, and the words next to an emoji
 carry every fact. In addition: a score is always called a score and never drawn as a probability, every list shows the live record
-that stands behind it (with its sample size and interval, or the plain statement that there is none yet), and a report built after the
+that stands behind it (with its sample size and interval, or the plain statement that there is none yet), and a report sent after the
 report deadline says so at the top."""
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ HEURISTIC_BANNER = (
 )
 # once a list's live record has passed the gate the sentence above would be untrue for it: point at the records instead
 RECORD_BANNER = "HEURISTIC SETUPS: the score ranks setups, it is NOT a probability; each list shows its own live record."
-LATE_BANNER = "built after the report deadline, too late to act on: kept for the record only"
+LATE_BANNER = "sent after the report deadline, too late to act on: kept for the record only"
 
 _SECTIONS = {
     "BTST": ("🌙", "BTST - buy before the close, sell in the next session"),

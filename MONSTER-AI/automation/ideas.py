@@ -4,8 +4,9 @@
 the running session of today; ``features.swing`` turns that panel into the features of the closing hour, ``ranking.ideas`` into
 BTST, swing, bearish and next-day intraday ideas, the news pipeline adds catalysts to the shortlist, and the report is FROZEN
 (written once per trading day and re-sent unchanged after a failed delivery, exactly like the morning snapshots) and sent to Telegram.
-A forced run scans again only while the frozen report was never delivered; once it was sent, what was said is the record and a new
-scan can only be previewed (``--dry-run``). Nothing is ever traded: shadow mode.
+Once a report is frozen, what was said is the record: a retry, a late run and a forced run all send that report (``--force`` only
+lifts the report deadline, and the copy that goes out says it is late); a new scan can only be previewed (``--dry-run``). Nothing is
+ever traded: shadow mode.
 
 ``evaluate_ideas`` runs in the evening after the official end-of-day data is in. It judges every frozen idea whose next sessions are
 stored and keeps the outcomes APART from the frozen reports (``ideas:out:<date>``): what was said is never edited, what happened is
@@ -18,7 +19,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass, field
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -55,6 +57,7 @@ BASIS_MISMATCH = "price basis differs from the stored history (an ex-date today?
 EVENT_LOOKAHEAD_DAYS = 9
 SWING_EVENT_SESSIONS = 5  # a results date this many sessions ahead or less is inside a swing's horizon
 DEADLINE_MARGIN_SEC = 20.0  # live requests must be over this long before the report deadline
+LATE_FETCH_SEC = 90.0  # a run that starts when the report deadline is (nearly) over may spend this long on NSE
 EVALUATE_DAYS = 14  # calendar days back whose ideas are judged (again) each night
 RECORD_DAYS = 120  # the live record in a report covers the runs of this many calendar days
 INDEX_NAMES = {"nifty": "NIFTY 50", "vix": "INDIA VIX"}
@@ -81,13 +84,23 @@ def outcome_key(day: date | str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ live
-def fetch_live(ctx: JobContext, symbols: list[str], deadline: float | None) -> LiveDay | None:
+def fetch_bound(ctx: JobContext, deadline_at: datetime) -> float:
+    """The ``clock.monotonic()`` instant by which the live requests must be over. A scan that is on time must not run past the
+    report deadline, or its report would be withheld. One that starts after it (a forced, a manual or a dry run) has no deadline to
+    protect, and a bound in the past would make the HTTP client refuse every attempt: it gets a budget of its own instead."""
+    margin = deadline_at - timedelta(seconds=DEADLINE_MARGIN_SEC)
+    if ctx.clock.now() < margin:
+        return monotonic_at(ctx, margin)
+    return ctx.budget(LATE_FETCH_SEC)
+
+
+def fetch_live(ctx: JobContext, symbols: list[str], deadline: float | None, errors: list[str] | None = None) -> LiveDay | None:
     """NSE's live rows of the universe, keeping only complete rows that are stamped on today's date (a row from an earlier session
-    is not today's trading and is counted, never used). ``None`` when NSE did not answer at all."""
+    is not today's trading and is counted, never used). ``None`` when NSE did not answer at all; ``errors`` then holds why."""
     s, day = ctx.settings, ctx.run_date
     lists = LIVE_LISTS.get(s.universe_mode, LIVE_LISTS["fno_nifty100"])
     nse = ctx.nse_api()
-    snapshot = collect_live_equities(ctx.store, nse, lists, symbols, deadline=deadline)
+    snapshot = collect_live_equities(ctx.store, nse, lists, symbols, deadline=deadline, errors=errors)
     if snapshot is None:
         return None
     live = LiveDay({}, source_ts=snapshot.source_ts, lists=tuple(lists))
@@ -142,16 +155,22 @@ def build_table(ctx: JobContext, live: LiveDay, instruments: dict[str, dict[str,
     unseen = sum(1 for why in excluded.values() if why == NO_PREVIOUS_CLOSE)
     if symbols and unseen / len(symbols) > MAX_UNSEEN_SHARE:
         raise ValueError(f"{unseen} of {len(symbols)} names have no stored bar of {last_stored}: run collect_india")
+    shifted = sum(1 for why in excluded.values() if why == BASIS_MISMATCH)
+    if symbols and shifted / len(symbols) > MAX_UNSEEN_SHARE:  # an ex-date moves a few names; this many means the stored closes are off
+        raise ValueError(f"the stored close of {last_stored} differs from the exchange's previous close for {shifted} of "
+                         f"{len(symbols)} names: run collect_india")
     nifty_close = panel.nifty["close"].astype(float).copy()
     live_nifty = live.indices.get(INDEX_NAMES["nifty"])
     if live_nifty and len(nifty_close):
         nifty_close.iloc[-1] = live_nifty["last"]
     frames = swing_frames(panel.o, panel.h, panel.low, panel.c, panel.v, nifty_close, live_fraction=fraction)
-    table = last_row(frames).loc[symbols]
-    table["excluded"] = pd.Series(excluded, dtype=object).reindex(table.index).fillna("")
+    # A name left out has meaningless figures (a split makes its move -50 %): it must not take part in anything that looks at the
+    # day's universe either (the sector peers' move, the breadth, the percentile ranks), so it is not in the table at all.
+    usable = [s for s in symbols if s not in excluded]
+    table = last_row(frames).loc[usable]
     table["is_fno"] = [bool(instruments.get(s, {}).get("is_fno")) for s in table.index]
     table["sector_chg"] = _peer_move(table, instruments)
-    table["event_days"] = pd.Series(_event_sessions(ctx, set(symbols)), dtype=float).reindex(table.index)
+    table["event_days"] = pd.Series(_event_sessions(ctx, set(usable)), dtype=float).reindex(table.index)
     info = {"excluded": excluded, "panel_symbols": len(panel.symbols)}
     return table, nifty_close, info
 
@@ -166,15 +185,16 @@ def _peer_move(table: pd.DataFrame, instruments: dict[str, dict[str, Any]]) -> p
 
 
 def _event_sessions(ctx: JobContext, symbols: set[str]) -> dict[str, float]:
-    """Sessions from today to the results announcement of each stock that has one within a swing's horizon (0 = today, which
-    NSE companies mostly announce after the close)."""
+    """Sessions from today to the results announcement of each stock that has one within a swing's horizon. 0 is today, which NSE
+    companies mostly announce after the close; a date that is no session (a Saturday meeting, a holiday) is read the same way as
+    the session before it, because its news lands before the next open: the overnight gap a BTST would carry."""
     day = ctx.run_date
     end = day + timedelta(days=EVENT_LOOKAHEAD_DAYS)
-    index = {d.isoformat(): n for n, d in enumerate(ctx.calendar.trading_days(day, end))}
+    sessions = [d.isoformat() for d in ctx.calendar.trading_days(day, end)]
     out: dict[str, float] = {}
     for row in ctx.store.board_meetings_between(day.isoformat(), end.isoformat()):
-        n = index.get(row["meeting_date"])
-        if n is not None and n <= SWING_EVENT_SESSIONS and row["is_results"] and row["symbol"] in symbols:
+        n = bisect_right(sessions, row["meeting_date"]) - 1  # the last session on or before the meeting
+        if 0 <= n <= SWING_EVENT_SESSIONS and row["is_results"] and row["symbol"] in symbols:
             out[row["symbol"]] = float(min(n, out.get(row["symbol"], n)))
     return out
 
@@ -253,9 +273,12 @@ def frozen_report(store: Store, day: date | str) -> IdeasReport | None:
 
 
 def deliver(ctx: JobContext, report: IdeasReport) -> JobResult:
-    """Send (or re-send, idempotently) a frozen report and translate the outcome into a job result."""
+    """Send (or re-send, idempotently) a frozen report and translate the outcome into a job result. A report that goes out after the
+    report deadline (only a forced send can) says so in the copy that is sent; the frozen report itself is never edited."""
     if ctx.dry_run:
         return JobResult("success", "dry run: report not sent")
+    if ctx.force and not report.late and ctx.clock.now() > at_ist(ctx.run_date, ctx.settings.ideas_report_deadline_time):
+        report = replace(report, late=True)
     outcome = ctx.notifier().send_ideas(report, force=ctx.force)
     if outcome.ok:
         return JobResult("success", f"report {outcome.status}", {"message_ids": outcome.message_ids})
@@ -275,12 +298,8 @@ def run_closing_scan(ctx: JobContext) -> JobResult:
     if not ctx.calendar.is_trading_day(day):
         return JobResult("skipped", f"exchange closed on {day} ({ctx.calendar.holiday_name(day)})")
     kept = None if ctx.dry_run else frozen_report(ctx.store, day)
-    if kept is not None:
-        if not ctx.force:
-            return deliver(ctx, kept)
-        if ctx.notifier().ideas_delivered(day.isoformat()):  # what was said is the record: a forced scan must not replace it
-            return JobResult("skipped", f"the report of {day} was delivered and stays the record (--dry-run previews a new scan)")
-        log.warning("forced closing scan replaces the frozen report of %s, which was never delivered", day)
+    if kept is not None:  # frozen once: a retry, a late run or --force sends what was frozen, never a second scan
+        return deliver(ctx, kept)
     try:
         return _scan(ctx)
     except Exception as exc:  # noqa: BLE001 - one bad scan must be reported, not crash the daemon
@@ -299,10 +318,11 @@ def _scan(ctx: JobContext) -> JobResult:
     if not symbols:
         return _fail(ctx, "no instruments in the universe (run bootstrap)")
     instruments = {r["symbol"]: {"name": r["name"], "sector": r["sector"], "is_fno": bool(r["is_fno"])} for r in universe}
-    deadline_at = at_ist(day, s.ideas_report_deadline_time)
-    live = fetch_live(ctx, symbols, monotonic_at(ctx, deadline_at - timedelta(seconds=DEADLINE_MARGIN_SEC)))
+    why: list[str] = []
+    live = fetch_live(ctx, symbols, fetch_bound(ctx, at_ist(day, s.ideas_report_deadline_time)), why)
     if live is None:
-        return _fail(ctx, "NSE live quotes unavailable (blocked or offline); nothing is guessed from older prices")
+        reason = "; ".join(dict.fromkeys(why))[:200] or "blocked or offline"
+        return _fail(ctx, f"NSE live quotes unavailable ({reason}); nothing is guessed from older prices")
     coverage = len(live.rows) / len(symbols)
     if coverage < MIN_LIVE_COVERAGE:
         detail = f"{len(live.rows)} of {len(symbols)} names have a complete live row of {day}"

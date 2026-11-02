@@ -682,7 +682,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("ideas", cmd_ideas, "run the closing-hour trade-idea scan now (BTST, swing, bearish F&O, next-day watchlist)")
     p.add_argument("--date")
     p.add_argument("--dry-run", action="store_true", help="print the report; freeze and send nothing")
-    p.add_argument("--force", action="store_true", help="scan again if today's frozen report was never delivered; send even after the deadline")
+    p.add_argument("--force", action="store_true",
+                   help="send the frozen report even after the 15:05 deadline (marked late); scan first only if none is frozen")
     p = add("evaluate", cmd_evaluate, "evaluate a day's predictions")
     p.add_argument("--date")
     p = add("train", cmd_train, "train the models now")

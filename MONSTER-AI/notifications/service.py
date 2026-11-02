@@ -149,10 +149,6 @@ class NotificationService:
             return self._render_failed(kind, key, trade_date, exc)
         return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date)
 
-    def ideas_delivered(self, trade_date: str) -> bool:
-        """Whether the closing-hour report of ``trade_date`` was sent (what was said is then the record of that day)."""
-        return self._duplicate(f"ideas:{trade_date}") is not None
-
     def send_ideas(self, ideas_report: IdeasReport, *, force: bool = False) -> DeliveryResult:
         """Send the closing-hour trade-idea report once per trade date. It is time-critical: a report that would go out after
         ``ideas_report_deadline_time`` is withheld (the entry window is nearly over) unless ``force`` is set, which a manual run

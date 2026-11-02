@@ -513,10 +513,11 @@ LIVE_CONTEXT = ("^N225", "^HSI", "^KS11", "000001.SS", "ES=F", "NQ=F", "CL=F", "
 
 
 def collect_live_equities(store: Store, nse: NseApi, lists: Sequence[str], symbols: Iterable[str], *,
-                          deadline: float | None = None) -> LiveEquities | None:
+                          deadline: float | None = None, errors: list[str] | None = None) -> LiveEquities | None:
     """Today's running figures of ``symbols`` from the stock lists ``lists`` (one call each; the first list that has a symbol
     wins). ``None`` when no list answered. A list that fails is logged and skipped, so a broad second list never costs the
-    answer of the first. The outcome is recorded in ``source_health`` as ``nse_live_quotes``."""
+    answer of the first. The outcome is recorded in ``source_health`` as ``nse_live_quotes``; the reason of every failure is
+    appended to ``errors`` (redacted), so the caller can tell the operator why there is no answer."""
     wanted = set(symbols)
     merged: dict[str, dict[str, Any]] = {}
     stamps: list[str] = []
@@ -526,8 +527,11 @@ def collect_live_equities(store: Store, nse: NseApi, lists: Sequence[str], symbo
         try:
             snapshot = nse.live_equities(name, wanted, deadline=deadline)
         except DataUnavailable as exc:
-            store.record_source_result("nse_live_quotes", False, error=redact(str(exc)))
-            log.warning("live quotes of %s failed: %s", name, redact(str(exc)))
+            reason = redact(str(exc))
+            store.record_source_result("nse_live_quotes", False, error=reason)
+            log.warning("live quotes of %s failed: %s", name, reason)
+            if errors is not None:
+                errors.append(reason)
             continue
         answered = True
         for row in snapshot.rows:

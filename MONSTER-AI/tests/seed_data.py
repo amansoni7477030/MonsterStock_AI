@@ -173,12 +173,13 @@ class FakeNseApi:
     """Scripted NSE API: ``books`` is a list of row-lists returned one per call (the last one repeats), stamped ``book_ts``
     (the book's own timestamp; set it to an earlier day to simulate NSE serving the previous session's book). ``live`` are the
     rows ``live_equities`` answers (see ``live_rows``), ``indices`` what ``all_indices`` answers; ``fail`` breaks every endpoint,
-    ``indices_fail`` only the index one."""
+    ``indices_fail`` only the index one. With a ``clock`` it behaves like the real HTTP client: no call starts at or after the
+    ``deadline`` it is given (a scan that hands over a deadline in the past gets nothing, exactly as in production)."""
 
     def __init__(self, books: list[list[dict[str, Any]]] | None = None, *, fail: bool = False, gift: dict | None = None,
                  holidays: list[dict[str, Any]] | None = None, book_ts: str = "02-Nov-2026 09:08:30",
                  live: list[dict[str, Any]] | None = None, live_ts: str | None = LIVE_STAMP,
-                 indices: dict[str, dict[str, Any]] | None = None, indices_fail: bool = False) -> None:
+                 indices: dict[str, dict[str, Any]] | None = None, indices_fail: bool = False, clock: Any = None) -> None:
         self.books = books or []
         self.calls = 0
         self.fail = fail
@@ -190,11 +191,19 @@ class FakeNseApi:
         self.live_calls: list[str] = []
         self.indices = indices or {}
         self.indices_fail = indices_fail
+        self.clock = clock
+
+    def _admit(self, deadline: float | None) -> None:
+        from app.errors import DataUnavailable
+
+        if self.clock is not None and deadline is not None and self.clock.monotonic() >= deadline:
+            raise DataUnavailable("nse_api", "deadline reached", retryable=True)
 
     def live_equities(self, index: str = "SECURITIES IN F&O", symbols: Any = None, *, deadline: float | None = None):
         from app.errors import DataUnavailable
         from ingestion.nse import LiveEquities
 
+        self._admit(deadline)
         self.live_calls.append(index)
         if self.fail:
             raise DataUnavailable("nse", "simulated block", retryable=True)
@@ -203,6 +212,7 @@ class FakeNseApi:
     def all_indices(self, *, deadline: float | None = None):
         from app.errors import DataUnavailable
 
+        self._admit(deadline)
         if self.fail or self.indices_fail:
             raise DataUnavailable("nse", "simulated block", retryable=True)
         return self.indices

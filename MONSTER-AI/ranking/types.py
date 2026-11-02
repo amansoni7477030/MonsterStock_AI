@@ -182,7 +182,7 @@ class IdeasReport:
     mode: str = "shadow"
     universe_size: int = 0
     n_eligible: int = 0
-    late: bool = False  # built after the report deadline: too little of the entry window is left to act (a very late retry, a manual run)
+    late: bool = False  # built after the report deadline (a very late retry, a manual run): kept out of the live record; a frozen report that is only SENT late is marked in the copy that goes out
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
