@@ -10,7 +10,7 @@ import pytest
 from news_intelligence import pipeline as pl
 from news_intelligence.context import host_of
 from news_intelligence.dedup import event_confidence
-from news_intelligence.events import EventDraft, apply_refutation, classify_rules
+from news_intelligence.events import WEAK_EVIDENCE_SEVERITY, EventDraft, apply_refutation, classify_rules
 from news_intelligence.jev import JevJudge
 from news_intelligence.llm import LLMExtractor
 from news_intelligence.pipeline import NewsPipeline, ProcessStats
@@ -886,6 +886,19 @@ def test_a_story_about_no_listed_company_is_not_searched_for_however_company_lik
     assert events(store) and sessions.web.calls == [] and stats.web_used == 0 and stats.web_skipped_budget == 0
     add_rumour(store, 1)  # a story about a company the matcher knows is still searched for, with the budget untouched
     assert pipe.process_pending().web_used == 1 and len(sessions.web.calls) == 1
+
+
+def test_a_company_type_event_that_names_no_listed_company_is_stored_as_a_lead_not_a_headline(store, pipe):
+    nobody = "Defence supplier bags order worth Rs 9,000 crore from the defence ministry"
+    somebody = "Wipro bags contract worth Rs 7,000 crore from the railways ministry"
+    for title in (nobody, somebody):
+        assert classify_rules(title, "", category=None, source_kind="business_media").severity > WEAK_EVIDENCE_SEVERITY
+    add_article(store, 0, nobody, "", source="Mint", feed="mint", url="https://www.livemint.com/nobody")
+    add_article(store, 1, somebody, "", source="Mint", feed="mint", url="https://www.livemint.com/somebody")
+    pipe.process_pending()
+    severity = {e["headline"]: e["severity"] for e in events(store)}
+    assert severity[nobody] == WEAK_EVIDENCE_SEVERITY  # nobody to move: a lead, whatever its type says
+    assert severity[somebody] > WEAK_EVIDENCE_SEVERITY  # the same kind of story about a company the matcher knows
 
 
 @pytest.mark.parametrize(("title", "body"), [

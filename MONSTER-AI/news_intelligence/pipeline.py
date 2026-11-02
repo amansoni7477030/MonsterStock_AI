@@ -53,6 +53,7 @@ from news_intelligence.events import (
     EventDraft,
     apply_refutation,
     assign_polarity,
+    cap_unattributed,
     classify_rules,
     extract_moves,
     primary_company,
@@ -507,6 +508,8 @@ class NewsPipeline:
         if draft.event_type == "other" and source_kind == "exchange_filing":
             stats.skipped_irrelevant += 1  # an unclassifiable filing has no structure worth an event or an LLM call
             return None
+        if source_class_of(source_kind) not in FIRST_HAND_CLASSES:
+            cap_unattributed(draft, _has_company(entities))  # the rules' reading only: a verified AI answer can still raise it
         method, quote, event_time = "rules", None, None
         ai_polarity: dict[str, float] = {}  # directions an AI service gave a company: they override the rules' reading
         worth_asking = draft.event_type != "other" or bool(entities)  # the rules already said the item is irrelevant: spend nothing

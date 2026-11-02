@@ -100,6 +100,7 @@ REFUTED_RULE = "web_refuted"  # recorded in ``EventDraft.rules`` when a web chec
 WEAK_EVIDENCE_SCORE = 3.0
 WEAK_EVIDENCE_SEVERITY = 0.35
 WEAK_EVIDENCE_RULE = "weak_evidence"  # recorded in ``EventDraft.rules`` when that cap applied
+NO_COMPANY_RULE = "no_listed_company"  # recorded when a company-type event named no listed company (see ``cap_unattributed``)
 
 # Tie-break order when two types score equally (more specific / more consequential first).
 _PRIORITY = (
@@ -142,6 +143,19 @@ def apply_refutation(draft: EventDraft) -> bool:
         draft.horizon = "weeks"
     draft.confidence = round(max(0.05, draft.confidence * 0.7), 3)
     draft.rules = (*draft.rules, REFUTED_RULE)
+    return True
+
+
+def cap_unattributed(draft: EventDraft, has_company: bool) -> bool:
+    """A company-type event whose text names no listed company has nobody to move: its type came from words (a "sales" figure that
+    jumped, a "stake" that was cut) in a story about the economy or the market, so it keeps the type but only as a lead, with the
+    severity of weak evidence. An AI reading may still raise it. Returns whether the draft changed."""
+    if has_company or draft.scope != "company" or draft.routine or draft.event_type == "other":
+        return False
+    if draft.severity <= WEAK_EVIDENCE_SEVERITY:
+        return False
+    draft.severity = WEAK_EVIDENCE_SEVERITY
+    draft.rules = (*draft.rules, NO_COMPANY_RULE)
     return True
 
 

@@ -200,6 +200,23 @@ def test_the_same_words_keep_their_weight_in_the_headline_or_with_more_evidence_
         assert ev.WEAK_EVIDENCE_RULE not in ev.classify_rules("Power demand rises 21%", passing, source_kind=first_hand).rules
 
 
+def test_a_company_event_that_names_no_listed_company_is_only_a_lead():
+    draft = ev.EventDraft(event_type="earnings_result", severity=0.95, scope="company", rules=("profit_up",))
+    assert ev.cap_unattributed(draft, has_company=False) is True
+    assert draft.severity == ev.WEAK_EVIDENCE_SEVERITY and draft.rules == ("profit_up", ev.NO_COMPANY_RULE)
+    assert draft.event_type == "earnings_result"  # the type may still be right: it is kept
+    untouched = [
+        (ev.EventDraft(event_type="earnings_result", severity=0.95), True),  # a company is named
+        (ev.EventDraft(event_type="central_bank", severity=0.9, scope="macro"), False),  # not a company event
+        (ev.EventDraft(event_type="earnings_result", severity=0.2), False),  # already smaller than the cap
+        (ev.EventDraft(event_type="other", severity=0.9), False),
+        (ev.EventDraft(event_type="earnings_result", severity=0.9, routine=True), False),
+    ]
+    for case, has_company in untouched:
+        before = (case.severity, case.rules)
+        assert ev.cap_unattributed(case, has_company) is False and (case.severity, case.rules) == before
+
+
 def test_severity_grows_with_magnitude():
     small = ev.classify_rules("Firm bags order worth Rs 50 crore")
     large = ev.classify_rules("Firm bags order worth Rs 9,000 crore")
