@@ -849,3 +849,27 @@ def render_test_message(settings: Any) -> str:
         "💡 <i>Connectivity test only; no market data or candidates are included.</i>",
     ]
     return "\n".join(lines)
+
+
+def render_subscriber_welcome(settings: Any) -> str:
+    """The one note an extra recipient gets when the operator checks the delivery (``telegram-test --all``): what will arrive here
+    and that it is research, never advice or orders. Nothing about the system's configuration, which is the operator's."""
+    def on(name: str, default: bool = True) -> bool:
+        return bool(getattr(settings, name, default))
+
+    items = []
+    if on("send_prelim_report", False):
+        items.append("the preliminary scan (about 08:45 IST)")
+    items.append("the morning large-move scan (about 09:12 IST)")
+    if on("ideas_enabled") and on("send_ideas_report"):
+        items.append("the closing-hour trade ideas (before 15:05 IST)")
+    if on("send_evening_report"):
+        items.append("the evening review")
+    lines = [
+        "✅ <b>MONSTER AI</b> · you are subscribed",
+        "You will receive the same reports as the owner of this bot, here in this chat:",
+        *[f"{style.BULLET} {item}" for item in items],
+        "",
+        "💡 <i>Research output only: not investment advice, and the system never places orders.</i>",
+    ]
+    return "\n".join(lines)

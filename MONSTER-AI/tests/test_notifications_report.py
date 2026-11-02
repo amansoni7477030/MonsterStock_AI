@@ -966,3 +966,31 @@ def test_test_message_tolerates_partial_settings_objects():
     text = render_test_message(SimpleNamespace(mode="live", range_thresholds=(1.0, math.nan, 2.0)))
     assert_telegram_safe([text])
     assert "<b>Mode:</b> live" in text and "thresholds 1, 2%" in text and "<b>Environment:</b> n/a" in text
+
+
+def test_the_subscription_note_lists_what_will_arrive_and_says_it_is_research_not_advice(settings):
+    from notifications.report import render_subscriber_welcome
+
+    text = render_subscriber_welcome(settings)
+    assert_telegram_safe([text])
+    assert text.startswith("✅ <b>MONSTER AI</b> · you are subscribed")
+    assert "the morning large-move scan (about 09:12 IST)" in text and "the closing-hour trade ideas (before 15:05 IST)" in text
+    assert "the evening review" in text and "preliminary" not in text  # the preliminary scan is off by default
+    assert "not investment advice" in text and "never places orders" in text
+    for private in ("Environment", "Mode", "Timezone", "universe", "LLM", "Jev", "backup"):
+        assert private not in text  # the system's configuration is the operator's, not the subscriber's
+
+
+def test_the_subscription_note_follows_the_report_switches(settings):
+    from notifications.report import render_subscriber_welcome
+
+    everything = render_subscriber_welcome(dataclasses.replace(settings, send_prelim_report=True))
+    assert "the preliminary scan (about 08:45 IST)" in everything
+    nothing_extra = render_subscriber_welcome(dataclasses.replace(
+        settings, send_evening_report=False, send_ideas_report=False))
+    assert "ideas" not in nothing_extra and "evening" not in nothing_extra and "the morning large-move scan" in nothing_extra
+    no_scan = render_subscriber_welcome(dataclasses.replace(settings, ideas_enabled=False))
+    assert "ideas" not in no_scan  # a closing scan that is off sends no report, whatever SEND_IDEAS_REPORT says
+    bare = render_subscriber_welcome(SimpleNamespace())  # a settings object that knows nothing still gives a sensible note
+    assert_telegram_safe([bare])
+    assert "the morning large-move scan" in bare

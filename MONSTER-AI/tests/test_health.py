@@ -161,6 +161,19 @@ def test_training_overdue_needs_both_the_model_and_the_last_training_to_be_old(e
         **{**env.settings.__dict__, "training_mode": "external"}), env.clock))  # external training is judged by model age alone
 
 
+def test_a_failed_copy_for_an_extra_chat_is_not_a_failed_final_report(env):
+    """An extra chat that blocked the bot leaves a failed ``final_report_extra`` row; the check that reads the newest final report must
+    keep looking at the main chat's own delivery, or one friend blocking the bot would raise a false alarm every morning."""
+    settings = env.settings.__class__(**{**env.settings.__dict__, "telegram_bot_token": "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789",
+                                         "telegram_chat_id": "1001", "telegram_extra_chat_ids": ("3003",)})
+    env.store.save_delivery("telegram", "final_report", "final_report:2026-11-02", "sent", trade_date="2026-11-02", message_ids=[1])
+    env.store.save_delivery("telegram", "final_report_extra", "final_report:2026-11-02@3003", "failed", trade_date="2026-11-02",
+                            error="HTTP 403: Forbidden: bot was blocked by the user")
+    assert "report_not_delivered" not in codes(evaluate_health(env.store, settings, env.clock))
+    env.store.save_delivery("telegram", "final_report", "final_report:2026-11-03", "failed", trade_date="2026-11-03", error="outage")
+    assert "report_not_delivered" in codes(evaluate_health(env.store, settings, env.clock))  # the main chat's own failure still counts
+
+
 def test_stale_holiday_calendar_is_flagged_once_the_system_has_been_running(env):
     env.store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
     report = evaluate_health(env.store, env.settings, env.clock)

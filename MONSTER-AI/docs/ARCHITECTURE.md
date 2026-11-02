@@ -326,6 +326,15 @@ How it is built:
   as a probability and a report withheld after 15:05 unless forced (then marked late; one built after the deadline is also kept out of
   the record). The levels are repeated in two monospace tables at the top (at most 37 characters wide) and, after the text, two chart
   images follow (`notifications/charts.py`): the board and the trade plan.
+- **More than one reader** (`NotificationService._deliver_extras`, setting `TELEGRAM_EXTRA_CHAT_IDS`): every report (prelim, final,
+  evening, closing-hour ideas) goes to the main chat first and, once that delivery is recorded as sent, to each extra chat with the very
+  same messages and the same deadline; alerts, failure notices and tests never do. Each extra chat has a ledger row of its own (kind
+  `<report>_extra`, key `<report key>@<chat id>`), which keeps three things true: a person who blocked the bot cannot turn the main
+  chat's delivery, or `health`'s look at the newest `final_report` row, into a failure; a chat that already has a message is never sent
+  it twice; and a failure is one `telegram_extra_delivery_failed` warning per chat and day, never a failed report. The text reaches every
+  chat before any image is drawn (once) or uploaded, so nobody waits for a picture. A report that is withheld or failed for the main
+  chat goes to nobody; the rare crash between the main chat's record and the extras' sends loses only their copy (the report is then a
+  duplicate and is not re-sent).
 - **Chart images** (`notifications/canvas.py` draws, `notifications/charts.py` composes): Pillow draws each chart at twice its size and
   shrinks it once (smooth edges without a vector library; the built-in font has ASCII only, so every label is sanitised and the arrows
   are shapes). A chart is built from the same report object as the text and returned as bytes, a Telegram-HTML caption and the list of
@@ -938,6 +947,7 @@ flowchart TB
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
 | Telegram down | reports and alerts are queued in the ledger and flushed when it returns; late final reports are withheld |
+| An extra chat blocked the bot, or Telegram refuses it | that chat's copy is recorded `failed` in its own ledger row and one `telegram_extra_delivery_failed` warning per chat and day goes to the alert chat; the main chat's delivery, the health check and the other chats are untouched |
 | Pillow missing, a chart that cannot be drawn, or Telegram refusing an image | the text report is delivered and recorded first and stays as it is; the images are skipped, the reason is logged (`chart images stopped` / `charts skipped`) and `doctor` shows a `charts` warning when Pillow is missing |
 | GDELT slow or rate limited (it often is: HTTP 429, 14-36 s to first byte, timeouts) | after two failed queries in a row the rest of the run is read from **Google News search** (`GDELT_FALLBACK`, on by default) with the same topic queries, and a topic GDELT answers with nothing is read from there too; a topic counts as answered when either source answered it, so `source_health` (`gdelt`) warns only when neither does (`gnews_search` has its own row). Fallback items are aggregator-grade evidence (capped at 0.6; a GDELT link to the publisher rates 0.75). The 44 RSS feeds and everything else are unaffected either way, since the discovery only adds headlines |
 | Google News search consent or block page, or no items | the answer is rejected as unreadable (a page without items would otherwise pass for an empty feed); the topic is a coverage gap, never an empty success, and `sources-check --only gdelt` shows the reason |

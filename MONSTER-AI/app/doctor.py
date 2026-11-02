@@ -156,7 +156,9 @@ def _resources(report: DoctorReport, s: Settings) -> None:
 
 def _telegram_config(report: DoctorReport, s: Settings) -> None:
     if s.telegram_configured:
-        report.add("telegram settings", "ok", "token and chat id present")
+        extras = len(s.extra_report_chat_ids)
+        more = f"; the reports also go to {extras} extra chat{'s' if extras != 1 else ''}" if extras else ""
+        report.add("telegram settings", "ok", "token and chat id present" + more)
     elif s.telegram_bot_token:
         report.add("telegram settings", "warn", "token set but TELEGRAM_CHAT_ID missing (run telegram-setup)")
     else:

@@ -28,7 +28,8 @@ for the moments you *want* to look, or when an alert asks you to.
 ## What you receive
 
 All messages arrive in the Telegram chat that was linked at install time (alerts may use a separate chat:
-`TELEGRAM_ALERT_CHAT_ID`).
+`TELEGRAM_ALERT_CHAT_ID`). Other people can receive the same reports and charts, never the alerts: see
+[Adding or removing a reader](#adding-or-removing-a-reader).
 
 | When (IST, trading days) | Message |
 |--------------------------|---------|
@@ -111,7 +112,7 @@ calibrated"* and caps every name at WATCH.
 | `backtest --stage final --years 6` | walk-forward evaluation against the baselines (writes a report) |
 | `backup`, `backup --verify`, `backup --restore-latest [--remote]` | backups, see [below](#backups-and-recovery) |
 | `run-job NAME [--force] [--dry-run] [--opt K=V]` | run one scheduled job by hand (for example `refresh_calendar`) |
-| `telegram-test`, `telegram-setup` | test message; discover the chat id |
+| `telegram-test [--all]`, `telegram-setup [--list]` | test message (`--all`: and a "you are subscribed" note to each extra chat, naming the ones that could not be reached); discover the chat id (`--list`: the chats that wrote to the bot in the last 24 hours, newest first) |
 | `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message with its tables and chart images (made-up data, each marked *SAMPLE PREVIEW*) |
 | `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the optional Groq / Jev keys: one made-up news item through the real code (and one real web search when the web check is on), `OK` or exactly why not (`--list-only` spends no tokens and makes no search), see [the AI services](#the-ai-services-groq-and-jev) |
 | `bootstrap --resume` | continue a first-run setup that stopped |
@@ -192,6 +193,7 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `health_source_<id>` | a data source - or an AI service (`llm_extraction`, `llm_web`, `jev_judgment`) - failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability; for the AI services see [the AI services](#the-ai-services-groq-and-jev) |
 | `health_telegram_not_configured` / `health_report_not_delivered` | no token/chat id, or the last final report could not be sent | `telegram-setup`; check the token |
 | `telegram_delivery_failed` / `report_deadline_missed` | a message could not be delivered (queued, retried) / a final report would have arrived after 09:14:30 and was withheld | check Telegram connectivity; nothing to do for the latter |
+| `telegram_extra_delivery_failed` | a report reached you but not one of the extra chats (one warning per chat and day; the text says which chat and why, usually `bot was blocked by the user`) | ask the person to press **Start** again, or remove their id from `TELEGRAM_EXTRA_CHAT_IDS`; it never affects your own report |
 | `ideas_scan_failed` | the closing-hour scan stopped: NSE's live quotes unavailable (the message gives the reason: blocked, offline, an endpoint that was renamed) or not from today, too few names with a complete row, a gap in the stored history (run `collect_india`), or an unexpected error; it retries every minute for the whole window until 15:00 and sends a notice on the last attempt | read the message; `monster-ai ideas --dry-run`; see [no closing-hour report](#no-closing-hour-report) |
 | `ideas_deadline_missed` | the closing-hour report was ready after 15:05 and was withheld on purpose (the ideas are frozen and still judged in the evening; a report *built* after the deadline is also kept out of the record) | nothing to do; `monster-ai ideas --force` sends the frozen report anyway, marked *late* |
 | `health_calibration_drift` / `health_skill_negative` | live calibration worse than 0.10 ECE / live Brier skill below the base rate over the last 90 days | see [models](#models); consider `models rollback` |
@@ -306,6 +308,28 @@ token is accepted (`telegram bot`). How to read the reason:
 service user cannot write the root-owned environment file.
 
 While Telegram is down, reports and alerts queue in the database and are delivered when it returns (late final reports are withheld).
+
+### Adding or removing a reader
+
+The reports (the 09:12 scan, the optional 08:45 one, the closing-hour ideas, the evening review) and their chart images can go to more
+chats than yours; alerts, failure notices and tests never do. To add a person:
+
+1. They open the bot in Telegram and press **Start** (a bot cannot write to someone first).
+2. Within 24 hours, `sudo monster-ai telegram-setup --list` shows every chat that wrote to the bot, newest first, with name, handle,
+   time and whether it is already subscribed. Copy the chat id (a number; a group's starts with `-100`).
+3. `sudo nano /etc/monster-ai/monster.env`, set `TELEGRAM_EXTRA_CHAT_IDS=<id>[,<id> ...]` (commas or spaces; your own chat id in the list
+   is ignored), then `sudo systemctl restart monster-ai`.
+4. `sudo monster-ai telegram-test --all` sends the new reader a short "you are subscribed" note (nothing about your configuration) and
+   prints `extra chat <id>: sent`, or the reason it could not be reached.
+
+To remove someone, delete the id from the line and restart. `sudo monster-ai doctor` shows how many extra chats receive the reports.
+
+How it behaves: your chat is served first and never waits for the others; the text reaches every chat before any image is drawn or
+uploaded; each chat has its own delivery record (`deliveries` rows of kind `<report>_extra`, key `<report key>@<chat id>`), so one
+person blocking the bot changes nothing for you or for the others, and the only trace is the `telegram_extra_delivery_failed` warning,
+once a day per chat. A report withheld for you (a missed deadline, a failed delivery) is not sent to anybody; a repeat of a report that
+was sent is not sent again to anybody. Everybody sees the same text, so a reader of the closing-hour ideas gets the same "research
+output, not advice" wording you do.
 
 ### The AI services (Groq and Jev)
 

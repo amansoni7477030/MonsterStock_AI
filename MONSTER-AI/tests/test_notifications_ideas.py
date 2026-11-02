@@ -331,6 +331,26 @@ def test_a_failed_delivery_is_retried_by_the_next_call(cfg, store, fake_clock):
     assert service.send_ideas(make_report()).status == "sent" and store.get_delivery("telegram", KEY)["status"] == "sent"
 
 
+def test_the_closing_hour_ideas_and_their_two_images_reach_the_extra_chats_after_the_text(cfg, store, fake_clock):
+    from tests.test_notifications_service import RoutedClient
+
+    client = RoutedClient(broken={"3003"})
+    service = NotificationService(dataclasses.replace(cfg, telegram_extra_chat_ids=("3003", "4004")), store, client=client,
+                                  clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    expected = render_ideas_report(make_report())
+    assert service.send_ideas(make_report()).status == "sent"
+    texts = [(chat, text) for chat, text, _ in client.sent]
+    assert [chat for chat, _ in texts] == ["1001"] * len(expected) + ["4004"] * len(expected)  # 3003 blocked the bot
+    assert [text for _, text in texts[len(expected):]] == expected  # the same messages, in the same order
+    assert client.order == ["text"] * (2 * len(expected)) + ["photo"] * 4  # all the text first, then the board and the plan twice
+    assert [chat for chat, *_ in client.photos] == ["1001", "1001", "4004", "4004"]
+    assert store.get_delivery("telegram", KEY)["status"] == "sent"
+    assert store.get_delivery("telegram", f"{KEY}@4004")["kind"] == "ideas_report_extra"
+    assert store.get_delivery("telegram", f"{KEY}@3003")["status"] == "failed"
+    assert service.send_ideas(make_report(), force=True).status == "duplicate"
+
+
 # ----------------------------------------------------------------------------------------- the charts
 def test_the_report_is_followed_by_its_board_and_its_trade_plan(cfg, store, fake_clock):
     client = PhotoClient()

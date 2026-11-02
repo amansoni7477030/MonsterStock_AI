@@ -16,6 +16,11 @@ the other records.
 - **New dependency `Pillow==12.3.0`** (binary wheels for linux x86-64 and aarch64, CPython 3.10-3.13; the installer and the CI wheel
   guard cover it, because both read `requirements.txt`). It only draws the chart images: without it the reports go out as text.
   **New setting `SEND_CHARTS`** (true) switches the images off; the tables are part of the text and need nothing.
+- **New setting `TELEGRAM_EXTRA_CHAT_IDS`** (empty): more Telegram chats that get the same reports and chart images as the main chat, never
+  the alerts, failure notices or tests. Nothing changes until it is set. Each chat has its own delivery record, so the new rows in
+  `deliveries` have the kinds `final_report_extra`, `prelim_report_extra`, `evening_report_extra` and `ideas_report_extra` (and
+  `test_extra`); the installer appends the empty key to `monster.env` on the next run. See `docs/OPERATIONS.md`, *Adding or removing a
+  reader*.
 - **New setting `GDELT_FALLBACK`** (true): when GDELT does not deliver a topic, the news job reads it from Google News search instead
   (no key, no new dependency). `GDELT_ENABLED=false` now means "skip GDELT, use Google News search alone"; set both to `false` for no
   global news discovery at all. The 44 RSS feeds do not depend on either. A new source `gnews_search` is registered by the next job (or
@@ -33,6 +38,17 @@ the other records.
 
 ### Added
 
+- **More than one reader for the Telegram reports** (`TELEGRAM_EXTRA_CHAT_IDS`; `NotificationService._deliver_extras`, the shared
+  `_send_messages` loop, `send_test_extras`; `render_subscriber_welcome`). A friend sends the bot `/start`, `telegram-setup --list`
+  shows every chat that wrote to it in the last 24 hours (newest first, with name, handle, time and whether it is already subscribed),
+  and the id goes into the setting. The prelim, final, evening and closing-hour reports then reach the main chat first and, once that is
+  recorded as sent, every extra chat with the same messages and deadline, followed by one drawing of the chart images for everybody
+  (the text always reaches all chats before the first image). Alerts, failure notices and tests stay with the owner;
+  `telegram-test --all` sends each extra chat a short "you are subscribed" note (nothing of the configuration) and names the ones that
+  could not be reached; `doctor` says how many extra chats there are. Failure isolation is the point: every extra chat has its own ledger
+  row, so a friend who blocked the bot never turns the owner's delivery, or the health check that reads the newest `final_report` row,
+  into a failure, and costs one `telegram_extra_delivery_failed` warning per chat and day. Tests cover the fan-out, the ledger, the
+  failure paths, the images and the commands.
 - **Tables and chart images in the Telegram reports** (`notifications/canvas.py`, `notifications/charts.py`, `send_photo` in
   `notifications/telegram.py`, see README *What the Telegram messages look like*). The 09:12 report and the closing-hour report get an
   "at a glance" table in monospace (at most 39 / 37 characters wide, so a phone needs no sideways scrolling); the closing-hour report

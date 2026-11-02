@@ -628,6 +628,36 @@ def test_discover_chat_id_propagates_auth_errors(make):
     assert info.value.retryable is False
 
 
+def test_chats_in_updates_lists_every_chat_once_newest_first_with_its_name_handle_and_time():
+    from notifications.telegram import chats_in_updates
+
+    def msg(update_id, chat_id, when, **chat):
+        return {"update_id": update_id, "message": {"date": when, "chat": {"id": chat_id, "type": "private", **chat}}}
+
+    found = chats_in_updates([
+        msg(1, 42, 1000, first_name="The", last_name="Owner"),
+        msg(2, 855690215, 2000, first_name="A", last_name="Friend", username="friend01"),
+        msg(3, 700100, 1500, username="onlyhandle"),
+        msg(4, 855690215, 3000, first_name="A", last_name="Friend", username="friend01"),  # a later message of the same chat
+        {"update_id": 5, "channel_post": {"date": 1200, "chat": {"id": -100888, "type": "channel", "title": "Desk"}}},
+        {"update_id": 6, "message": {"text": "no chat in this one"}},  # nothing to list
+        {"update_id": 7, "edited_message": {"date": True, "chat": {"id": 9, "type": "private", "first_name": "Odd"}}},
+    ])
+    assert [c["chat_id"] for c in found] == ["855690215", "700100", "-100888", "42", "9"]  # the chat that wrote last comes first
+    friend = found[0]
+    assert friend == {"chat_id": "855690215", "title": "A Friend", "type": "private", "username": "@friend01", "last_message_at": 3000}
+    assert found[1]["title"] == "@onlyhandle" and found[1]["username"] == "@onlyhandle"  # no name: the handle stands in
+    assert found[2]["type"] == "channel" and found[4]["last_message_at"] is None  # a date that is no time is not invented
+    assert chats_in_updates([]) == []
+
+
+def test_discover_chat_id_still_returns_the_first_chat_with_the_keys_it_always_had(make):
+    first = {"update_id": 1, "message": {"date": 5, "chat": {"id": 42, "type": "private", "first_name": "Fake", "username": "u"}}}
+    second = {"update_id": 2, "message": {"date": 6, "chat": {"id": 43, "type": "private", "first_name": "Other"}}}
+    client, _ = make(updates(first, second))
+    assert client.discover_chat_id() == {"chat_id": "42", "title": "Fake", "type": "private"}  # unchanged by the listing helper
+
+
 # --------------------------------------------------------------------------------------- deadlines
 def test_deadline_in_the_past_aborts_before_any_request(make, fake_clock):
     client, session = make()

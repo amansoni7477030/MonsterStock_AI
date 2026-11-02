@@ -11,10 +11,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from app import jsonutil
 from app.clock import Clock, at_ist, get_clock, iso, parse_date
@@ -46,6 +46,16 @@ class DeliveryResult:
     @property
     def ok(self) -> bool:
         return self.status in ("sent", "duplicate")
+
+
+class _Sent(NamedTuple):
+    """What sending a report's messages to one chat came to (see ``NotificationService._send_messages``)."""
+
+    status: str  # sent | failed | withheld
+    reason: str | None
+    retryable: bool
+    message_ids: list[int]
+    attempts: int
 
 
 def _safe_reason(exc: BaseException) -> str:
@@ -83,6 +93,10 @@ class NotificationService:
     @property
     def clock(self) -> Clock:
         return self._clock or get_clock()
+
+    def _extras(self) -> tuple[str, ...]:
+        """The extra chats that get every report after the main one (a duck-typed settings object may know none)."""
+        return tuple(getattr(self.settings, "extra_report_chat_ids", ()) or ())
 
     # --------------------------------------------------------------------------------- reports
     def send_report(self, ctx: ReportContext, *, force: bool = False) -> DeliveryResult:
@@ -133,7 +147,7 @@ class NotificationService:
             messages = _prefix_late(messages)
         return self._deliver(
             kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
-            charts=None if late else lambda: chart_images.report_charts(ctx),
+            charts=None if late else lambda: chart_images.report_charts(ctx), extra_chat_ids=self._extras(),
         )
 
     def send_evening(self, summary: EveningSummary) -> DeliveryResult:
@@ -152,7 +166,7 @@ class NotificationService:
         except Exception as exc:
             return self._render_failed(kind, key, trade_date, exc)
         return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date,
-                             charts=lambda: chart_images.evening_charts(summary))
+                             charts=lambda: chart_images.evening_charts(summary), extra_chat_ids=self._extras())
 
     def send_ideas(self, ideas_report: IdeasReport, *, force: bool = False) -> DeliveryResult:
         """Send the closing-hour trade-idea report once per trade date. It is time-critical: a report that would go out after
@@ -190,7 +204,8 @@ class NotificationService:
             return self._render_failed(kind, key, trade_date, exc)
         late = bool(getattr(ideas_report, "late", False)) or self.clock.now() > deadline  # too late to act on: no images either
         return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
-                             charts=None if late else lambda: chart_images.ideas_charts(ideas_report))
+                             charts=None if late else lambda: chart_images.ideas_charts(ideas_report),
+                             extra_chat_ids=self._extras())
 
     def send_failure_notice(
         self, trade_date: str, stage: str, reason: str, details: Any = None
@@ -221,6 +236,13 @@ class NotificationService:
     def send_test(self) -> DeliveryResult:
         key = f"test:{iso(self.clock.now())}:{uuid.uuid4().hex[:8]}"
         return self.send_text("test", key, report.render_test_message(self.settings))
+
+    def send_test_extras(self) -> list[tuple[str, DeliveryResult]]:
+        """Send each extra chat the one short "you are subscribed" note and say which could be reached: the check to run after a
+        recipient is added. (The owner's test message carries the system's configuration, which is not theirs to see.)"""
+        stamp = f"{iso(self.clock.now())}:{uuid.uuid4().hex[:8]}"
+        text = report.render_subscriber_welcome(self.settings)
+        return [(chat, self.send_text("test_extra", f"test:{stamp}@{chat}", text, chat_id=chat)) for chat in self._extras()]
 
     # ---------------------------------------------------------------------------------- alerts
     def alert(
@@ -327,39 +349,40 @@ class NotificationService:
         )
         return DeliveryResult("failed", reason)
 
-    def _send_charts(self, build: Callable[[], list[Any]] | None, chat_id: Any, key: str) -> int:
-        """Send a report's chart images after its text, one photo each. Best effort: a missing library, a failed drawing or a refused
-        upload is logged and never changes the delivery that is already recorded. A client without ``send_photo`` (or
-        ``SEND_CHARTS=false``) sends none. Returns how many images went out."""
+    def _send_charts(self, build: Callable[[], list[Any]] | None, chat_ids: Any, key: str) -> int:
+        """Send a report's chart images after its text, one photo each, to every chat that got the text (a single chat id or a
+        list; the drawing happens once). Best effort: a missing library, a failed drawing or a refused upload is logged and never
+        changes the delivery that is already recorded, and one chat's refusal does not stop the next chat. A client without
+        ``send_photo`` (or ``SEND_CHARTS=false``) sends none; all the images share one time budget. Returns how many went out."""
         send = getattr(self.client, "send_photo", None)
         if build is None or not callable(send) or not getattr(self.settings, "send_charts", True):
             return 0
+        chats = [chat_ids] if isinstance(chat_ids, (str, int)) else list(chat_ids)
         sent = 0
         until = self.clock.now() + timedelta(seconds=CHART_BUDGET_SEC)
         try:
-            for chart in build():
-                send(chat_id, chart.png, caption=chart.caption, filename=chart.filename, deadline=until)
-                sent += 1
+            images = build()
         except Exception as exc:  # noqa: BLE001 - an image is an extra: the text report is already delivered
-            log.warning("%s: chart images stopped after %d: %s at %s", key, sent, _safe_reason(exc), exception_site(exc))
+            log.warning("%s: chart images stopped after 0: %s at %s", key, _safe_reason(exc), exception_site(exc))
+            return 0
+        for chat in chats:
+            count = 0
+            try:
+                for chart in images:
+                    send(chat, chart.png, caption=chart.caption, filename=chart.filename, deadline=until)
+                    count += 1
+            except Exception as exc:  # noqa: BLE001
+                where = f" for chat {chat}" if len(chats) > 1 else ""
+                log.warning("%s: chart images stopped after %d%s: %s at %s", key, count, where, _safe_reason(exc),
+                            exception_site(exc))
+            sent += count
         if sent:
             log.info("%s: %d chart image(s) delivered", key, sent)
         return sent
 
-    def _deliver(
-        self,
-        kind: str,
-        key: str,
-        messages: list[str],
-        *,
-        chat_id: Any,
-        trade_date: str | None,
-        deadline: datetime | None = None,
-        charts: Callable[[], list[Any]] | None = None,
-    ) -> DeliveryResult:
-        digest = hashlib.sha256("\n".join(messages).encode("utf-8", "replace")).hexdigest()
-        self.store.save_delivery(CHANNEL, kind, key, "pending", trade_date=trade_date, body_hash=digest)
-        options = {"deadline": deadline} if deadline is not None else {}
+    def _send_messages(self, chat_id: Any, messages: list[str], options: dict[str, Any], what: str) -> _Sent:
+        """Send ``messages`` to one chat in order and stop at the first that fails. Never raises: a deadline, a Telegram refusal or
+        anything unexpected is the returned status (``withheld`` / ``failed``) with a redacted reason, plus the ids already sent."""
         sent_ids: list[int] = []
         attempts = 0
         status, reason, retryable = "sent", None, True
@@ -374,10 +397,75 @@ class NotificationService:
                 sent_ids.extend(getattr(exc, "message_ids", []))
             except Exception as exc:  # delivery problems must never raise into the scheduler
                 status, reason = "failed", _safe_reason(exc)
-                log.warning("delivery %s [%s] failed unexpectedly: %s at %s", kind, key, reason, exception_site(exc))
+                log.warning("delivery %s failed unexpectedly: %s at %s", what, reason, exception_site(exc))
             attempts += self._attempts_used()
             if status != "sent":
                 break
+        return _Sent(status, reason, retryable, sent_ids, attempts)
+
+    def _deliver_extras(
+        self,
+        kind: str,
+        key: str,
+        messages: list[str],
+        chats: Sequence[str],
+        *,
+        trade_date: str | None,
+        options: dict[str, Any],
+        digest: str,
+    ) -> list[str]:
+        """Send the same messages to each extra chat once the main chat has them; returns the chats that got the text.
+
+        Every chat has a ledger row of its own (kind ``<kind>_extra``, key ``<key>@<chat>``), so a chat that blocked the bot can
+        never change the main delivery, the health check that reads it, or what the other chats receive, and a message already
+        sent to a chat is never sent to it twice. A failure is logged and queued as one warning per chat and day for the alert
+        chat; it is never an error of the report."""
+        extra_kind = f"{kind}_extra"
+        reached: list[str] = []
+        for chat in chats:
+            extra_key = f"{key}@{chat}"
+            if self._duplicate(extra_key):
+                reached.append(chat)
+                continue
+            self.store.save_delivery(CHANNEL, extra_kind, extra_key, "pending", trade_date=trade_date, body_hash=digest)
+            outcome = self._send_messages(chat, messages, options, f"{extra_kind} [{extra_key}]")
+            self.store.save_delivery(
+                CHANNEL, extra_kind, extra_key, outcome.status, trade_date=trade_date, attempts=outcome.attempts,
+                message_ids=outcome.message_ids or None, error=outcome.reason, body_hash=digest,
+            )
+            if outcome.status == "sent":
+                reached.append(chat)
+                log.info("%s delivered to the extra chat %s (%d message(s))", key, chat, len(outcome.message_ids))
+                continue
+            log.warning("%s not delivered to the extra chat %s (%s): %s", key, chat, outcome.status, outcome.reason)
+            subject = f"{kind} for {trade_date}" if trade_date else kind
+            self.alert(
+                "warning",
+                "telegram_extra_delivery_failed",
+                f"{subject} did not reach the extra chat {chat}: {outcome.reason}. If they stopped or blocked the bot, remove the "
+                "chat from TELEGRAM_EXTRA_CHAT_IDS.",
+                dedupe_key=f"extra-failed:{chat}:{trade_date or 'n/a'}",
+                dedupe_minutes=720,
+                deliver_now=False,
+            )
+        return reached
+
+    def _deliver(
+        self,
+        kind: str,
+        key: str,
+        messages: list[str],
+        *,
+        chat_id: Any,
+        trade_date: str | None,
+        deadline: datetime | None = None,
+        charts: Callable[[], list[Any]] | None = None,
+        extra_chat_ids: Sequence[str] = (),
+    ) -> DeliveryResult:
+        digest = hashlib.sha256("\n".join(messages).encode("utf-8", "replace")).hexdigest()
+        self.store.save_delivery(CHANNEL, kind, key, "pending", trade_date=trade_date, body_hash=digest)
+        options = {"deadline": deadline} if deadline is not None else {}
+        status, reason, retryable, sent_ids, attempts = self._send_messages(chat_id, messages, options, f"{kind} [{key}]")
 
         if status == "sent":
             self.store.save_delivery(
@@ -385,7 +473,10 @@ class NotificationService:
                 message_ids=sent_ids, body_hash=digest,
             )
             log.info("%s delivered (%d message(s), %d attempt(s))", key, len(sent_ids), attempts)
-            self._send_charts(charts, chat_id, key)
+            # the text reaches everybody before any image is drawn or uploaded, so nobody waits for the pictures
+            reached = self._deliver_extras(kind, key, messages, extra_chat_ids, trade_date=trade_date, options=options,
+                                           digest=digest)
+            self._send_charts(charts, [chat_id, *reached], key)
             return DeliveryResult("sent", None, sent_ids, attempts)
 
         self.store.save_delivery(

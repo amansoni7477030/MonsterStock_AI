@@ -121,6 +121,26 @@ def _models(value: str) -> tuple[str, ...] | None:
     return tuple(names)
 
 
+_CHAT_ID = re.compile(r"-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{3,31}")
+MAX_EXTRA_CHATS = 20  # a sanity bound: these are friends of the operator, not a broadcast list
+
+
+def _chat_ids(value: str) -> tuple[str, ...]:
+    """Telegram chats separated by commas or spaces, each a number (``123456789``, ``-100...`` for a group or channel) or a public
+    ``@channelname``, without repeats and in the order given. Empty = none."""
+    out: list[str] = []
+    for item in re.split(r"[,\s]+", value.strip()):
+        if not item:
+            continue
+        if not _CHAT_ID.fullmatch(item):
+            raise ValueError(f"not a Telegram chat id: {item!r} (a number such as 123456789, or -100... for a group)")
+        if item not in out:
+            out.append(item)
+    if len(out) > MAX_EXTRA_CHATS:
+        raise ValueError(f"at most {MAX_EXTRA_CHATS} chats")
+    return tuple(out)
+
+
 def _choice(*options: str) -> Callable[[str], str]:
     def parse(value: str) -> str:
         v = value.strip().lower()
@@ -183,6 +203,9 @@ VARS: tuple[Var, ...] = (
         "Destination chat id (run `python -m app.cli telegram-setup` to discover it automatically).", "Telegram"),
     Var("telegram_alert_chat_id", "TELEGRAM_ALERT_CHAT_ID", "", _opt_str,
         "Chat for operational alerts (defaults to TELEGRAM_CHAT_ID).", "Telegram"),
+    Var("telegram_extra_chat_ids", "TELEGRAM_EXTRA_CHAT_IDS", "", _chat_ids,
+        "More chats that also receive the reports and their chart images (comma separated; the person sends the bot /start first, "
+        "`telegram-setup --list` shows their id). They never get the operational alerts, failure notices or tests.", "Telegram"),
     Var("send_prelim_report", "SEND_PRELIM_REPORT", "false", _bool,
         "Also send the 08:45 preliminary scan (off by default to avoid noise).", "Telegram"),
     Var("send_evening_report", "SEND_EVENING_REPORT", "true", _bool, "Send the post-session evaluation summary.", "Telegram"),
@@ -387,6 +410,7 @@ class Settings:
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_alert_chat_id: str | None = None
+    telegram_extra_chat_ids: tuple[str, ...] = ()
     send_prelim_report: bool = False
     send_evening_report: bool = True
     send_charts: bool = True
@@ -504,6 +528,18 @@ class Settings:
     @property
     def alert_chat_id(self) -> str | None:
         return self.telegram_alert_chat_id or self.telegram_chat_id
+
+    @property
+    def extra_report_chat_ids(self) -> tuple[str, ...]:
+        """The chats that get every report besides the main one (never the alerts): the configured extras, without the main chat
+        itself and without repeats, in the order given."""
+        seen = {self.telegram_chat_id} if self.telegram_chat_id else set()
+        out: list[str] = []
+        for chat in self.telegram_extra_chat_ids:
+            if chat not in seen:
+                seen.add(chat)
+                out.append(chat)
+        return tuple(out)
 
     @property
     def llm_provider(self) -> str | None:

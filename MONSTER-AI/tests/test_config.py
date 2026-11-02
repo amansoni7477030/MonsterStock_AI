@@ -130,6 +130,36 @@ def test_valid_token_and_redaction(tmp_path):
     assert token not in repr(s) and "abcdef123456" not in repr(s) and "***set***" in repr(s)  # logs and tracebacks stay clean
 
 
+def test_extra_telegram_chats_are_optional_validated_and_never_repeat_the_main_chat(tmp_path):
+    none = _load(tmp_path, TELEGRAM_CHAT_ID="42")
+    assert none.telegram_extra_chat_ids == () and none.extra_report_chat_ids == ()
+    s = _load(tmp_path, TELEGRAM_CHAT_ID="42", TELEGRAM_EXTRA_CHAT_IDS=" 855690215, -1001234567890 ,@signals_desk 42 855690215,")
+    assert s.telegram_extra_chat_ids == ("855690215", "-1001234567890", "@signals_desk", "42")  # commas or spaces, no repeats
+    assert s.extra_report_chat_ids == ("855690215", "-1001234567890", "@signals_desk")  # the main chat is never sent twice
+    assert _load(tmp_path, TELEGRAM_EXTRA_CHAT_IDS="7001").extra_report_chat_ids == ("7001",)  # no main chat: all are extras
+    # the owner's alerts stay with the owner: the extras are no alert chat, whatever is configured
+    assert s.alert_chat_id == "42" and _load(tmp_path, TELEGRAM_CHAT_ID="42", TELEGRAM_ALERT_CHAT_ID="9").alert_chat_id == "9"
+
+
+@pytest.mark.parametrize("value", ["abc", "123 four", "12.5", "@ab", "@1abc", "https://t.me/someone", "1" * 21, "+4915112345678", "-"])
+def test_a_malformed_extra_chat_is_refused_with_the_variable_named(tmp_path, value):
+    with pytest.raises(ConfigError) as err:
+        _load(tmp_path, TELEGRAM_EXTRA_CHAT_IDS=value)
+    assert "TELEGRAM_EXTRA_CHAT_IDS" in str(err.value) and "chat id" in str(err.value)
+
+
+def test_the_number_of_extra_chats_is_bounded(tmp_path):
+    assert len(_load(tmp_path, TELEGRAM_EXTRA_CHAT_IDS=",".join(str(1000 + i) for i in range(20))).telegram_extra_chat_ids) == 20
+    with pytest.raises(ConfigError) as err:
+        _load(tmp_path, TELEGRAM_EXTRA_CHAT_IDS=",".join(str(1000 + i) for i in range(21)))
+    assert "at most 20" in str(err.value)
+
+
+def test_extra_chat_ids_are_not_secrets_but_are_shown_in_the_redacted_settings(tmp_path):
+    shown = _load(tmp_path, TELEGRAM_CHAT_ID="42", TELEGRAM_EXTRA_CHAT_IDS="855690215").redacted()
+    assert shown["telegram_extra_chat_ids"] == ("855690215",)
+
+
 def test_env_file_parsing(tmp_path):
     env_file = tmp_path / "x.env"
     env_file.write_text(

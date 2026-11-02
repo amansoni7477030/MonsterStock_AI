@@ -302,6 +302,13 @@ A chart is an extra: `SEND_CHARTS=false`, or a machine without Pillow, sends tex
 refused by Telegram is logged and never changes a report that was already delivered. `sudo monster-ai doctor` says whether charts
 are on, and `sudo monster-ai telegram-preview` sends a sample of everything (every image carries a red *SAMPLE PREVIEW* strip).
 
+**Who receives them.** The chat in `TELEGRAM_CHAT_ID` is yours and gets everything. Friends or colleagues can get **the same reports
+and chart images** (never the operational alerts, failure notices or tests): they send the bot `/start`, `sudo monster-ai
+telegram-setup --list` shows their chat ids, and you add them to `TELEGRAM_EXTRA_CHAT_IDS` (comma separated) and restart the service;
+`sudo monster-ai telegram-test --all` then sends each of them a short "you are subscribed" note and says which could be reached. Your
+chat is served first and never waits for the others, the text reaches everybody before any image, and every chat has a delivery record
+of its own, so a person who blocked the bot costs the others nothing and raises one warning a day for you, never a failed report.
+
 ## Commands
 
 `python -m app.cli <command>` (on the server: `sudo monster-ai <command>`):
@@ -325,7 +332,7 @@ are on, and `sudo monster-ai telegram-preview` sends a sample of everything (eve
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
 | `logs [--role R] [--date D] [-n N] [--level L] [--job J] [--grep T] [--since 90m] [--follow] [--list]` | read, filter and follow the daily logs (default: today's warnings and errors of every process) |
 | `diag` | write a redacted diagnostics bundle (`diag-<UTC>.tar.gz`) for a bug report |
-| `telegram-setup`, `telegram-test`, `telegram-preview` | discover the chat id; send a test message; send one sample of every message type with its tables and chart images (made-up data, marked *SAMPLE PREVIEW*) |
+| `telegram-setup [--list]`, `telegram-test [--all]`, `telegram-preview` | discover the chat id (`--list`: every chat that wrote to the bot in the last 24 hours, newest first, to find a friend's id for `TELEGRAM_EXTRA_CHAT_IDS`); send a test message (`--all`: and a short "you are subscribed" note to each extra chat, naming the ones that could not be reached); send one sample of every message type with its tables and chart images (made-up data, marked *SAMPLE PREVIEW*) |
 | `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the Groq / Jev keys: lists the models the key can use, then sends one made-up news item through the real code (and makes one real web search when the web check is on) and prints the answer or why not (`--list-only` spends no tokens and makes no search) |
 | `dashboard` | optional read-only web view |
 | `env-example`, `version` | print the documented `.env` template; print the version and the running code fingerprint |
@@ -339,6 +346,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Group | Key knobs (defaults) |
 |-------|----------------------|
 | Mode and universe | `MONSTER_MODE` (shadow), `UNIVERSE_MODE` (fno_nifty100), `HISTORY_YEARS` (10) |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ALERT_CHAT_ID` (alerts; defaults to the main chat), `TELEGRAM_EXTRA_CHAT_IDS` (more chats that get the same reports and charts, never the alerts), `SEND_PRELIM_REPORT`, `SEND_EVENING_REPORT`, `SEND_CHARTS` |
 | Prediction | `PRIMARY_THRESHOLD` (3.0), `TOP_N` (5), `RANGE_THRESHOLDS`, `UNUSUAL_K`, tier probabilities (`TIER_*_P`) |
 | Schedule | `PRELIM_SCAN_TIME`, `FINAL_SCAN_TIME`, `REPORT_CUTOFF_TIME`, `REPORT_DEADLINE_TIME` |
 | Closing-hour ideas | `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true), `IDEAS_REPORT_DEADLINE_TIME` (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5 per list), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS` (true) |

@@ -16,12 +16,12 @@ import shutil
 import subprocess  # noqa: S404 - only journalctl with a fixed argument vector
 import sys
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app import __version__
-from app.clock import get_clock, ist_date, pin_process_timezone
+from app.clock import IST, get_clock, ist_date, pin_process_timezone
 from app.config import ConfigError, Settings, env_example_text, load_settings
 from app.logging_setup import configure_from_settings, redact, register_secrets
 from app.release import release_id
@@ -520,6 +520,33 @@ def cmd_alert_unit(args: argparse.Namespace) -> int:
         return EXIT_FAIL
 
 
+def _list_recent_chats(client: Any, settings: Settings, me: dict[str, Any]) -> int:
+    """``telegram-setup --list``: the chats the bot was messaged from (Telegram keeps them 24 hours), most recent first, so an id can
+    be copied into TELEGRAM_EXTRA_CHAT_IDS. Read-only: nothing is confirmed, consumed or written."""
+    from notifications.telegram import chats_in_updates
+
+    try:
+        chats = chats_in_updates(client.get_updates(timeout=0))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Telegram call failed while reading the bot's messages: {_why(exc)}", file=sys.stderr)
+        return EXIT_FAIL
+    if not chats:
+        print(f"no message from the last 24 hours: ask the person to send @{me.get('username', 'the bot')} /start and run this again",
+              file=sys.stderr)
+        return EXIT_FAIL
+    known = {str(settings.telegram_chat_id or ""): "main chat (TELEGRAM_CHAT_ID)"}
+    known.update({chat: "extra recipient (TELEGRAM_EXTRA_CHAT_IDS)" for chat in settings.extra_report_chat_ids})
+    print(f"{'chat id':>16}  {'type':<8} {'name':<26} {'handle':<22} {'last message (IST)':<19} status")
+    for chat in chats:
+        when = chat["last_message_at"]
+        stamp = "" if when is None else datetime.fromtimestamp(when, tz=timezone.utc).astimezone(IST).strftime("%d %b %H:%M")
+        print(f"{chat['chat_id']:>16}  {chat['type']:<8} {chat['title'][:26]:<26} {chat['username'][:22]:<22} {stamp:<19} "
+              f"{known.get(chat['chat_id'], 'not subscribed')}")
+    print("to subscribe one: add its chat id to TELEGRAM_EXTRA_CHAT_IDS (comma separated) in the env file and restart the service",
+          file=sys.stderr)
+    return EXIT_OK
+
+
 def cmd_telegram_setup(args: argparse.Namespace) -> int:
     """Find the chat id of the person who messaged the bot (no manual API calls needed)."""
     from app.envfile import upsert_env
@@ -538,6 +565,8 @@ def cmd_telegram_setup(args: argparse.Namespace) -> int:
         print(f"Telegram call failed: {_why(exc)}", file=sys.stderr)
         return EXIT_FAIL
     print(f"bot: @{me.get('username', '?')}")
+    if args.list:
+        return _list_recent_chats(client, settings, me)
     print(f"Open Telegram, find @{me.get('username', 'your bot')} and send it any message (e.g. /start).", file=sys.stderr)
     try:
         found = client.discover_chat_id(wait_seconds=float(args.wait))
@@ -565,11 +594,17 @@ def cmd_telegram_test(args: argparse.Namespace) -> int:
     _logging(settings, "cli.log")
     store = _open_store(settings)
     try:
-        outcome = NotificationService(settings, store).send_test()
+        service = NotificationService(settings, store)
+        outcome = service.send_test()
+        extras = service.send_test_extras() if args.all else []
     finally:
         store.close()
     print(f"telegram test: {outcome.status}" + (f" ({outcome.reason})" if outcome.reason else ""))
-    return EXIT_OK if outcome.ok else EXIT_FAIL
+    for chat, result in extras:
+        print(f"extra chat {chat}: {result.status}" + (f" ({result.reason})" if result.reason else ""))
+    if args.all and not extras:
+        print("no extra chats are configured (TELEGRAM_EXTRA_CHAT_IDS is empty)")
+    return EXIT_OK if outcome.ok and all(result.ok for _chat, result in extras) else EXIT_FAIL
 
 
 def cmd_telegram_preview(args: argparse.Namespace) -> int:
@@ -754,7 +789,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wait", type=int, default=120)
     p.add_argument("--print-only", action="store_true")
     p.add_argument("--write-env")
-    add("telegram-test", cmd_telegram_test, "send a test message")
+    p.add_argument("--list", action="store_true",
+                   help="list the chats the bot was messaged from in the last 24 hours (to find a friend's id for TELEGRAM_EXTRA_CHAT_IDS)")
+    p = add("telegram-test", cmd_telegram_test, "send a test message")
+    p.add_argument("--all", action="store_true",
+                   help="also send each TELEGRAM_EXTRA_CHAT_IDS chat a short 'you are subscribed' note and say which could be reached")
     p = add("telegram-preview", cmd_telegram_preview, "send one sample of every Telegram message type with its tables and charts (made-up data)")
     p.add_argument("--only", nargs="+", metavar="KIND", help="only these kinds (see --list)")
     p.add_argument("--list", action="store_true", help="list the kinds of sample message and exit")

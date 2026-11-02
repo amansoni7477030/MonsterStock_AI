@@ -97,6 +97,26 @@ def test_doctor_says_whether_chart_images_will_be_sent_and_why_not(cli_env, monk
     assert missing.status == "warn" and "text only" in missing.detail and "requirements.txt" in missing.detail
 
 
+def test_doctor_says_how_many_extra_chats_get_the_reports(cli_env, monkeypatch):
+    import app.doctor as doctor
+    from app.config import load_settings
+
+    def row():
+        report = doctor.DoctorReport()
+        doctor._telegram_config(report, load_settings())
+        (check,) = report.checks
+        assert check.name == "telegram settings"
+        return check
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    assert (row().status, row().detail) == ("ok", "token and chat id present")
+    monkeypatch.setenv("TELEGRAM_EXTRA_CHAT_IDS", "855690215")
+    assert (row().status, row().detail) == ("ok", "token and chat id present; the reports also go to 1 extra chat")
+    monkeypatch.setenv("TELEGRAM_EXTRA_CHAT_IDS", "855690215, 700100, 42")  # the main chat is not counted twice
+    assert row().detail.endswith("the reports also go to 2 extra chats") and "855690215" not in row().detail
+
+
 def test_sources_check_exits_0_when_every_endpoint_answers_and_1_when_one_does_not(cli_env, monkeypatch, capsys):
     from app import sourcecheck
     from app.doctor import DoctorReport
@@ -461,6 +481,137 @@ def test_alert_unit_sanitises_the_unit_name_and_redacts_logs(cli_env, monkeypatc
     assert sent["chat"] == "42"
     assert sent["text"].startswith("🚨 <b>Service failed</b> · <code>monster-ai.servicerm-rf</code>")  # the sanitised name
     assert "📜 <b>Last journal lines</b>" in sent["text"] and " IST</i>" in sent["text"]
+
+
+_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+
+
+def _updates(*items):
+    """A getUpdates answer from ``(chat_id, first_name, username, text, epoch_seconds)`` tuples, oldest first."""
+    out = []
+    for n, (chat_id, name, username, text, when) in enumerate(items, 1):
+        chat = {"id": chat_id, "type": "private", "first_name": name, **({"username": username} if username else {})}
+        out.append({"update_id": n, "message": {"message_id": n, "date": when, "chat": chat, "text": text}})
+    return out
+
+
+def _bot_that_lists(monkeypatch, updates, *, error=None):
+    import notifications.telegram as tg
+
+    asked = []
+
+    class Lister:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_me(self):
+            return {"username": "monster_test_bot"}
+
+        def get_updates(self, offset=None, timeout=0):
+            asked.append(offset)
+            if error:
+                raise error
+            return updates
+
+    monkeypatch.setattr(tg, "TelegramClient", Lister)
+    return asked
+
+
+def _epoch(hour, minute):
+    from datetime import datetime, timezone
+
+    return int(datetime(2026, 11, 2, hour, minute, tzinfo=timezone.utc).timestamp())
+
+
+def test_telegram_setup_list_shows_who_messaged_the_bot_newest_first_and_who_is_subscribed(cli_env, monkeypatch, capsys):
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("TELEGRAM_EXTRA_CHAT_IDS", "700100")
+    asked = _bot_that_lists(monkeypatch, _updates(
+        (42, "The Owner", "", "/start", _epoch(10, 0)),
+        (855690215, "A Friend", "friend01", "/start", _epoch(18, 51)),  # 00:21 IST on the 3rd
+        (700100, "Subscribed", "", "hello", _epoch(12, 0)),
+        (855690215, "A Friend", "friend01", "hello", _epoch(18, 51))))
+    assert run(["telegram-setup", "--token", _TOKEN, "--list"]) == 0
+    out, err = capsys.readouterr()
+    rows = [line for line in out.splitlines() if line.strip() and not line.startswith(("bot:", "         chat id"))]
+    assert [row.split()[0] for row in rows] == ["855690215", "700100", "42"]  # the most recently active first
+    assert "A Friend" in rows[0] and "@friend01" in rows[0] and "03 Nov 00:21" in rows[0] and rows[0].endswith("not subscribed")
+    assert rows[1].endswith("extra recipient (TELEGRAM_EXTRA_CHAT_IDS)") and rows[2].endswith("main chat (TELEGRAM_CHAT_ID)")
+    assert "TELEGRAM_EXTRA_CHAT_IDS" in err and _TOKEN not in out + err
+    assert asked == [None]  # read-only: no offset, so nothing is confirmed or consumed on Telegram's side
+
+
+def test_telegram_setup_list_says_what_to_do_when_nobody_has_written_to_the_bot(cli_env, monkeypatch, capsys):
+    _bot_that_lists(monkeypatch, [])
+    assert run(["telegram-setup", "--token", _TOKEN, "--list"]) == 1
+    out, err = capsys.readouterr()
+    assert out.strip() == "bot: @monster_test_bot" and "/start" in err and "last 24 hours" in err
+
+
+def test_telegram_setup_list_reports_why_telegram_failed_without_leaking_the_token(cli_env, monkeypatch, capsys):
+    from app.errors import DataUnavailable
+
+    _bot_that_lists(monkeypatch, [], error=DataUnavailable(
+        "telegram", f"HTTP 409: Conflict: can't use getUpdates method while webhook is active at /bot{_TOKEN}/getUpdates",
+        retryable=False))
+    assert run(["telegram-setup", "--token", _TOKEN, "--list"]) == 1
+    out, err = capsys.readouterr()
+    assert "webhook is active" in err and "reading the bot's messages" in err and _TOKEN not in out + err
+
+
+def _bot_that_records(monkeypatch, *, broken=()):
+    """The delivery service gets a client that records what is sent; sends to the chats in ``broken`` are refused."""
+    import notifications.service as service
+    from app.errors import DataUnavailable
+
+    sent = []
+
+    class Recording:
+        configured = True
+        last_attempts = 1
+
+        def __init__(self, settings, **kwargs):
+            pass
+
+        def send_message(self, chat_id, text, **kwargs):
+            if chat_id in broken:
+                raise DataUnavailable("telegram", "HTTP 403: Forbidden: bot was blocked by the user", retryable=False)
+            sent.append((chat_id, text))
+            return [len(sent)]
+
+    monkeypatch.setattr(service, "TelegramClient", Recording)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", _TOKEN)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("TELEGRAM_EXTRA_CHAT_IDS", "855690215,700100")
+    return sent
+
+
+def test_telegram_test_goes_to_the_main_chat_only_unless_all_is_asked_for(cli_env, monkeypatch, capsys):
+    sent = _bot_that_records(monkeypatch)
+    assert run(["telegram-test"]) == 0
+    assert [chat for chat, _ in sent] == ["42"] and "telegram test: sent" in capsys.readouterr().out
+    sent.clear()
+    assert run(["telegram-test", "--all"]) == 0
+    out = capsys.readouterr().out
+    assert [chat for chat, _ in sent] == ["42", "855690215", "700100"]
+    assert "telegram test: sent" in out and "extra chat 855690215: sent" in out and "extra chat 700100: sent" in out
+    assert "you are subscribed" in sent[1][1] and "you are subscribed" not in sent[0][1]  # the owner's test is the owner's
+
+
+def test_telegram_test_all_fails_and_names_the_extra_chat_that_could_not_be_reached(cli_env, monkeypatch, capsys):
+    sent = _bot_that_records(monkeypatch, broken={"700100"})
+    assert run(["telegram-test", "--all"]) == 1
+    out = capsys.readouterr().out
+    assert "telegram test: sent" in out and "extra chat 855690215: sent" in out
+    assert re.search(r"extra chat 700100: failed \(.*bot was blocked by the user", out)
+    assert "42" in [chat for chat, _ in sent]
+
+
+def test_telegram_test_all_without_extra_chats_says_so(cli_env, monkeypatch, capsys):
+    sent = _bot_that_records(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_EXTRA_CHAT_IDS", "")
+    assert run(["telegram-test", "--all"]) == 0
+    assert [chat for chat, _ in sent] == ["42"] and "no extra chats are configured" in capsys.readouterr().out
 
 
 def _preview_env(monkeypatch, *, alert_chat="77"):

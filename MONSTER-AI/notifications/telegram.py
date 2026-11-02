@@ -270,25 +270,55 @@ def _message_id(result: Any) -> int | None:
     return None
 
 
+def _chats_of(update: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """The ``(chat, message)`` pairs one update carries, whichever kind of update it is."""
+    candidates = [update.get(key) for key in _UPDATE_KEYS]
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        candidates.append(callback.get("message"))
+    pairs = []
+    for item in candidates:
+        chat = item.get("chat") if isinstance(item, dict) else None
+        if isinstance(chat, dict) and chat.get("id") is not None:
+            pairs.append((chat, item))
+    return pairs
+
+
+def _describe_chat(chat: dict[str, Any]) -> dict[str, str]:
+    name = " ".join(str(chat[k]) for k in ("first_name", "last_name") if chat.get(k))
+    title = chat.get("title") or name or (f"@{chat['username']}" if chat.get("username") else "")
+    kind = str(chat.get("type") or "")
+    return {
+        "chat_id": str(chat["id"]),
+        "title": _short(title, 80),
+        "type": _CHAT_TYPES.get(kind, kind),
+    }
+
+
 def _first_chat(updates: list[dict[str, Any]]) -> dict[str, str] | None:
     for update in updates:
-        candidates = [update.get(key) for key in _UPDATE_KEYS]
-        callback = update.get("callback_query")
-        if isinstance(callback, dict):
-            candidates.append(callback.get("message"))
-        for item in candidates:
-            chat = item.get("chat") if isinstance(item, dict) else None
-            if not isinstance(chat, dict) or chat.get("id") is None:
-                continue
-            name = " ".join(str(chat[k]) for k in ("first_name", "last_name") if chat.get(k))
-            title = chat.get("title") or name or (f"@{chat['username']}" if chat.get("username") else "")
-            kind = str(chat.get("type") or "")
-            return {
-                "chat_id": str(chat["id"]),
-                "title": _short(title, 80),
-                "type": _CHAT_TYPES.get(kind, kind),
-            }
+        for chat, _item in _chats_of(update):
+            return _describe_chat(chat)
     return None
+
+
+def chats_in_updates(updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every distinct chat the bot has been messaged from, the most recently active first. Each entry has ``chat_id``, ``title``,
+    ``type``, ``username`` (``@name`` or empty) and ``last_message_at`` (epoch seconds, or ``None``). The operator picks the id of a
+    friend who sent ``/start`` from this list. Order and time agree: a chat is as recent as its latest message."""
+    best: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+    for position, update in enumerate(updates):
+        for chat, item in _chats_of(update):
+            when = item.get("date")
+            when = when if isinstance(when, int) and not isinstance(when, bool) else None
+            entry: dict[str, Any] = _describe_chat(chat)
+            entry["username"] = f"@{chat['username']}" if chat.get("username") else ""
+            entry["last_message_at"] = when
+            rank = (-1 if when is None else when, position)  # a message without a time sorts last; arrival breaks a tie
+            known = best.get(entry["chat_id"])
+            if known is None or rank >= known[0]:
+                best[entry["chat_id"]] = (rank, entry)
+    return [entry for _rank, entry in sorted(best.values(), key=lambda pair: pair[0], reverse=True)]
 
 
 def _keep_http_debug_logs_off() -> None:

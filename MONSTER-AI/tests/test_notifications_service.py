@@ -751,3 +751,210 @@ def test_with_the_real_client_the_image_is_an_upload_after_the_text_and_does_not
     assert (result.status, result.message_ids, result.attempts) == ("sent", [31], 1)
     assert [call["url"].rsplit("/", 1)[1] for call in session.calls] == ["sendMessage", "sendPhoto"]
     assert session.calls[1]["json"] is None and store.get_delivery("telegram", KEY)["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------------------- extra recipients
+BLOCKED = "HTTP 403: Forbidden: bot was blocked by the user"
+
+
+class RoutedClient(PhotoClient):
+    """A PhotoClient whose sends to the chats in ``broken`` fail (messages with ``text_error``, images with ``photo_error``)."""
+
+    def __init__(self, *, broken=(), text_error=None, photo_error=None, **kwargs):
+        super().__init__(**kwargs)
+        self.broken = set(broken)
+        self.text_error = text_error or DataUnavailable("telegram", BLOCKED, retryable=False)
+        self.photo_error = photo_error or DataUnavailable("telegram", BLOCKED, retryable=False)
+
+    def send_message(self, chat_id, text, **options):
+        if chat_id in self.broken:
+            raise self.text_error
+        return super().send_message(chat_id, text, **options)
+
+    def send_photo(self, chat_id, photo, **options):
+        if chat_id in self.broken:
+            raise self.photo_error
+        return super().send_photo(chat_id, photo, **options)
+
+
+@pytest.fixture()
+def cfg_extra(cfg):
+    return dataclasses.replace(cfg, telegram_extra_chat_ids=("3003", "4004"))
+
+
+@pytest.fixture()
+def routed():
+    return RoutedClient()
+
+
+@pytest.fixture()
+def extra_svc(cfg_extra, store, fake_clock, routed):
+    return NotificationService(cfg_extra, store, client=routed, clock=fake_clock)
+
+
+def test_every_report_goes_to_the_extra_chats_after_the_main_chat_with_a_ledger_row_each(extra_svc, routed, store):
+    result = extra_svc.send_report(make_ctx())
+    assert (result.status, result.message_ids) == ("sent", [101])  # the result is the main chat's
+    assert [(chat, text) for chat, text, _ in routed.sent] == [(c, routed.sent[0][1]) for c in ("1001", "3003", "4004")]
+    assert routed.sent[1][2] == routed.sent[0][2] == {"deadline": at_ist("2026-11-02", "09:14:30")}  # the same hard deadline
+    main = store.get_delivery("telegram", KEY)
+    assert (main["status"], main["kind"], json.loads(main["message_ids"])) == ("sent", "final_report", [101])
+    for chat, ids in (("3003", [102]), ("4004", [103])):
+        row = store.get_delivery("telegram", f"{KEY}@{chat}")
+        assert (row["status"], row["kind"], row["trade_date"], json.loads(row["message_ids"])) == (
+            "sent", "final_report_extra", "2026-11-02", ids)
+        assert row["body_hash"] == main["body_hash"] and row["error"] is None and row["sent_at"]
+
+
+def test_the_evening_report_and_the_prelim_report_reach_the_extra_chats_too(cfg_extra, store, fake_clock, routed):
+    service = NotificationService(dataclasses.replace(cfg_extra, send_prelim_report=True), store, client=routed, clock=fake_clock)
+    assert service.send_evening(make_summary()).status == "sent"
+    assert service.send_report(make_ctx(stage="pre")).status == "sent"
+    texts = [(chat, text.split("\n", 1)[0]) for chat, text, _ in routed.sent]
+    assert [chat for chat, _ in texts] == ["1001", "3003", "4004"] * 2 and texts[0][1] == texts[1][1] == texts[2][1]
+    assert store.get_delivery("telegram", "evening:2026-11-02@4004")["kind"] == "evening_report_extra"
+    assert store.get_delivery("telegram", "pre_report:2026-11-02@3003")["kind"] == "prelim_report_extra"
+
+
+def test_an_extra_chat_that_blocked_the_bot_never_changes_the_main_delivery_or_the_other_chats(cfg_extra, store, fake_clock):
+    client = RoutedClient(broken={"3003"})
+    service = NotificationService(cfg_extra, store, client=client, clock=fake_clock)
+    result = service.send_report(make_ctx())
+    assert (result.status, result.reason, result.message_ids) == ("sent", None, [101])
+    assert store.get_delivery("telegram", KEY)["status"] == "sent"
+    assert [chat for chat, _, _ in client.sent] == ["1001", "4004"]  # the next extra chat still got it
+    failed = store.get_delivery("telegram", f"{KEY}@3003")
+    assert (failed["status"], failed["kind"]) == ("failed", "final_report_extra") and BLOCKED in failed["error"]
+    assert store.get_delivery("telegram", f"{KEY}@4004")["status"] == "sent"
+    # the owner hears of it as a warning for the alert chat, once per chat and day, and never as a failed report
+    (alert,) = store.pending_alerts()
+    assert (alert["level"], alert["code"]) == ("warning", "telegram_extra_delivery_failed")
+    assert "3003" in alert["message"] and BLOCKED in alert["message"] and "TELEGRAM_EXTRA_CHAT_IDS" in alert["message"]
+    assert service.send_evening(make_summary()).status == "sent"  # a second report the same day: the same alert, not a new one
+    assert len(store.pending_alerts()) == 1
+
+
+def test_a_failed_extra_copy_is_not_a_failed_final_report_for_the_health_check(cfg_extra, store, fake_clock):
+    client = RoutedClient(broken={"3003", "4004"})
+    NotificationService(cfg_extra, store, client=client, clock=fake_clock).send_report(make_ctx())
+    row = store.conn.execute(  # the query of automation.health._check_notifications
+        "SELECT status FROM deliveries WHERE kind = 'final_report' ORDER BY delivery_id DESC LIMIT 1").fetchone()
+    assert row["status"] == "sent"
+    assert store.conn.execute("SELECT COUNT(*) FROM deliveries WHERE status = 'failed'").fetchone()[0] == 2
+
+
+def test_an_unexpected_error_for_one_extra_chat_is_contained_and_redacted(cfg_extra, store, fake_clock, caplog):
+    client = RoutedClient(broken={"3003"}, text_error=RuntimeError(f"boom {TOKEN}"))
+    service = NotificationService(cfg_extra, store, client=client, clock=fake_clock)
+    with caplog.at_level(logging.WARNING):
+        assert service.send_report(make_ctx()).status == "sent"
+    row = store.get_delivery("telegram", f"{KEY}@3003")
+    assert row["status"] == "failed" and row["error"].startswith("RuntimeError") and TOKEN not in row["error"]
+    assert TOKEN not in caplog.text and TOKEN not in json.dumps(store.pending_alerts())
+    assert [chat for chat, _, _ in client.sent] == ["1001", "4004"]
+
+
+def test_a_deadline_that_passes_while_the_extra_chats_are_served_withholds_only_their_copy(cfg_extra, store, fake_clock):
+    client = RoutedClient(broken={"4004"}, text_error=DeadlineExceeded("deadline passed"))
+    service = NotificationService(cfg_extra, store, client=client, clock=fake_clock)
+    assert service.send_report(make_ctx()).status == "sent"
+    assert store.get_delivery("telegram", f"{KEY}@4004")["status"] == "withheld"
+    assert store.get_delivery("telegram", f"{KEY}@3003")["status"] == "sent"
+    (alert,) = store.pending_alerts()
+    assert alert["code"] == "telegram_extra_delivery_failed" and "deadline_missed" in alert["message"]
+
+
+def test_nothing_goes_to_the_extra_chats_when_the_main_delivery_does_not_happen(cfg_extra, store, fake_clock):
+    failing = RoutedClient(script=[DataUnavailable("telegram", "simulated outage", retryable=True)])
+    service = NotificationService(cfg_extra, store, client=failing, clock=fake_clock)
+    assert service.send_report(make_ctx()).status == "failed"
+    assert failing.sent == [] and store.get_delivery("telegram", f"{KEY}@3003") is None
+    set_ist(fake_clock, "09:20:00")  # past the deadline, not forced: withheld for everybody
+    late = RoutedClient()
+    assert NotificationService(cfg_extra, store, client=late, clock=fake_clock).send_report(make_ctx()).status == "withheld"
+    assert late.sent == [] and store.get_delivery("telegram", f"{KEY}@4004") is None
+    assert store.conn.execute("SELECT COUNT(*) FROM deliveries WHERE kind LIKE '%_extra'").fetchone()[0] == 0
+
+
+def test_a_chat_that_already_has_the_report_is_not_sent_it_again_but_still_gets_the_images(cfg_extra, store, fake_clock, routed):
+    store.save_delivery("telegram", "final_report_extra", f"{KEY}@3003", "sent", trade_date="2026-11-02", message_ids=[7])
+    service = NotificationService(cfg_extra, store, client=routed, clock=fake_clock)
+    assert service.send_report(make_ctx()).status == "sent"
+    assert [chat for chat, _, _ in routed.sent] == ["1001", "4004"]
+    assert [chat for chat, *_ in routed.photos] == ["1001", "3003", "4004"]
+    assert service.send_report(make_ctx()).status == "duplicate" and len(routed.sent) == 2  # and a repeat sends nothing at all
+
+
+def test_a_second_call_is_a_duplicate_for_the_extra_chats_too(extra_svc, routed):
+    extra_svc.send_report(make_ctx())
+    assert extra_svc.send_report(make_ctx(), force=True).status == "duplicate"
+    assert len(routed.sent) == 3 and len(routed.photos) == 3
+
+
+def test_alerts_failure_notices_plain_texts_and_tests_never_go_to_the_extra_chats(extra_svc, routed, store):
+    assert extra_svc.alert("error", "x", "something broke") is True
+    assert extra_svc.send_failure_notice("2026-11-02", "final", "no data").status == "sent"
+    assert extra_svc.send_text("note", "note:1", "hello").status == "sent"
+    assert extra_svc.send_test().status == "sent"
+    assert [chat for chat, _, _ in routed.sent] == ["2002", "2002", "1001", "1001"]
+    assert store.conn.execute("SELECT COUNT(*) FROM deliveries WHERE kind LIKE '%_extra'").fetchone()[0] == 0
+
+
+def test_the_images_are_drawn_once_and_follow_the_text_to_every_chat(extra_svc, routed, monkeypatch):
+    from notifications import charts
+
+    drawn = []
+    real = charts.report_charts
+    monkeypatch.setattr(charts, "report_charts", lambda ctx: drawn.append(1) or real(ctx))
+    extra_svc.send_report(make_ctx())
+    assert drawn == [1]
+    assert routed.order == ["text", "text", "text", "photo", "photo", "photo"]  # nobody waits for a picture to get the text
+    assert [chat for chat, *_ in routed.photos] == ["1001", "3003", "4004"]
+    assert len({png for _, png, *_ in routed.photos}) == 1  # one image, three chats
+
+
+def test_one_chats_refused_image_does_not_stop_the_next_chat(cfg_extra, store, fake_clock, caplog):
+    client = RoutedClient(broken=set(), photo_script=[None, DataUnavailable("telegram", "HTTP 400: Bad Request: wrong file", retryable=False)])
+    service = NotificationService(cfg_extra, store, client=client, clock=fake_clock)
+    with caplog.at_level(logging.WARNING):
+        assert service.send_report(make_ctx()).status == "sent"
+    assert [chat for chat, *_ in client.photos] == ["1001", "4004"]
+    assert "chart images stopped after 0 for chat 3003" in caplog.text and "wrong file" in caplog.text
+    assert store.get_delivery("telegram", f"{KEY}@3003")["status"] == "sent"  # the text had arrived: the ledger knows only text
+
+
+def test_a_late_forced_report_reaches_the_extra_chats_without_images_like_the_main_chat(cfg_extra, store, fake_clock, routed):
+    set_ist(fake_clock, "09:20:00")
+    service = NotificationService(cfg_extra, store, client=routed, clock=fake_clock)
+    assert service.send_report(make_ctx(), force=True).status == "sent"
+    assert [chat for chat, _, _ in routed.sent] == ["1001", "3003", "4004"] and routed.photos == []
+    assert all(text.startswith(LATE_PREFIX) for _, text, _ in routed.sent)
+
+
+def test_without_extra_chats_nothing_changes_and_a_minimal_settings_object_is_fine(cfg, store, fake_clock, routed):
+    assert NotificationService(cfg, store, client=routed, clock=fake_clock).send_report(make_ctx()).status == "sent"
+    assert [chat for chat, _, _ in routed.sent] == ["1001"]
+    assert store.conn.execute("SELECT COUNT(*) FROM deliveries WHERE kind LIKE '%_extra'").fetchone()[0] == 0
+
+    class Minimal:  # a duck-typed settings object that knows nothing of extra chats
+        telegram_chat_id, telegram_alert_chat_id, report_deadline_time = "1001", None, "09:14:30"
+        send_prelim_report, send_evening_report, send_charts = False, True, False
+
+    assert NotificationService(Minimal(), store, client=FakeClient(), clock=fake_clock)._extras() == ()
+
+
+def test_the_subscription_note_goes_to_each_extra_chat_only_and_says_which_could_be_reached(cfg_extra, store, fake_clock):
+    client = RoutedClient(broken={"4004"})
+    service = NotificationService(cfg_extra, store, client=client, clock=fake_clock)
+    results = service.send_test_extras()
+    assert [(chat, r.status) for chat, r in results] == [("3003", "sent"), ("4004", "failed")]
+    assert BLOCKED in results[1][1].reason
+    ((chat, text, _),) = [s for s in client.sent if s[0] != "2002"]  # (the failed note also queues the usual delivery alert)
+    assert chat == "3003" and "you are subscribed" in text and "not investment advice" in text
+    assert "Environment" not in text and "Mode" not in text  # nothing of the system's configuration
+    assert {row["kind"] for row in store.conn.execute("SELECT kind FROM deliveries")} == {"test_extra"}
+    assert [r.status for _, r in service.send_test_extras()] == ["sent", "failed"]  # every call is a fresh message (unique keys)
+
+
+def test_the_subscription_note_without_extra_chats_sends_nothing(svc, fake_client):
+    assert svc.send_test_extras() == [] and fake_client.sent == []
