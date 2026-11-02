@@ -74,7 +74,8 @@ A note under the regime names stocks with an **ex-date today** (split or bonus),
 2. Check once: `sudo monster-ai health` (exit 0 = ok), `sudo monster-ai jobs` (timetable and recent runs),
    `sudo monster-ai models list` (the first models appear at the end of the bootstrap).
 3. Optional dry run of the morning scan (prints the report, sends and freezes nothing):
-   `sudo monster-ai scan --stage final --dry-run`.
+   `sudo monster-ai scan --stage final --dry-run`. The same for the afternoon report: `sudo monster-ai ideas --dry-run` during or
+   after the session proves that NSE's live quotes reach the server and prints the trade-idea report it would send.
 4. The default mode is **shadow**. Nothing in this system places orders.
 
 The very first model is usually `shadow` or `validated`; until one exists the report says *"heuristic baseline, NOT
@@ -94,7 +95,7 @@ calibrated"* and caps every name at WATCH.
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
 | `scan --stage pre\|final --dry-run [--date YYYY-MM-DD]` | print a report without freezing or sending |
 | `scan --stage final --force` | recompute and re-send today's report (adds a new snapshot; the earlier one is kept) |
-| `ideas [--date D] [--dry-run] [--force]` | the closing-hour scan now: `--dry-run` prints today's trade-idea report and freezes and sends nothing; `--force` scans again only while the frozen report was never delivered, and sends after the 15:05 deadline (a report already delivered stays the record) |
+| `ideas [--date D] [--dry-run] [--force]` | the closing-hour scan now: `--dry-run` prints a trade-idea report and freezes and sends nothing (it works after 15:05 too, on the day's final figures); `--force` sends the frozen report even after the 15:05 deadline, marked late, and scans first only when nothing is frozen (a frozen report is never replaced) |
 | `evaluate [--date D]` | evaluate a day's predictions now |
 | `models list` / `rollback --stage S` / `approve V --status shadow\|validated` / `activate V` | model governance |
 | `train [--stage pre\|final\|both]` | retrain now (heavy: 30-90 minutes on a 1 GB server) |
@@ -182,8 +183,8 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `health_source_<id>` | a data source - or an AI service (`llm_extraction`, `llm_web`, `jev_judgment`) - failed 5 times in a row | usually external; the system degrades and says so; `doctor` shows reachability; for the AI services see [the AI services](#the-ai-services-groq-and-jev) |
 | `health_telegram_not_configured` / `health_report_not_delivered` | no token/chat id, or the last final report could not be sent | `telegram-setup`; check the token |
 | `telegram_delivery_failed` / `report_deadline_missed` | a message could not be delivered (queued, retried) / a final report would have arrived after 09:14:30 and was withheld | check Telegram connectivity; nothing to do for the latter |
-| `ideas_scan_failed` | the closing-hour scan stopped: NSE's live quotes unavailable or not from today, too few names with a complete row, a gap in the stored history (run `collect_india`), or an unexpected error; it retries every minute until 15:00 and sends a notice on the last attempt | read the message; `monster-ai ideas --dry-run`; see [no closing-hour report](#no-closing-hour-report) |
-| `ideas_deadline_missed` | the closing-hour report was ready after 15:05 and was withheld on purpose (the ideas are frozen and still judged in the evening, but are marked late and do not count toward the record) | nothing to do; `monster-ai ideas --force` sends it anyway, marked *late* |
+| `ideas_scan_failed` | the closing-hour scan stopped: NSE's live quotes unavailable (the message gives the reason: blocked, offline, an endpoint that was renamed) or not from today, too few names with a complete row, a gap in the stored history (run `collect_india`), or an unexpected error; it retries every minute for the whole window until 15:00 and sends a notice on the last attempt | read the message; `monster-ai ideas --dry-run`; see [no closing-hour report](#no-closing-hour-report) |
+| `ideas_deadline_missed` | the closing-hour report was ready after 15:05 and was withheld on purpose (the ideas are frozen and still judged in the evening; a report *built* after the deadline is also kept out of the record) | nothing to do; `monster-ai ideas --force` sends the frozen report anyway, marked *late* |
 | `health_calibration_drift` / `health_skill_negative` | live calibration worse than 0.10 ECE / live Brier skill below the base rate over the last 90 days | see [models](#models); consider `models rollback` |
 | `health_calendar_horizon` | the official NSE holiday list ends within 21 days | none: NSE publishes the next year's list in December and the daily refresh picks it up; see [calendar](#the-calendar-every-month-every-year) |
 | `health_calendar_unofficial` | no official list covers today (the year changed and NSE has not published yet, or the refresh is blocked) | none in most cases: rule-based holidays and the live check cover it; with `NSE_ENABLED=false` add dates to `calendar_overrides.json` |
@@ -244,16 +245,18 @@ the attempts and accept the reduced data (and `IDEAS_ENABLED=false` to stop the 
 ### No closing-hour report
 
 1. `sudo monster-ai jobs` - did `closing_scan` run at 14:30, and with which status? On an exchange holiday it is `skipped`.
-2. `failed` with an `ideas_scan_failed` alert: the message says why. *NSE live quotes unavailable* is NSE blocking or being offline
-   (see above; the scan retries every minute until 15:00 and sends a notice on the last attempt); *too few live quotes ... stamped on an
-   earlier session* means NSE served yesterday's session (the market was not trading yet, or the exchange was closed that day);
-   *the stored history ends on ... run collect_india* means the morning data job missed a session: run
-   `sudo monster-ai run-job collect_india --force`, then `sudo monster-ai ideas --force`.
-3. `sudo monster-ai ideas --dry-run` prints what the scan would say now without freezing or sending; `sudo monster-ai logs --job closing_scan`
-   has the details of every attempt.
+2. `failed` with an `ideas_scan_failed` alert: the message says why, in brackets after *NSE live quotes unavailable* (the reason NSE's
+   client gave: blocked, a timeout, an endpoint that no longer exists ...; see below and [NSE blocks the
+   server](#nse-blocks-the-server-http-403)). The scan retries every minute for the whole window until 15:00 and sends a notice on the
+   last attempt. *too few live quotes ... stamped on an earlier session* means NSE served yesterday's session (the market was not
+   trading yet, or the exchange was closed that day); *the stored history ends on ... run collect_india* (or *the stored close ...
+   differs from the exchange's previous close for N names*) means the morning data job missed a session or left wrong closes: run
+   `sudo monster-ai run-job collect_india --force`, then `sudo monster-ai ideas` (after 15:05 add `--force` to send the report anyway).
+3. `sudo monster-ai ideas --dry-run` prints what the scan would say now without freezing or sending (it works after 15:05 too);
+   `sudo monster-ai logs --job closing_scan` has the details of every attempt.
 4. `success` but nothing arrived: the report is frozen and was withheld after 15:05 (`ideas_deadline_missed`), or Telegram failed (it is
-   re-sent on the next attempt); `sudo monster-ai ideas --force` sends it, marked *late* if it is past 15:05. A report that was
-   already delivered cannot be replaced by a new scan: that one stays the record.
+   re-sent on the next attempt); `sudo monster-ai ideas --force` sends that frozen report, marked *late* if it is past 15:05. It never
+   scans again: a frozen report is the record of the day and is not replaced (only when nothing is frozen does `--force` scan first).
 5. NSE renamed its live-quote endpoint once already (2026): `ideas_scan_failed` with `no live-quote endpoint knows SECURITIES IN F&O
    (HTTP 404 ...)` means all the known names are gone. The scan then needs a code update; nothing is guessed meanwhile.
 
@@ -627,6 +630,8 @@ does it).
   judged on whether a level broke next session and whether the day closed beyond it. The judging runs after the official end-of-day data
   is in (`evaluate_ideas`, 18:30+), on the official bars (an outcome judged on provisional bars waits for them and is replaced); what
   was frozen at 14:30 is never edited, the outcome is stored beside it.
-- **Late or forced reports** carry a ⏰ banner at the top and are kept out of the record: they were built too late to act on.
+- **Late reports** carry a ⏰ banner at the top: a frozen report that is only sent after 15:05 (with `--force`) is marked in the copy that
+  goes out, and one that was *built* after the deadline is marked in the frozen report too and kept out of the record, because it
+  was built too late to act on.
 - A bearish idea needs an F&O position (short futures, or buy a put); an overnight position can open with a gap that a stop does not
   cover; at 14:30 the day's volume is a projection from a typical intraday profile. None of this is advice, and the system places no orders.

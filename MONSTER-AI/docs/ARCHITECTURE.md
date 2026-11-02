@@ -210,7 +210,7 @@ flowchart TB
 | 08:45 | `prelim_scan` | preliminary report (**critical**); first repairs the previous session when `collect_india` left it below 90 % coverage |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (**critical**) |
 | 09:08:45 | `final_scan` | final report with pre-open gaps, delivered by 09:12 (**critical**, hard deadline 09:14:30) |
-| 14:30 | `closing_scan` | closing-hour trade ideas from NSE's live quotes, delivered by 15:05 (**critical**, retried every minute until 15:00) |
+| 14:30 | `closing_scan` | closing-hour trade ideas from NSE's live quotes, delivered by 15:05 (**critical**, a try every minute for the whole window until 15:00) |
 | 17:45 | `ingest_eod` | official end-of-day files |
 | 18:15 | `evaluate` | outcomes, metrics, evening report |
 | 18:30 | `evaluate_ideas` | the earlier trade ideas judged on the official bars, outcomes stored apart from the frozen reports |
@@ -273,7 +273,7 @@ sequenceDiagram
     participant TG as Telegram
 
     SCH->>RUN: start at 14:30
-    RUN->>DB: trading day? report frozen and delivered?
+    RUN->>DB: trading day? report already frozen?
     alt a frozen report exists
         RUN->>TG: re-send it, no new scan
     else first run of the day
@@ -298,25 +298,33 @@ How it is built:
 - **Live feed** (`ingestion/nse.py`, `ingestion/pipeline.py`): one request returns every F&O stock's running open, high, low, last price,
   previous close and volume, one more the indices. NSE renamed the list endpoint in 2026, so the client tries the current names first
   (`equity-stockIndex` for the F&O segment, `equity-stock-indices` for an index list, the retired `equity-stockIndices` last), moves on
-  only on a 404 and remembers the name that answered. The answer's own timestamp stamps every row (the per-stock `lastUpdateTime` is a
-  placeholder) and a snapshot that is not from today is refused.
+  only on a 404 and remembers the name that answered; when none answers, the error names them and the scan's alert and notice carry
+  it. The answer's own timestamp stamps every row (the per-stock `lastUpdateTime` is a placeholder) and a snapshot that is not from
+  today is refused. The requests are bound by the report deadline while it is ahead; a run that starts after it (a manual or forced
+  run, a preview) gets a budget of its own, because the HTTP client starts no attempt once its deadline has passed.
 - **Features** (`features/swing.py`): the live row is laid over the stored history as the session in progress and the features are
   computed as of that session (unshifted, unlike the morning model's, which only ever sees the previous one). Volume is projected to a
   full day with a U-shaped intraday profile (an approximation the report states) and the ATR comes from the previous close.
-  A name whose live previous close differs from the stored one by more than 2 % (an ex-date) is left out.
+  A name whose live previous close differs from the stored one by more than 2 % (an ex-date) is not in the day's table at all: its
+  figures are meaningless (a split reads as -50 %) and would otherwise skew the sector peers, the breadth and the ranks of the rest.
+  When more than 40 % of the names have no stored close or a different one, the stored history is not trusted and the scan stops.
 - **Setups, gates and levels** (`ranking/ideas.py`): fixed, documented components become a 0-100 score per setup (BTST long and short,
   swing long and short, watchlist); gates cover liquidity, price, history, event dates, regime and a Nifty crash; stops and targets are
   multiples of the previous ATR with a structural stop and a minimum reward to risk; the estimated delivery cost must be small
-  against the first target (`ranking/costs.py`); confirmed news can veto or discount an idea, a rumour is only mentioned.
+  against the first target (`ranking/costs.py`); confirmed news can veto or discount an idea, a rumour is only mentioned. A results
+  meeting on a weekend or a holiday counts like one announced after the close of the session before it (its news lands before the
+  next open, the gap a BTST carries).
 - **Freeze once, never edit** (`automation/ideas.py`): the report is stored under `ideas:run:<date>` before delivery and re-sent
-  unchanged by a retry. A forced scan may replace a frozen report only when nobody received it. `evaluate_ideas` judges the ideas
+  unchanged by a retry, a late run or `--force` (which only lifts the report deadline: the copy that goes out says it is late);
+  a frozen report is never replaced. `evaluate_ideas` judges the ideas
   on the official bars (`backtesting/ideas.py`: the first of the stop, the first target and the end of the horizon, a gap through the
   stop exits at the open, the stop wins a day that touches both) and stores the outcomes under `ideas:out:<date>`; the live record
   of the next report is built from them, per list, with sample sizes and day-block bootstrap intervals, and a list passes its gate
   only with at least 60 judged ideas over 20 days and both intervals clear of no-edge.
 - **Rendering and delivery** (`notifications/ideas.py`, `NotificationService.send_ideas`): the same guarantees as the other reports
   (escaping, `n/a` for a missing figure, messages of at most 3,900 characters, an idempotent ledger) plus a score that is never drawn
-  as a probability and a report withheld after 15:05 unless forced (then marked late and kept out of the record).
+  as a probability and a report withheld after 15:05 unless forced (then marked late; one built after the deadline is also kept out of
+  the record).
 
 ## News intelligence and the optional AI services
 
@@ -907,7 +915,7 @@ flowchart TB
 | NSE live quotes blocked, not from today, or too few complete rows (14:30 scan) | the closing-hour scan **fails visibly** (`ideas_scan_failed`, a notice on the last attempt), retries every minute until 15:00 and sends no ideas: nothing is guessed from older prices |
 | NSE renames its live-quote endpoint again | the client tries the known names, moves on only on a 404 and names them in the error; until the code is updated the scan fails visibly as above |
 | Stored history incomplete before the closing scan | the scan stops and says which session is missing (`run collect_india`); a special session such as Muhurat trading is tolerated |
-| Closing-hour report ready after 15:05 | frozen and withheld (`ideas_deadline_missed`); `ideas --force` sends it marked late, and it never counts toward the live record |
+| Closing-hour report ready after 15:05 | frozen and withheld (`ideas_deadline_missed`); `ideas --force` sends the frozen report marked late, and a report built after the deadline never counts toward the live record |
 | Nifty or VIX quotes missing at 14:30 | the scan goes on without them and the report's notes say that Nifty and VIX are not shown and relative strength to Nifty is not used |
 | Yahoo down or rate limited | official bhavcopy first; global block is withheld only when >= 6 critical series are stale, otherwise degraded with warnings; the client slows that source down and a circuit breaker stops hammering it |
 | curl_cffi unusable (missing wheel, rejected profile) | automatic fallback to `requests`, logged once; some providers may then block the client |

@@ -220,7 +220,6 @@ def test_the_report_is_sent_once_and_recorded_in_the_ledger(svc, fake_client, st
     assert options == {"deadline": at_ist("2026-11-02", "15:05")}
     row = store.get_delivery("telegram", KEY)
     assert (row["status"], row["kind"], row["trade_date"]) == ("sent", "ideas_report", "2026-11-02")
-    assert svc.ideas_delivered("2026-11-02") and not svc.ideas_delivered("2026-11-03")
 
 
 def test_a_second_send_is_a_duplicate_even_when_forced(svc, fake_client, fake_clock):
@@ -295,5 +294,5 @@ def test_a_failed_delivery_is_retried_by_the_next_call(cfg, store, fake_clock):
     client = FakeClient(script=[RuntimeError("telegram is down")])
     service = NotificationService(cfg, store, client=client, clock=fake_clock)
     set_ist(fake_clock, "14:31")
-    assert service.send_ideas(make_report()).status == "failed" and not service.ideas_delivered("2026-11-02")
-    assert service.send_ideas(make_report()).status == "sent" and service.ideas_delivered("2026-11-02")
+    assert service.send_ideas(make_report()).status == "failed" and store.get_delivery("telegram", KEY)["status"] == "failed"
+    assert service.send_ideas(make_report()).status == "sent" and store.get_delivery("telegram", KEY)["status"] == "sent"

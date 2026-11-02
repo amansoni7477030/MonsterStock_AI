@@ -221,7 +221,7 @@ flowchart TB
 | 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (indicative/final equilibrium prices) |
 | 09:08:45 | `final_scan` | final scan with the opening gap, frozen snapshot, **Telegram report by 09:12-09:14:30** |
-| 14:30-15:00 | `closing_scan` | NSE live quotes over the stored history: BTST, swing, bearish F&O and next-day intraday ideas, frozen once, **Telegram report by 15:05** (enter before 15:15); retried every minute inside its window |
+| 14:30-15:00 | `closing_scan` | NSE live quotes over the stored history: BTST, swing, bearish F&O and next-day intraday ideas, frozen once, **Telegram report by 15:05** (enter before 15:15); retried every minute for the whole window |
 | 17:45+ | `ingest_eod` | official end-of-day data (retries until 23:30) |
 | 18:15+ | `evaluate` | outcomes vs baselines, evening report with the live record |
 | 18:30+ | `evaluate_ideas` | the earlier trade ideas judged on the official bars; outcomes are kept apart from the frozen reports and make up each list's live record |
@@ -264,17 +264,20 @@ the list says so.
   ideas over 20 days and both the win-rate and the mean-return intervals clear their no-edge level; until then every list says
   *not validated* and what it still needs.
 - The report is **frozen once** per trading day (`ideas:run:<date>` in the key-value store) and re-sent unchanged after a failed
-  delivery. Outcomes are judged by `evaluate_ideas` on the official end-of-day bars and stored apart (`ideas:out:<date>`): what was
-  said is never edited, what happened is attached. A report built after the 15:05 deadline is withheld unless forced, is marked *late*
-  at its top and never counts toward the record.
-- It **fails visibly**: no live quotes, quotes that are not from today, a gap in the stored history or too few names with a complete
-  row stop the scan with an alert (and a notice on the last attempt); nothing is guessed from older prices. A name whose price basis
-  differs from the stored history (an ex-date today) is left out.
+  delivery; a later run, a manual one and `--force` all send that report and never scan again. Outcomes are judged by
+  `evaluate_ideas` on the official end-of-day bars and stored apart (`ideas:out:<date>`): what was said is never edited, what
+  happened is attached. A report that would go out after 15:05 is withheld unless forced, and is then marked *late* at its top; one
+  that was **built** after the deadline never counts toward the record.
+- It **fails visibly**: no live quotes (the alert says why: blocked, offline, or an endpoint NSE has renamed), quotes that are not
+  from today, a gap in the stored history or too few names with a complete row stop the scan with an alert (and a notice on the last
+  attempt); nothing is guessed from older prices. A name whose price basis differs from the stored history (an ex-date today) is left
+  out of everything, including the sector and market figures the others are ranked against.
 - Volume at 14:30 is a **projection** with a typical intraday profile, and the report says so. Stops, targets and costs are
   estimates; the system never places orders.
 
-Commands: `sudo monster-ai ideas --dry-run` prints today's report and freezes and sends nothing; `sudo monster-ai ideas` runs the
-scheduled job now; `--force` scans again only while the frozen report was never delivered and also sends after the deadline;
+Commands: `sudo monster-ai ideas --dry-run` prints today's report and freezes and sends nothing (it also works after 15:05, on the
+final figures of the day); `sudo monster-ai ideas` runs the scheduled job now; `--force` sends the frozen report even after the
+deadline (marked late) and only scans first when nothing is frozen;
 `sudo monster-ai telegram-preview --only ideas` shows a sample of the message with made-up data. The settings are `IDEAS_*`
 (see [Configuration](#configuration)); `IDEAS_ENABLED=false` switches the whole feature off and `SEND_IDEAS_REPORT=false` keeps it
 computing, freezing and evaluating silently.
@@ -291,7 +294,7 @@ computing, freezing and evaluating silently.
 | `daemon` | run the scheduler (systemd does this) |
 | `run-job NAME [--key K] [--force] [--dry-run] [--opt K=V]`, `jobs` | run one job now; show the timetable and recent runs |
 | `scan --stage pre\|final [--date D] [--dry-run] [--force]` | run a scan now (`--dry-run` prints the report, freezes and sends nothing) |
-| `ideas [--date D] [--dry-run] [--force]` | run the closing-hour trade-idea scan now (`--dry-run` prints the report, freezes and sends nothing; `--force` scans again only while the frozen report was never delivered, and sends after the 15:05 deadline) |
+| `ideas [--date D] [--dry-run] [--force]` | run the closing-hour trade-idea scan now (`--dry-run` prints the report, freezes and sends nothing; `--force` sends the frozen report even after the 15:05 deadline, marked late, and scans first only when nothing is frozen) |
 | `evaluate [--date D]` | evaluate a day's predictions |
 | `train [--stage pre\|final\|both] [--publish]` | train now (`--publish`: CI worker mode) |
 | `backtest [--stage S] [--years N] [--out FILE]` | walk-forward evaluation against the baselines |

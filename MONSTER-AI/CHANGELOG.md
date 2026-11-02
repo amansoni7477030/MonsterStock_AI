@@ -13,7 +13,8 @@ migration; the new records live in the key-value store under `ideas:` and are pr
 ### Upgrade notes
 
 - **New jobs and schedule entries** (picked up when the scheduler restarts): `collect_news` at 13:40 (slot `midday`), `closing_scan`
-  at 14:30 (retried every minute until 15:00) and `evaluate_ideas` after `ingest_eod`. Run `sudo monster-ai jobs` to see them.
+  at 14:30 (a try every minute for the whole window until 15:00) and `evaluate_ideas` after `ingest_eod`. Run `sudo monster-ai jobs`
+  to see them.
 - **New settings** (safe defaults, see `.env.example`): `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true), `IDEAS_REPORT_DEADLINE_TIME`
   (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS`
   (true) and `LLM_FALLBACK_MODELS`. The afternoon report goes to the same Telegram chat as the morning one; `SEND_IDEAS_REPORT=false`
@@ -38,13 +39,15 @@ migration; the new records live in the key-value store under `ideas:` and are pr
 - **Honest by construction.** A score is a weighted mean of fixed, documented components and is called a score, never a probability.
   Each list shows its own live record with sample sizes and 95 % intervals and is only called validated after 60 judged ideas over 20
   days with intervals that clear no-edge. The report is frozen once per day (`ideas:run:<date>`), re-sent unchanged after a failed
-  delivery, and never replaced once it was delivered; `evaluate_ideas` judges the ideas on the official bars (the first of the stop, the
-  first target and the end of the horizon, a gap through the stop exits at the open, a stop touched on the day of a target wins) and
-  keeps the outcomes apart (`ideas:out:<date>`); outcomes on provisional bars wait for the official file; a report built after the
-  15:05 deadline is withheld unless forced, marked *late* and left out of the record.
-- **It refuses to guess.** No live quotes, quotes that are not from today, a gap in the stored history (special sessions such as
-  Muhurat trading are tolerated), a history without the previous closes or too few names with a complete row fail the scan with the
-  alert `ideas_scan_failed` and, on the last attempt, a notice; a name whose price basis differs from the stored history is left out.
+  delivery, and never replaced: a retry, a late run and `--force` all send the frozen report (`--force` only lifts the report deadline,
+  and the copy that goes out says it is late; it scans first only when nothing is frozen). `evaluate_ideas` judges the ideas on the
+  official bars (the first of the stop, the first target and the end of the horizon, a gap through the stop exits at the open, a stop
+  touched on the day of a target wins) and keeps the outcomes apart (`ideas:out:<date>`); outcomes on provisional bars wait for the
+  official file; a report built after the 15:05 deadline is withheld unless forced, marked *late* and left out of the record.
+- **It refuses to guess.** No live quotes (the alert says why), quotes that are not from today, a gap in the stored history (special
+  sessions such as Muhurat trading are tolerated), a history without the previous closes or with different ones for most names, or too
+  few names with a complete row fail the scan with the alert `ideas_scan_failed` and, on the last attempt, a notice; a name whose
+  price basis differs from the stored history is left out of everything, including the sector and market figures of the others.
 - **`telegram-preview --only ideas`** sends a sample of the report with made-up data.
 - **Groq model chain** (`news_intelligence/llm.py`, `app/config.py`): the extractor walks `openai/gpt-oss-120b` ->
   `openai/gpt-oss-20b` -> `qwen/qwen3.8-27b`; Groq's limits are per model, so the free tier's throughput roughly triples (about 12
@@ -69,6 +72,25 @@ migration; the new records live in the key-value store under `ideas:` and are pr
   others the date of some old update) and its prices come as text; a first version that required today's date on every row would
   have refused the whole answer. Every row now carries the answer's own timestamp, and a stamp on a row is not trusted.
 - `ai-test --list-only` confirmed that the project's Groq key lists all three models of the chain.
+
+### Found by an independent review of this change, and fixed
+
+- **A manual, forced or preview run after about 15:04:40 could never fetch quotes.** The live requests were bound by the report
+  deadline, and once that is past the HTTP client starts no attempt at all, so `ideas --dry-run` or `--force` late in the afternoon
+  failed with "quotes unavailable" without a single request (the test double ignored deadlines, which hid it, and now behaves like the
+  client). A run that starts when the deadline is nearly over gets a 90-second budget of its own, and `--force` now sends the
+  frozen report instead of scanning again.
+- **`closing_scan` gave up after about five minutes** (5 tries a minute apart) although its window runs 30 minutes, so an NSE blip that
+  cleared at 14:40 still lost the day's report. It now has a try for every minute of the window.
+- **A split or bonus name polluted the others.** A name left out for a price-basis change kept its meaningless move (-50 % for a 1:2
+  split) in the day's table, so every stock of its sector inherited a bogus "sector peers -9.9 %" and the breadth and percentile ranks
+  were skewed. Left-out names are no longer in the table, and a stored history that disagrees with the exchange's previous close for
+  more than 40 % of the names stops the scan.
+- **A results meeting on a Saturday, Sunday or holiday was ignored**, so the BTST gate for an overnight trade into results missed it
+  (a Friday BTST would carry a Saturday announcement across the weekend). Such a meeting now counts like one announced after the close
+  of the session before it.
+- **The cause of "no quotes" never reached the alert or the notice** (they always said "blocked or offline"), contrary to the runbook:
+  the reason NSE's client gave, such as "no live-quote endpoint knows SECURITIES IN F&O ... did NSE change its API?", is now in both.
 
 ## [1.0.0] - 2026-11-01
 

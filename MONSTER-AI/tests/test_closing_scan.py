@@ -238,6 +238,7 @@ def test_a_forced_run_with_nothing_frozen_scans_and_sends_the_report_marked_late
 def test_an_nse_failure_alerts_and_only_the_last_attempt_sends_a_failure_notice(env):
     early = scan.run_closing_scan(env.make(nse_fail=True, attempt=1, max_attempts=5, last_attempt=False))
     assert early.status == "failed" and "NSE live quotes unavailable" in early.message
+    assert "simulated block" in early.message  # the reason of the failure is carried to the operator, not a generic guess
     assert alerts(env, "ideas_scan_failed") and env.telegram.sent == []
     assert env.store.kv_get_json(scan.run_key(DAY)) is None
 
@@ -245,6 +246,22 @@ def test_an_nse_failure_alerts_and_only_the_last_attempt_sends_a_failure_notice(
     assert last.status == "failed"
     notice = said(env)
     assert "REPORT WITHHELD" in notice and "CLOSING-HOUR IDEAS" in notice and "closing_scan" in notice
+    assert "simulated block" in notice
+
+
+def test_a_renamed_endpoint_is_named_in_the_alert_and_in_the_notice(env, fake_clock):
+    """Every known live-quote endpoint answers 404 (NSE renamed it again): the operator is told that, not that NSE is blocking."""
+    def handler(url, kwargs):
+        return FakeResponse(200, b"<html/>") if url == nse.HOME else FakeResponse(404, b"Resource not found")
+
+    ctx = env.make(attempt=5, max_attempts=5, last_attempt=True)
+    ctx._cache["nse_api"] = nse.NseApi(env.cfg, http=HttpClient("nse", session=FakeSession(handler), clock=fake_clock))
+    result = scan.run_closing_scan(ctx)
+    assert result.status == "failed" and "no live-quote endpoint knows SECURITIES IN F&O" in result.message
+    assert "did NSE change its API" in result.message and "blocked or offline" not in result.message
+    (alert,) = alerts(env, "ideas_scan_failed")
+    assert "no live-quote endpoint knows" in alert["message"]
+    assert "no live-quote endpoint knows" in said(env)  # the failure notice of the last attempt
 
 
 def test_rows_stamped_on_an_earlier_session_are_not_todays_prices(env):
@@ -269,13 +286,71 @@ def test_an_incomplete_live_row_is_counted_and_never_used(env):
     assert any("1 incomplete live row" in note for note in report["notes"])
 
 
+def split_rows(env, symbol):
+    """The live rows with ``symbol`` as on the day of a 1:2 split: the exchange's prices (and previous close) are already halved."""
+    prices = ("open", "high", "low", "last", "prev_close")
+    return [{**r, **{key: r[key] / 2 for key in prices}} if r["symbol"] == symbol else r for r in env.live]
+
+
 def test_a_name_whose_previous_close_differs_from_the_history_is_left_out(env):
-    rows = [{**r, "prev_close": r["prev_close"] / 2} if r["symbol"] == env.star else r for r in env.live]
-    result = scan.run_closing_scan(env.make(live=rows))
+    result = scan.run_closing_scan(env.make(live=split_rows(env, env.star)))
     assert result.status == "success", result.message
     report = frozen(env.store)
     assert not any(i["symbol"] == env.star for i in report["ideas"])
     assert any("1 name(s) left out" in n and "price basis differs" in n for n in report["notes"])
+
+
+def test_a_name_left_out_takes_no_part_in_the_day_of_the_others(env):
+    """A split makes the name's own move -50 %. Left in the table it would drag the sector peers' average, the breadth and the ranks."""
+    split = env.panel.symbols[3]
+    ctx = env.make(live=split_rows(env, split))
+    live = scan.fetch_live(ctx, env.panel.symbols, None)
+    instruments = {s: {"name": s, "sector": "Demo", "is_fno": True} for s in env.panel.symbols}  # one sector: everyone is a peer
+    table, _nifty, info = scan.build_table(ctx, live, instruments, 0.79)
+    assert split not in table.index and len(table) == 23 and info["excluded"] == {split: scan.BASIS_MISMATCH}
+    assert table["sector_chg"].between(-1.0, 1.5).all()  # about +0.2 %: not dragged to about -2 % by the split
+    market = scan.market_context(table, _nifty, live)
+    assert market["advancers"] + market["decliners"] <= 23
+
+
+def test_a_history_that_disagrees_with_the_exchange_for_most_names_stops_the_scan(env):
+    rows = [{**r, "prev_close": r["prev_close"] * 1.05} for r in env.live]  # every name 5 % off the stored close
+    result = scan.run_closing_scan(env.make(live=rows, **EARLY))
+    assert result.status == "failed" and "differs from the exchange's previous close for 24 of 24 names" in result.message
+    assert "collect_india" in result.message and frozen(env.store) is None
+
+
+def test_a_results_meeting_on_a_weekend_or_a_holiday_counts_as_after_the_close_of_the_session_before(env):
+    """A Saturday board meeting is announced before Monday's open: the gap a Friday BTST would carry. A date that is no session is
+    read like the session before it (a Sunday and a Tuesday holiday here), and a meeting that is no results meeting is no event."""
+    meetings = [("AAA", "2026-11-06"), ("BBB", "2026-11-07"), ("CCC", "2026-11-08"), ("DDD", "2026-11-09"), ("EEE", "2026-11-10"),
+                ("GGG", "2026-11-13")]
+    env.store.upsert_board_meetings(
+        [{"symbol": s, "meeting_date": d, "purpose": "Financial Results", "is_results": True} for s, d in meetings]
+        + [{"symbol": "FFF", "meeting_date": "2026-11-07", "purpose": "Dividend", "is_results": False}])
+    ctx = env.make(run_key="2026-11-06")  # a Friday
+    found = scan._event_sessions(ctx, {"AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG"})
+    # Friday 0, Monday 1 (Sunday 8 Nov is the Diwali Muhurat day, Tuesday 10 Nov a holiday), Wednesday 2 ... Friday 13 Nov is the 4th
+    assert found == {"AAA": 0.0, "BBB": 0.0, "CCC": 0.0, "DDD": 1.0, "EEE": 1.0, "GGG": 4.0}
+
+
+def test_a_saturday_results_meeting_keeps_the_name_out_of_the_friday_btst(settings, store, fake_clock):
+    """A BTST bought on Friday is sold on Monday, with a Saturday results announcement in between: a coin flip on the gap."""
+    panel = panel_ending("2026-11-05", n_dates=420, n_symbols=24, seed=11)
+    env = build_env(settings, store, fake_clock, panel)
+    fake_clock.set(datetime(2026, 11, 6, 9, 1, tzinfo=UTC))  # Friday 14:31 IST
+    stamp = "2026-11-06T09:00:00Z"
+    star = env.star
+    rows = live_rows(panel, moves={star: 2.6}, strength={star: 0.95}, volume={star: 1.8}, stamp=stamp)
+
+    clean = scan.run_closing_scan(env.make(run_key="2026-11-06", live=rows, live_ts=stamp, dry_run=True))
+    assert clean.status == "success", clean.message
+    assert star_btst(clean.metrics["report"], env)  # no meeting: the textbook BTST of the other tests
+
+    store.upsert_board_meetings([{"symbol": star, "meeting_date": "2026-11-07", "purpose": "Financial Results", "is_results": True}])
+    blocked = scan.run_closing_scan(env.make(run_key="2026-11-06", live=rows, live_ts=stamp, dry_run=True))
+    assert blocked.status == "success", blocked.message
+    assert not star_btst(blocked.metrics["report"], env)
 
 
 def test_a_missing_regular_session_in_the_history_stops_the_scan(settings, store, fake_clock):
@@ -329,9 +404,51 @@ def test_a_scan_after_the_deadline_is_frozen_late_and_withheld_unless_forced(env
     retry = scan.run_closing_scan(env.make(live=late_live, live_ts=LATE_STAMP))  # a retry does not get past the deadline either
     assert retry.status == "success" and env.telegram.sent == []
 
-    forced = scan.run_closing_scan(env.make(live=late_live, live_ts=LATE_STAMP, force=True))
-    assert forced.status == "success", forced.message
-    assert "built after the report deadline" in said(env) and frozen(env.store)["late"] is True
+    forced = env.make(nse_fail=True, force=True)  # the frozen report is sent as it is: NSE is not asked again
+    assert scan.run_closing_scan(forced).status == "success"
+    assert forced.nse_api().live_calls == [] and frozen(env.store)["late"] is True
+    assert LATE_BANNER in html.unescape(said(env))
+
+
+def test_the_live_requests_are_bound_by_the_report_deadline_while_it_is_ahead_and_by_a_budget_after_it(env):
+    ctx = env.make()
+    deadline_at = at_ist(date(2026, 11, 2), "15:05")
+    ahead = (deadline_at - SCAN_TIME).total_seconds() - scan.DEADLINE_MARGIN_SEC
+    assert scan.fetch_bound(ctx, deadline_at) == pytest.approx(ctx.clock.monotonic() + ahead)
+
+    env.clock.set(LATE_TIME)
+    assert scan.fetch_bound(ctx, deadline_at) == pytest.approx(ctx.clock.monotonic() + scan.LATE_FETCH_SEC)
+    env.clock.set(datetime(2026, 11, 2, 9, 34, 50, tzinfo=UTC))  # 15:04:50: inside the margin, nothing left before the deadline
+    assert scan.fetch_bound(ctx, deadline_at) == pytest.approx(ctx.clock.monotonic() + scan.LATE_FETCH_SEC)
+
+
+def test_a_scan_that_starts_after_the_deadline_still_reaches_nse(env):
+    """The HTTP client starts no attempt once its deadline has passed, and the test double now does the same. A bound of 'now' would
+    make every manual, forced or dry run after 15:04:40 fail with 'quotes unavailable' without a single request."""
+    env.clock.set(LATE_TIME)
+    late_live = live_rows(env.panel, moves={env.star: 2.6}, strength={env.star: 0.95}, volume={env.star: 1.8}, stamp=LATE_STAMP)
+    ctx = env.make(live=late_live, live_ts=LATE_STAMP, dry_run=True)
+    result = scan.run_closing_scan(ctx)
+    assert result.status == "success", result.message
+    assert ctx.nse_api().live_calls == ["SECURITIES IN F&O"] and result.metrics["report"]["late"] is True
+
+
+def test_the_test_double_refuses_a_deadline_that_has_passed_like_the_real_client(env):
+    api = env.make().nse_api()
+    with pytest.raises(Exception, match="deadline reached"):
+        api.live_equities("SECURITIES IN F&O", None, deadline=env.clock.monotonic())
+    assert api.live_equities("SECURITIES IN F&O", None, deadline=env.clock.monotonic() + 1).rows
+
+
+def test_a_run_after_the_close_works_on_the_final_figures_of_the_day(env):
+    env.clock.set(datetime(2026, 11, 2, 11, 0, tzinfo=UTC))  # 16:30 IST: the session is over
+    stamp = "2026-11-02T10:10:00Z"  # NSE's last answer of the day carries its own stamp (15:40 IST)
+    rows = live_rows(env.panel, moves={env.star: 2.6}, strength={env.star: 0.95}, volume={env.star: 1.8}, fraction=1.0, stamp=stamp)
+    result = scan.run_closing_scan(env.make(live=rows, live_ts=stamp, dry_run=True))
+    assert result.status == "success", result.message
+    report = result.metrics["report"]
+    assert report["late"] is True and star_btst(report, env)
+    assert not any("projected" in note or "minutes old" in note for note in report["notes"])  # the volume is the day's own
 
 
 def test_the_prices_age_is_stated_when_the_last_quotes_are_old(env):

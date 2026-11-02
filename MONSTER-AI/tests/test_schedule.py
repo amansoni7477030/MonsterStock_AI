@@ -175,13 +175,38 @@ def test_the_closing_scan_opens_at_14_30_retries_every_minute_and_is_missed_afte
     assert alert["level"] == "error"
 
 
-def test_the_last_closing_scan_attempt_is_flagged(engine, store):
+def test_the_closing_scan_has_an_attempt_for_every_retry_slot_of_its_window():
+    """One try every ``retry_sec`` seconds from the window's opening to its end: giving up after the first few minutes (as 5 tries a
+    minute apart did) loses the day's report to an NSE blip that clears at 14:40, when a report by 15:05 would still be of use."""
+    scan = next(e for e in SCHEDULE if e.label == "closing_scan")
+    window = (ist(*MON, 15, 0) - ist(*MON, 14, 30)).total_seconds()
+    assert scan.max_attempts * scan.retry_sec >= window
+
+
+def test_the_closing_scan_keeps_trying_for_the_whole_window_and_only_the_last_try_is_flagged(engine, store):
     engine.clock.set(ist(*MON, 14, 30, 5))
-    for _ in range(4):
+    for _ in range(20):  # twenty failures in a row: the old limit (5) would have written the day off at 14:35
         store.job_record("closing_scan", "2026-11-02", "failed", message="NSE live quotes unavailable")
-    engine.clock.set(ist(*MON, 14, 40))
+    engine.clock.set(ist(*MON, 14, 50))
+    (mid,) = [d for d in engine.due() if d.entry.job == "closing_scan"]
+    assert mid.attempt == 21 and not mid.last_attempt
+    assert store.job_runs_for("closing_scan", "2026-11-02")[-1]["status"] == "failed"  # not recorded as missed
+
+    engine.clock.set(ist(*MON, 14, 58, 30))
+    (nearly,) = [d for d in engine.due() if d.entry.job == "closing_scan"]
+    assert not nearly.last_attempt  # one more try still fits before 15:00
+    engine.clock.set(ist(*MON, 14, 59, 30))
     (last,) = [d for d in engine.due() if d.entry.job == "closing_scan"]
-    assert last.attempt == 5 and last.last_attempt  # the failure notice goes out on this one
+    assert last.attempt == 21 and last.last_attempt  # nothing fits after this one: the failure notice goes out on it
+
+
+def test_the_attempts_of_the_closing_scan_end_at_the_limit(engine, store):
+    engine.clock.set(ist(*MON, 14, 30, 5))
+    for _ in range(30):
+        store.job_record("closing_scan", "2026-11-02", "failed", message="NSE live quotes unavailable")
+    engine.clock.set(ist(*MON, 14, 59))
+    assert "closing_scan" not in labels(engine.due())
+    assert "gave up after 30 failed attempts" in store.job_runs_for("closing_scan", "2026-11-02")[-1]["message"]
 
 
 def test_the_midday_news_pass_has_its_own_run_key(engine):

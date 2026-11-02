@@ -72,7 +72,7 @@ SCHEDULE: tuple[ScheduleEntry, ...] = (
     E("final_scan", "09:08:45", "09:13:30", retry_sec=45, max_attempts=3),
     # ---- the closing hour (trading days): fresh news, then BTST / swing / watchlist ideas while the entry window is open -------
     E("collect_news", "13:40", "14:20", slot="midday", retry_sec=600, max_attempts=2),
-    E("closing_scan", "14:30", "15:00", retry_sec=60, max_attempts=5),
+    E("closing_scan", "14:30", "15:00", retry_sec=60, max_attempts=30),  # a try a minute fills the whole window, not its first five minutes
     # ---- after the close -------------------------------------------------------------------------------------
     E("ingest_eod", "17:45", "23:30", retry_sec=1200, max_attempts=12, catch_up=True),
     E("evaluate", "18:15", "23:45", retry_sec=1200, max_attempts=10, after=("ingest_eod",), catch_up=True),
