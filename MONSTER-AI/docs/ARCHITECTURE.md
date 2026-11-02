@@ -313,6 +313,9 @@ sequenceDiagram
                 S->>K: cooldown until then (at most 6 h, survives between runs)
                 S->>H: failure
                 S-->>P: nothing
+            else web check: the model answered as a call to a tool that does not exist (HTTP 400 tool_use_failed)
+                S->>S: read the brief from the error body when it has the shape of one, else retry once (never a back-off)
+                S-->>P: the brief (unverified: it can inform but never discount an item) or nothing
             else web check: tool rejected or request above the plan's token limit
                 S->>K: back off 6 h (survives between runs)
                 S->>H: failure
@@ -330,7 +333,7 @@ sequenceDiagram
 | Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** (it names a reputable publisher of the source registry: an exchange, an official body, a wire or a business newspaper) whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
 | Never | invents evidence | raises a severity or a confidence, clears a flag, runs for an exchange filing, an official statement or a company's own release, for macro or sector news, or in a replay or backtest | clears a rumour flag the rules set, or flags an exchange filing or official statement as a rumour |
 | Where it adds | news the rules cannot read: unusual wording, implied events, entities by description | the one thing the text cannot tell: is the rumour or the unverified deal true, denied or old | calibrated confidence on the event type, rumour and denial detection, a second opinion on severity and direction |
-| Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text and context | per news job: `LLM_WEB_MAX_PER_RUN` (8), 30 % of the LLM time box, a 1-day cache; HTTP 413 (the free tier's 8,000 tokens per minute) or a rejected tool backs it off for 6 h | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, context, company and source class |
+| Caps | per news job: `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240 s), and a 14-day cache by text and context | per news job: `LLM_WEB_MAX_PER_RUN` (8) and per IST day `LLM_WEB_MAX_PER_DAY` (16), 30 % of the LLM time box, a 1-day cache; HTTP 413 or a rejected tool backs it off for 6 h | per news job: `JEV_MAX_ITEMS_PER_RUN` (200), 180 s, and a 14-day cache by text, context, company and source class |
 
 Where both answer, the direction of the company in focus is the mean of the two readings when they agree and *unknown* (0) when they
 point opposite ways; a direction offered for a rumour or a denial is halved, as the rules do. The company asked about is the one
@@ -348,7 +351,10 @@ results) is single-line, length-capped and stripped of control characters and of
 The web check searches the public web; nothing of yours is sent with the request. Its time share is a hard bound: every request of
 every service is given at most what is left of the run's wall-clock budget (and is not started when almost nothing is left), so a
 slow provider cannot overrun it. The web check and the extraction share Groq's per-model token quota; when it is spent the
-extraction hands over to its fallback model and the web check backs off.
+extraction hands over to its fallback model and the web check backs off. A search is by far the most expensive call (about
+7 000 tokens, measured: the pages it reads count as input tokens, charged to the per-minute and to the per-day limit, so about 28
+of them use up a free-tier model's 200 000 tokens a day), hence a daily cap besides the per-job one (`LLM_WEB_MAX_PER_DAY`, counted per
+IST day in `kv`): retries and manual runs cannot add up to a day of tokens that the extraction needs.
 
 How it is observed: `monster-ai ai-test` sends one made-up item through the real code (and makes one real web search) and prints
 what came back or why not; `monster-ai doctor` lists the models each key can use (no tokens spent); the counters `llm.*` /
@@ -816,7 +822,7 @@ flowchart TB
 | Holiday list of a new year not published | rule-based holidays plus the live pre-open confirmation; `holiday_inferred` alert and no report on a closed day |
 | RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
 | Groq LLM or Jev unavailable, unconfigured, rate-limited or rejected | the rules alone; the circuit opens for the run (at once on a rejected key), a quota starts a cooldown that survives between runs, the report's coverage note names the service, `source_health` warns after repeated failures |
-| Web check unavailable (free-tier token limit, rejected tool, slow or failing search) | the item is extracted and judged without it; the web check has its own circuit and a 6 h back-off, so the extraction is untouched; `source_health` (`llm_web`) warns after repeated failures |
+| Web check unavailable (plan or model refuses the tool, slow or failing search) | the item is extracted and judged without it; the web check has its own circuit and a 6 h back-off, so the extraction is untouched; `source_health` (`llm_web`) warns after repeated failures |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |

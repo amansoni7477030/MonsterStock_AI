@@ -50,27 +50,27 @@ _CLOSING_TAG = re.compile(r"</(article|context)\s*>", re.IGNORECASE)
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOST = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.[a-z]{{2,24}}")
 _INVISIBLE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")  # zero-width and bidi characters hide words
-_DIRECTIVE = (
-    r"(?:ignore|disregard|forget|override|bypass|overrule|discard|do not follow|don't follow|stop following)"
-)
-_PROMPT_NOUN = r"(?:instructions?|prompts?|directives?|system messages?|guidelines)"
+_DIRECTIVE = r"(?:ignore|disregard|forget|override|bypass|discard|do not follow|don't follow|stop following)"
+# Only the nouns that name what an AI was told. "guidelines", "directives" and "orders" are deliberately absent: a court that
+# "overrules earlier directives" or a regulator that tells brokers to "disregard the previous guidelines" is ordinary news.
+_PROMPT_NOUN = r"(?:instructions?|(?:system )?prompts?|system messages?)"
 _QUALIFIER = r"(?:all|any|the|these|those|your|my|our|previous|prior|above|earlier|preceding|former|original|initial|every)"
+_SCORE = r"(?:[-+]?(?:0(?:\.\d+)?|1(?:\.0+)?)(?![\d,.]*\d)|merger|acquisition|positive|negative|bullish|bearish)"  # a score in -1..1
 # What an attacker writes to an AI that reads the article, and a news article never contains. Each pattern is deliberately narrow: a
 # false alarm only withholds one item from the AI services (the rules still read it), while a miss lets a text dictate an answer.
 INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("an order to ignore earlier instructions",
      re.compile(rf"\b{_DIRECTIVE}\W+(?:{_QUALIFIER}\W+){{1,4}}{_PROMPT_NOUN}\b")),
     ("a role marker (system / assistant)",
-     re.compile(r"(?:^|\n|[.!?]\s)\s*(?:system|assistant|developer|admin(?:istrator)?)\s*(?:prompt|message)?\s*:", re.MULTILINE)),
+     re.compile(r"(?:^|\n|[.!?]\s)\s*(?:system|assistant)\s*(?:prompt|message)?\s*:", re.MULTILINE)),
     ("a chat-template token", re.compile(r"<\|[a-z_ ]{1,24}\|>|\[/?(?:inst|sys)\]|<<\s*/?sys\s*>>|###\s*(?:instruction|system)")),
     ("a dictated answer",
      re.compile(r"\b(?:report|set|output|return|respond|reply|answer|assign|mark|rate|classify|label|score|rank)\b[^.\n]{0,30}"
-                r"\b(?:severity|polarity|confidence|event[_ ]type|evidence[_ ]quote)\b\W{0,4}(?:to|as|of|=|:)?\W{0,4}"
-                r"(?:[-+]?\d|merger|acquisition|positive|negative|bullish|bearish|other)")),
+                rf"\b(?:severity|polarity|confidence|event[_ ]type|evidence[_ ]quote)\b\W{{0,4}}(?:to|as|of|=|:)?\W{{0,4}}{_SCORE}")),
     ("a prompt-block tag", re.compile(r"</?\s*(?:article|context)\s*>")),
     ("a request addressed to an AI",
-     re.compile(r"\b(?:as an? (?:ai|language model|assistant)|you are (?:now )?(?:an? )?(?:ai|assistant|language model|chatbot)|"
-                r"new instructions?\s*:|respond (?:only )?with (?:the )?json)\b")),
+     re.compile(r"\b(?:as an? (?:ai|language model|assistant)|you are (?:now )?(?:an? )?(?:ai|assistant|language model|chatbot)"
+                r"|respond (?:only )?with (?:the )?json)\b|(?:^|\n|[.!?]\s)\s*new instructions?\s*:", re.MULTILINE)),
 )
 
 

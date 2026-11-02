@@ -59,6 +59,7 @@ def test_all_errors_are_reported_together(tmp_path):
         ({"LLM_API_BASE": "https://api.groq.com/openai/v1", "LLM_MODEL": "openai/gpt-oss-20b"}, "neither GROQ_API_KEY nor LLM_API_KEY"),
         ({"LLM_MAX_SECONDS_PER_RUN": "5"}, "LLM_MAX_SECONDS_PER_RUN"),
         ({"LLM_WEB_MAX_PER_RUN": "-1"}, "LLM_WEB_MAX_PER_RUN"),
+        ({"LLM_WEB_MAX_PER_DAY": "-1"}, "LLM_WEB_MAX_PER_DAY"),
         ({"LLM_REASONING_EFFORT": "extreme"}, "LLM_REASONING_EFFORT"),
         ({"JEV_MIN_CONFIDENCE": "1.5"}, "JEV_MIN_CONFIDENCE"),
         ({"TRAINING_MODE": "external"}, "MODEL_ARTIFACT_URL"),
@@ -153,12 +154,15 @@ def test_the_models_can_be_overridden_and_a_fallback_never_equals_the_primary(tm
 
 def test_the_web_check_is_on_by_default_but_only_ever_exists_with_groq_and_a_gpt_oss_model(tmp_path):
     off = _load(tmp_path)
-    assert (off.llm_web_search, off.llm_web_max_per_run, off.llm_web_configured, off.llm_web_models) == (True, 8, False, [])
+    assert (off.llm_web_search, off.llm_web_max_per_run, off.llm_web_max_per_day) == (True, 8, 16)
+    assert (off.llm_web_configured, off.llm_web_models) == (False, [])
     on = _load(tmp_path, GROQ_API_KEY=GROQ)
     assert on.llm_web_configured and on.llm_web_models == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
     assert not _load(tmp_path, GROQ_API_KEY=GROQ, LLM_WEB_SEARCH="false").llm_web_configured
     assert not _load(tmp_path, GROQ_API_KEY=GROQ, LLM_WEB_MAX_PER_RUN="0").llm_web_configured
+    assert not _load(tmp_path, GROQ_API_KEY=GROQ, LLM_WEB_MAX_PER_DAY="0").llm_web_configured
     assert _load(tmp_path, GROQ_API_KEY=GROQ, LLM_WEB_MAX_PER_RUN="25").llm_web_max_per_run == 25
+    assert _load(tmp_path, GROQ_API_KEY=GROQ, LLM_WEB_MAX_PER_DAY="40").llm_web_max_per_day == 40
     other = _load(tmp_path, GROQ_API_KEY=GROQ, LLM_API_BASE="https://api.openai.com/v1", LLM_MODEL="gpt-x")
     assert other.llm_configured and not other.llm_web_configured and other.llm_web_models == []  # browser_search is Groq's
     partial = _load(tmp_path, GROQ_API_KEY=GROQ, LLM_MODEL="qwen/qwen3.8-27b")

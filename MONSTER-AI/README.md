@@ -260,7 +260,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
 | Resources | `MIN_FREE_DISK_MB_WARN` / `_CRIT`, `JOB_MAX_RSS_MB` (720) |
 | Training | `TRAINING_MODE` (`local-light`, `external` signed models, or `disabled`), `MODEL_SIGNING_KEY`, S3 storage for off-box backups and model bundles |
-| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
+| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` / `LLM_WEB_MAX_PER_DAY` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
 
 ### Optional AI: Groq and Jev
 
@@ -272,9 +272,9 @@ Both are **off until you add a key**; with no key the deterministic rules do eve
 | Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (`LLM_MODEL`, `LLM_FALLBACK_MODEL` override) | `jev-1.14.0`, pinned (`JEV_MODEL`) |
 | What it does | reads an article and returns event type, companies with a direction, severity, horizon, event time and a **verbatim evidence quote** | answers five typed questions about an article in one request: event type, rumour, denial, severity and direction for the company in focus, each with calibrated probabilities |
 | What it is given | the whole stored text (up to 6,000 characters), the definition of every event type and a **context block** (see below) | the same text and the same facts as typed fields of its state |
-| Web access | Groq's built-in `browser_search` for non-first-hand company news that matters (`LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`), see [the web check](#the-web-check) | none: it judges what it is shown, including the web check's result |
+| Web access | Groq's built-in `browser_search` for non-first-hand company news that matters (`LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`, `LLM_WEB_MAX_PER_DAY`), see [the web check](#the-web-check) | none: it judges what it is shown, including the web check's result |
 | What it is not | a source of facts: a claim without a quote that appears word for word in the text is ignored | a price forecaster or a chat model: it judges news, it does not predict prices |
-| Cost caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_WEB_MAX_PER_RUN` (8) | `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5) |
+| Cost caps | `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_WEB_MAX_PER_RUN` (8), `LLM_WEB_MAX_PER_DAY` (16) | `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5) |
 
 Turn them on (the file edit is the only manual step; no code or container changes):
 
@@ -321,23 +321,51 @@ purpose: to settle whether an unconfirmed-looking company story is true, denied 
   enough severity to matter. Macro and sector news, results and dividends are reported everywhere and are never searched for.
 - **What it returns.** A small JSON brief, validated field by field before it is used: do independent outlets report the same
   facts (yes / no / unclear), how many, was a denial or correction found, was the event already public, up to three short facts and
-  the host names relied on. A page that says "ignore your instructions" can at most colour those fields.
-- **What it changes.** Both readers get the brief as context. By itself it changes one thing only: a **sourced denial** found
-  elsewhere, with the facts not confirmed, turns the item into a rumour with a denial's discounts (half the severity, a halved
-  direction, the rumour horizon). "Sourced" means it names a host the source registry knows as reputable (an exchange, an official
-  body, a wire service, a business newspaper): a page the search model cannot vouch for never discounts an item. A confirmation
-  never raises anything, and what was found is kept in the event's evidence so you can see why a flag was set.
+  the host names relied on. The brief is checked against what the search really did: Groq returns the pages the tool read, and a
+  cited source the search never returned is dropped, the outlet count cannot exceed the sites actually seen, and a "fact" that
+  tries to instruct the reader is thrown away.
+- **What it changes.** Both readers get the brief as context. By itself it changes one thing only: a **verified denial** turns the
+  item into a rumour with a denial's discounts (half the severity, a halved direction, the rumour horizon). "Verified" means a page
+  of a reputable publisher (an exchange, an official body, a wire service, a business newspaper, as the source registry knows them)
+  that the search returned *and* the reply cites contains the wording of a denial; a denial the model merely asserts, or one found
+  only on an unknown site, an aggregator or social media, never discounts an item (the readers are still told, marked unverified).
+  A confirmation never raises anything, and what was found is kept in the event's evidence so you can see why a flag was set.
 - **Why a separate request.** Groq documents that browser search cannot be combined with structured outputs, so a search request
   cannot also force the strict JSON schema the extraction relies on. Kept apart, the extraction stays schema-constrained.
-- **What it costs.** A search reads far more tokens than an extraction and Groq bills the tool separately. It has its own cap
-  (`LLM_WEB_MAX_PER_RUN`, 8 per news job), its own share of the time box (30 %, a hard bound: no request may run past it, so it
-  needs `LLM_MAX_SECONDS_PER_RUN` of at least 34), cache (1 day), circuit breaker and cooldown, so a failing search never affects
-  the extraction. It does share Groq's per-model token quota with the extraction: when that quota runs out the extraction hands
-  over to its fallback model and the search backs off. **Groq's free tier (8,000 tokens per minute) is too small for a search**
-  (HTTP 413): the check then backs off for 6 hours and every item is judged without it. The Developer plan works. Set
-  `LLM_WEB_SEARCH=false` to switch it off.
+- **What it costs.** Measured on a live key: a search takes 4 to 10 seconds and is the most expensive call there is: about 7,000
+  tokens (4,000 to 12,000: the pages the tool reads count as input tokens), charged to Groq's per-minute **and** per-day token
+  limits. It has its own caps (`LLM_WEB_MAX_PER_RUN`, 8 per news job, and `LLM_WEB_MAX_PER_DAY`, 16 per IST day over every job, retry
+  and manual run), its own share of the time box (30 %, a hard bound: no request may run past it, so it needs
+  `LLM_MAX_SECONDS_PER_RUN` of at least 34), cache (1 day), circuit breaker and cooldown, so a failing search never affects the
+  extraction. It shares Groq's per-model token quota with the extraction: when that quota is spent the request goes to the fallback
+  model, and when both are limited the item is judged without the search. **It works on Groq's free tier**, where a model has 200,000
+  tokens a day, so about 28 searches use up a model's whole day: that is what the daily cap protects the extraction from. If an
+  account's plan refuses it (HTTP 413, or a model without the tool) the check backs off for 6 hours and every item is judged without
+  it. A gpt-oss model sometimes delivers its answer as a call to a tool that does not exist (HTTP 400 `tool_use_failed`, about one
+  search in six in testing): the answer is then read from the error when it has the shape of a brief (unverified, so it can inform
+  but never discount an item), otherwise the search is retried once; it never switches the check off. Set `LLM_WEB_SEARCH=false` to
+  switch it off.
 - **Point in time.** The web of today is not the web of last year: the check runs only in the live pipeline, never in a replay or a
   backtest, and its result is cached for one day only.
+
+#### Text that tries to instruct the AI
+
+A news item is untrusted input, and what a feed publishes can be written by anyone. An item whose text addresses the AI (for example
+"ignore all previous instructions", a `SYSTEM:` line, a chat-template token, "set severity to 1", a closing `</article>` tag) is
+**withheld from every AI service**: the rules still read it and it still becomes an event, but nothing of it is sent to Groq, Jev or
+the web search. It is logged as a WARNING and counted in the news job's message (`N withheld (instruction-like text)`). The
+detector is deliberately narrow so that ordinary regulatory news ("the court overruled the earlier directives") is not flagged. As a
+second line of defence the prompt tells the model to treat such text as an attack, every answer is validated, and Jev only ever
+sees the text as data in a typed field.
+
+#### Throughput on Groq's free tier
+
+Measured: 8,000 tokens per minute and 200,000 tokens per day for each model, about 2,000 tokens per extraction (the prompt carries the
+definition of every event type), so roughly four extractions per minute and about a hundred a day per model, and twice that with the
+fallback model. A news job of 60 articles therefore needs about seven minutes on the free tier; the 240-second time box
+(`LLM_MAX_SECONDS_PER_RUN`) stops it after about thirty and the rest are read by the rules and Jev, which has its own limits. A web
+check costs as many tokens as three or four extractions, which is why it has a daily cap. Groq's paid Developer tier raises these
+limits; nothing else changes.
 
 ## Reliability guarantees
 
@@ -419,8 +447,9 @@ tests/          hermetic tests built on real captured provider responses
 - Calibrated probabilities describe *range*, not direction or profit. Costs are modelled estimates.
 - News features reach the report (catalysts, chains, "priced in") but are not model inputs, and VWAP is a daily proxy: see the
   deviations in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#deviations-from-the-blueprint). The optional Groq and Jev services
-  make that news evidence more accurate; they do not change the calibrated forecast, and they were built without live keys, so run
-  `sudo monster-ai ai-test` after adding them.
+  make that news evidence more accurate; they do not change the calibrated forecast. They were verified against live Groq and Jev keys
+  (see the CHANGELOG) and the size of the LLM's direction is noisy even so; run `sudo monster-ai ai-test` after adding the keys on a
+  server.
 - The live evidence base starts empty: statistics are shown with sample sizes and intervals and the "VALIDATED" label has to be earned.
   The measured edge over the best simple baseline is real but modest.
 - The Linux installer and systemd units were validated by static analysis, stubs and ShellCheck on a Windows development machine, and

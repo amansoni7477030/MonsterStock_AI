@@ -265,6 +265,10 @@ class RemoteJudge:
         self._bump(f"{self.COUNTER}.calls")
         return True
 
+    def _refund(self) -> None:
+        """Take back the call :meth:`_admit` counted when the request was not sent after all (the run's time ran out first)."""
+        self.run_calls -= 1
+
     def _attempt(self, call: Callable[[], T]) -> T | None:
         """Run one admitted request. Any failure is counted, logged and answered with ``None`` (never raised): a rejected key
         or endpoint opens the circuit, an exhausted quota starts a cooldown, and a spent time budget is no failure at all."""
@@ -283,7 +287,7 @@ class RemoteJudge:
             self.start_cooldown(exc.seconds)
             return None
         except OutOfTime:
-            self.run_calls -= 1  # not a failure and not a use: the run's time ran out before the answer
+            self._refund()  # not a failure and not a use: the run's time ran out before the answer
             self.run_budget_skipped += 1
             self.tripped = True
             return None

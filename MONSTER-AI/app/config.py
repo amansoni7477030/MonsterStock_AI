@@ -236,12 +236,16 @@ VARS: tuple[Var, ...] = (
     Var("llm_web_search", "LLM_WEB_SEARCH", "true", _bool,
         "Let the Groq gpt-oss model check a news item on the web (Groq's built-in browser_search tool) before it is judged: do "
         "independent outlets report the same facts, did anyone deny it, is it old news. Only for company news that matters and "
-        "is not first-hand (never exchange filings), only on Groq with a gpt-oss model, never part of a backtest. A search reads "
-        "pages worth about 4,000-12,000 input tokens and Groq bills the tool on top (measured on a free-tier key, where it works: "
-        "only the request itself counts against the per-minute limit); when it fails the item is judged without it. "
-        "false = off.", "LLM"),
+        "is not first-hand (never exchange filings), only on Groq with a gpt-oss model, never part of a backtest. A check is the "
+        "most expensive call there is: the pages the model reads count as input tokens (about 7,000 per check, measured 4,000-12,000) "
+        "against both the per-minute and the per-day token limits. It works on Groq's free tier (8,000 tokens per minute and "
+        "200,000 per day for each model) but about 28 checks use up a model's day, so the caps below matter. When it fails or "
+        "is not allowed the item is judged without it. false = off.", "LLM"),
     Var("llm_web_max_per_run", "LLM_WEB_MAX_PER_RUN", "8", _int,
         "Cost cap: web checks per news job (a job drains a backlog in up to four batches that share it). 0 = off.", "LLM"),
+    Var("llm_web_max_per_day", "LLM_WEB_MAX_PER_DAY", "16", _int,
+        "Cost cap: web checks per day (IST), counted over every news job, retry and manual run, so that they cannot use up the "
+        "day's token allowance that the extraction needs (16 checks are about 110,000 tokens). 0 = off.", "LLM"),
     # -- jev -----------------------------------------------------------------------------------------------
     Var("typesafe_api_key", "TYPESAFE_API_KEY", "", _opt_str,
         "TypeSafe API key (https://console.typesafe.ai/keys). Enables Jev judgments on news (event type, rumour, denial, "
@@ -371,6 +375,7 @@ class Settings:
     llm_max_output_tokens: int = 1200
     llm_web_search: bool = True
     llm_web_max_per_run: int = 8
+    llm_web_max_per_day: int = 16
     typesafe_api_key: str | None = None
     jev_model: str | None = "jev-1.14.0"
     jev_timeout_sec: float = 20.0
@@ -470,7 +475,10 @@ class Settings:
 
     @property
     def llm_web_configured(self) -> bool:
-        return bool(self.llm_web_search and self.llm_web_max_per_run > 0 and self.llm_configured and self.llm_web_models)
+        return bool(
+            self.llm_web_search and self.llm_web_max_per_run > 0 and self.llm_web_max_per_day > 0
+            and self.llm_configured and self.llm_web_models
+        )
 
     @property
     def jev_configured(self) -> bool:
@@ -634,6 +642,8 @@ def validate(s: Settings) -> list[str]:
         problems.append("LLM_MAX_SECONDS_PER_RUN must be at least 10")
     if s.llm_web_max_per_run < 0:
         problems.append("LLM_WEB_MAX_PER_RUN must not be negative (0 = web checks off)")
+    if s.llm_web_max_per_day < 0:
+        problems.append("LLM_WEB_MAX_PER_DAY must not be negative (0 = web checks off)")
     if not 0.0 <= s.jev_min_confidence <= 1.0:
         problems.append("JEV_MIN_CONFIDENCE must be between 0 and 1")
     if s.typesafe_api_key and not s.jev_model:

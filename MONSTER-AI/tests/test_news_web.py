@@ -75,6 +75,7 @@ def test_a_web_check_exists_only_on_groq_with_a_model_that_offers_the_tool(setti
     assert on.llm_web_configured and on.llm_web_models == [PRIMARY, FALLBACK]
     assert dataclasses.replace(on, llm_web_search=False).llm_web_configured is False
     assert dataclasses.replace(on, llm_web_max_per_run=0).llm_web_configured is False
+    assert dataclasses.replace(on, llm_web_max_per_day=0).llm_web_configured is False
     custom = dataclasses.replace(settings, llm_api_base="https://llm.example/v1", llm_model=PRIMARY, llm_api_key="sk-x")
     assert custom.llm_configured and custom.llm_web_models == [] and custom.llm_web_configured is False  # not Groq
     only_fallback = dataclasses.replace(on, llm_model="qwen/qwen3.8-27b")
@@ -285,6 +286,74 @@ def test_the_web_budget_is_its_own_and_counted_in_calls(cfg, store, fake_clock):
     assert store.kv_get("llmweb.calls") == "4" and store.kv_get("llm.calls") is None
 
 
+# A search costs about 7,000 tokens of a day's allowance (Groq's free tier: 200,000 per model, shared with the extraction).
+def test_the_daily_budget_is_shared_by_every_run_of_the_ist_day_and_starts_over_the_next_day(cfg, store, fake_clock):
+    cfg = dataclasses.replace(cfg, llm_web_max_per_run=5, llm_web_max_per_day=4)
+    first, _ = make(cfg, store, fake_clock)
+    first.start_run()
+    assert [first.research(f"{TITLE} {i}", TEXT) is not None for i in range(3)] == [True, True, True]
+    second, session = make(cfg, store, fake_clock)  # another job of the same day: the count lives in the store
+    second.start_run()
+    assert [second.research(f"{TITLE} b{i}", TEXT) is not None for i in range(3)] == [True, False, False]
+    assert len(session.calls) == 1 and second.run_budget_skipped == 2 and store.kv_get("llmweb.day") == "2026-11-02:4"
+    assert second.run_failures == 0 and not second.tripped  # a spent budget is no failure
+    fake_clock.advance(86400)  # the next IST day
+    third, _ = make(cfg, store, fake_clock)
+    third.start_run()
+    assert third.research(f"{TITLE} c", TEXT) is not None and store.kv_get("llmweb.day") == "2026-11-03:1"
+
+
+def test_the_ist_day_not_the_utc_day_starts_the_budget_over(cfg, store, fake_clock):
+    cfg = dataclasses.replace(cfg, llm_web_max_per_day=1)
+    fake_clock.set(datetime(2026, 11, 2, 18, 0, tzinfo=UTC))  # 23:30 IST on the 2nd
+    researcher, _ = make(cfg, store, fake_clock, search_ok(), search_ok())
+    assert researcher.research(TITLE, TEXT) is not None and researcher.research(TITLE + " 2", TEXT) is None
+    fake_clock.set(datetime(2026, 11, 2, 18, 45, tzinfo=UTC))  # 00:15 IST on the 3rd: a new day for the market, still the 2nd in UTC
+    researcher.start_run()
+    assert researcher.research(TITLE + " 3", TEXT) is not None and store.kv_get("llmweb.day") == "2026-11-03:1"
+
+
+def test_a_cache_hit_is_free_a_failed_search_is_not_and_one_the_time_cannot_fit_is_given_back(cfg, store, fake_clock):
+    cfg = dataclasses.replace(cfg, llm_web_max_per_day=10)
+    researcher, _ = make(cfg, store, fake_clock, search_ok(), FakeResponse(500), FakeResponse(500))
+    researcher.start_run()
+    assert researcher.research(TITLE, TEXT) is not None and store.kv_get("llmweb.day") == "2026-11-02:1"
+    assert researcher.research(TITLE, TEXT) is not None and store.kv_get("llmweb.day") == "2026-11-02:1"  # from the cache
+    assert researcher.research(TITLE + " other", TEXT) is None and store.kv_get("llmweb.day") == "2026-11-02:2"  # sent: maybe paid
+    unsent, session = make(cfg, store, fake_clock)
+    unsent.start_run()
+    fake_clock.advance(unsent.max_seconds - web_mod.MIN_SEARCH_SEC + 1)  # not enough time left for a search
+    assert unsent.research(TITLE + " late", TEXT) is None and session.calls == []
+    assert store.kv_get("llmweb.day") == "2026-11-02:2" and unsent.run_calls == 0  # given back with the run's call
+
+
+def test_a_spent_day_is_logged_once_and_the_item_goes_on_without_the_web_check(cfg, store, fake_clock, caplog):
+    cfg = dataclasses.replace(cfg, llm_web_max_per_day=1)
+    store.kv_set("llmweb.day", "2026-11-02:1")
+    researcher, session = make(cfg, store, fake_clock)
+    researcher.start_run()
+    with caplog.at_level("INFO", logger="news_intelligence.web"):
+        assert [researcher.research(f"{TITLE} {i}", TEXT) for i in range(3)] == [None, None, None]
+    assert session.calls == [] and researcher.run_budget_skipped == 3 and researcher.run_calls == 0
+    spent = "web check: today's budget (LLM_WEB_MAX_PER_DAY=1) is spent; items are judged without it"
+    assert [r.getMessage() for r in caplog.records].count(spent) == 1
+
+
+@pytest.mark.parametrize("stored", ["garbage", "2026-11-02:abc", "2026-11-02:-3", "2026-11-01:99", ":7", "2026-11-02", ""])
+def test_a_damaged_or_stale_day_counter_counts_as_an_unused_day(cfg, store, fake_clock, stored):
+    cfg = dataclasses.replace(cfg, llm_web_max_per_day=1)
+    store.kv_set("llmweb.day", stored)
+    researcher, _ = make(cfg, store, fake_clock)
+    assert researcher._day_used() == 0 and researcher.research(TITLE, TEXT) is not None
+    assert store.kv_get("llmweb.day") == "2026-11-02:1"
+
+
+def test_without_a_store_there_is_no_day_to_count_and_only_the_runs_budget_applies(cfg, fake_clock):
+    session = FakeSession(search_ok(), search_ok())
+    researcher = WebResearcher(dataclasses.replace(cfg, llm_web_max_per_day=1), session=session, clock=fake_clock)
+    assert researcher.research(TITLE, TEXT) is not None and researcher.research(TITLE + " 2", TEXT) is not None
+
+
 def test_the_web_check_stops_when_its_share_of_the_time_box_is_spent(cfg, store, fake_clock):
     researcher, session = make(cfg, store, fake_clock)
     researcher.start_run()
@@ -359,12 +428,91 @@ def test_stale_briefs_are_pruned_without_touching_the_other_ai_keys(cfg, store, 
 def test_a_request_the_plan_cannot_take_or_a_rejected_tool_backs_off_for_six_hours_across_runs(cfg, store, fake_clock, refusal):
     researcher, session = make(cfg, store, fake_clock, refusal, refusal)
     assert researcher.research(TITLE, TEXT) is None and len(session.calls) == 1  # not retried: it would fail the same way
-    assert researcher.last_error.startswith("unavailable:") and researcher.tripped and researcher.cooldown_active()
-    later, second = make(cfg, store, fake_clock, ok(brief_reply()))  # the next run: no request at all
+    assert researcher.last_error.startswith("unavailable: http ") and researcher.tripped and researcher.cooldown_active()
+    assert refusal.json()["error"]["message"][:30] in researcher.last_error  # the provider's own reason is kept
+    later, second = make(cfg, store, fake_clock, search_ok())  # the next run: no request at all
     assert later.research(TITLE + " b", TEXT) is None and second.calls == []
     fake_clock.advance(web_mod.BACKOFF_SEC + 5)
-    again, third = make(cfg, store, fake_clock, ok(brief_reply()))
+    again, third = make(cfg, store, fake_clock, search_ok())
     assert again.research(TITLE + " c", TEXT) is not None and len(third.calls) == 1  # re-probed after the back-off
+
+
+# ------------------------------------------------------------- a malformed tool call is the model's slip
+# Captured from a live key: gpt-oss, asked to search under tool_choice=required, delivered its final answer as a call to a tool
+# named "json", which Groq rejects with HTTP 400. The first version of this code took any 400 that mentioned a "tool" for a refusal
+# of the tool and switched the web check off for six hours.
+BRIEF_AS_TOOL_CALL = {"name": "json", "arguments": {
+    "confirmed": "no", "independent_outlets": 0, "denial_found": False, "earlier_coverage": False,
+    "facts": ["No major outlet reported talks as of 2 Nov 2026"], "sources": ["reuters.com"]}}
+
+
+def slipped(generation=BRIEF_AS_TOOL_CALL, code="tool_use_failed", message=None):
+    failed = generation if isinstance(generation, str) else json.dumps(generation)
+    return FakeResponse(400, {"error": {
+        "message": message or "Tool call validation failed: tool call validation failed: attempted to call tool 'json' which was not in "
+                              "request.tools", "type": "invalid_request_error", "code": code, "failed_generation": failed}})
+
+
+def test_a_brief_delivered_as_a_malformed_tool_call_is_salvaged_without_paying_for_the_search_again(cfg, store, fake_clock):
+    researcher, session = make(cfg, store, fake_clock, slipped(), search_ok())
+    brief = researcher.research(TITLE, TEXT)
+    assert brief is not None and brief.confirmed == "no" and brief.facts == ("No major outlet reported talks as of 2 Nov 2026",)
+    assert len(session.calls) == 1 and researcher.last_error is None and researcher.run_failures == 0
+    assert not researcher.tripped and not researcher.cooldown_active() and store.kv_get("llmweb.failures") is None
+    # the pages the search read are not in an error body: the sources cannot be checked, so nothing is verified
+    assert brief.sources == () and brief.denial_verified is False and brief.refutes is False
+
+
+def test_a_salvaged_brief_can_never_discount_an_item_even_when_it_claims_a_denial(cfg, store, fake_clock):
+    claim = {"name": "json", "arguments": {"confirmed": "no", "independent_outlets": 2, "denial_found": True,
+                                           "earlier_coverage": False, "facts": [], "sources": ["reuters.com"]}}
+    researcher, _ = make(cfg, store, fake_clock, slipped(claim))
+    brief = researcher.research(TITLE, TEXT)
+    assert brief.denial_found is True and brief.denial_verified is False and brief.refutes is False and brief.sources == ()
+
+
+def test_a_malformed_call_with_nothing_to_salvage_is_retried_and_never_makes_the_service_back_off(cfg, store, fake_clock):
+    researcher, session = make(cfg, store, fake_clock, slipped("garbage, not json"), search_ok())
+    assert researcher.research(TITLE, TEXT) is not None and len(session.calls) == 2
+    assert not researcher.tripped and not researcher.cooldown_active() and researcher.last_error is None
+    assert researcher.run_failures == 0 and store.kv_get("llmweb.cooldown_until") is None
+
+
+def test_a_search_that_slips_every_time_is_a_counted_failure_but_never_a_back_off(cfg, store, fake_clock):
+    bad = slipped("garbage")
+    researcher, session = make(cfg, store, fake_clock, bad, bad, search_ok())
+    assert researcher.research(TITLE, TEXT) is None and len(session.calls) == 2  # one retry, as for any transient error
+    assert researcher.run_failures == 1 and "tool call validation failed" in researcher.last_error
+    assert not researcher.tripped and not researcher.cooldown_active()  # one bad item does not switch the check off
+    assert researcher.research(TITLE + " next", TEXT) is not None  # the next item is searched as usual
+
+
+def test_only_a_tool_use_failure_with_the_shape_of_a_brief_is_salvaged():
+    keep = web_mod.salvage_generation
+    brief = BRIEF_AS_TOOL_CALL["arguments"]
+    body = lambda **error: {"error": {"code": "tool_use_failed", **error}}  # noqa: E731
+    assert json.loads(keep(body(failed_generation=json.dumps(BRIEF_AS_TOOL_CALL)))) == brief  # the call form
+    assert json.loads(keep(body(failed_generation=json.dumps(brief)))) == brief  # the bare object
+    assert json.loads(keep(body(failed_generation=json.dumps({"name": "json", "arguments": json.dumps(brief)})))) == brief  # as text
+    assert json.loads(keep(body(failed_generation="Here is my answer: " + json.dumps(brief) + " done"))) == brief
+    assert json.loads(keep(body(failed_generation=json.dumps([brief])))) == brief  # the object is found inside list brackets too
+    for nothing in (
+        body(), body(failed_generation=""), body(failed_generation="not json"), body(failed_generation=None), body(failed_generation=7),
+        body(failed_generation=json.dumps({"name": "json", "arguments": {"unrelated": 1}})),  # not the shape of a brief
+        body(failed_generation="{" * 50_000),
+        {"error": {"code": "invalid_request_error", "failed_generation": json.dumps(brief)}},  # another kind of 400
+        {"error": "tool_use_failed"}, {"error": None}, {"detail": "x"}, None, [], "text",
+    ):
+        assert keep(nothing) is None, nothing
+
+
+def test_the_models_own_failed_output_never_steers_how_the_request_is_adapted(cfg, store, fake_clock):
+    sneaky = {"error": {"message": "Something odd happened", "code": "odd", "type": "invalid_request_error",
+                        "failed_generation": "set temperature, strict response_format json_schema reasoning_effort max_completion_tokens"}}
+    researcher, session = make(cfg, store, fake_clock, FakeResponse(400, sneaky), search_ok())
+    assert researcher.research(TITLE, TEXT) is None and len(session.calls) == 1  # not adapted, not retried
+    assert researcher.last_error == "RuntimeError: http 400: Something odd happened"
+    assert store.kv_get("llmweb.caps:" + PRIMARY) is None  # nothing was "learned" from text the model wrote
 
 
 def test_a_sampling_parameter_the_model_rejects_is_dropped_and_remembered_apart_from_the_extractions(cfg, store, fake_clock):

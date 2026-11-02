@@ -63,6 +63,27 @@ ENTITY_TYPES = ("company", "sector", "macro", "commodity", "fx", "rate", "index"
 GROQ_FORMATS = ("json_schema", "json_object", "none")  # strongest first; a rejected one steps down to the next
 PLAIN_FORMATS = ("json_object", "none")
 _MODEL_GONE = ("decommission", "model_not_found", "does not exist", "model_terminated", "no longer supported")
+# A 400 that is the model's own slip, not a fault of the request: a tool call written in a format the API rejects, or JSON that
+# failed its schema. Seen on a live key (gpt-oss answering a web search with a call to a tool named "json", code tool_use_failed).
+# Asking again usually works, so it is retried like a 5xx and never makes a service back off.
+TRANSIENT_CODES = frozenset({"tool_use_failed", "json_validate_failed"})
+_TRANSIENT_WORDS = ("failed to call a function", "failed to generate json", "tool call validation failed", "did not call a tool")
+
+
+def complaint_of(payload: Any, text: str = "") -> str:
+    """The lower-case words of an error response that say what is wrong with the request (message, code, type, parameter). The
+    model's own failed output (``failed_generation``) is left out: it is arbitrary text and must not steer how we adapt."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return " ".join(str(error.get(key)) for key in ("message", "code", "type", "param") if error.get(key)).lower()[:600]
+    return (text.lower() + json.dumps(payload, default=str).lower()[:600]) if payload is not None else text.lower()[:600]
+
+
+def is_transient_400(payload: Any, complaint: str) -> bool:
+    """True for a 400 that is the model's own slip (see ``TRANSIENT_CODES``)."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = str(error.get("code") or "").lower() if isinstance(error, dict) else ""
+    return code in TRANSIENT_CODES or any(word in complaint for word in _TRANSIENT_WORDS)
 
 SYSTEM_PROMPT = (
     "You extract structured facts from ONE news article or exchange filing about Indian listed companies and global "
@@ -277,9 +298,10 @@ class LLMExtractor(RemoteJudge):
         if self.store is not None:
             self.store.kv_set(self.CAPS_PREFIX + model, jsonutil.dumps({**self._caps(model), "ts": iso(self.clock.now())}))
 
-    def _adapt(self, model: str, complaint: str) -> bool:
+    def _adapt(self, model: str, complaint: str, reason: str = "") -> bool:
         """React to a 400 that names a parameter: step the structured-output mode down, drop the parameter, or swap the
-        token-limit parameter. Returns False when the complaint is not about anything we can change."""
+        token-limit parameter. Returns False when the complaint is not about anything we can change. ``reason`` is the
+        provider's own explanation (for messages)."""
         caps = self._caps(model)
         changed = False
         if any(word in complaint for word in ("response_format", "json_schema", "strict")) and caps["fmt"] != "none":
@@ -347,6 +369,11 @@ class LLMExtractor(RemoteJudge):
     def _observe(self, payload: Any) -> None:
         """Called with every successful reply before its content is used (a subclass reads tool records from it)."""
 
+    def _salvage(self, payload: Any) -> str | None:
+        """The reply text hidden in a 400 body whose request nevertheless produced the answer (a subclass knows which), or
+        ``None``: the 400 is then handled as an error."""
+        return None
+
     def _request(self, make_body: Callable[[str], dict[str, Any]]) -> str:
         """POST ``make_body(model)`` with bounded retries; returns the reply content or raises ``Fatal`` / ``Quota`` /
         ``OutOfTime`` / ``RuntimeError``. A rate-limited model hands over to the other one at once (Groq's limits are per model);
@@ -376,16 +403,22 @@ class LLMExtractor(RemoteJudge):
                 self._observe(payload)
                 return content
             reason = error_reason(payload, snippet) if status != -1 else ""
-            complaint = (snippet.lower() + json.dumps(payload, default=str).lower()[:600]) if status == 400 else ""
-            if status == 404 or (status == 400 and any(word in complaint for word in _MODEL_GONE)):
+            complaint = complaint_of(payload, snippet) if status == 400 else ""
+            if status == 400:
+                salvaged = self._salvage(payload)
+                if salvaged is not None:  # the answer is in the error body: use it instead of paying for the search again
+                    self.last_model = model
+                    return salvaged
+            transient = status == 400 and is_transient_400(payload, complaint)
+            if status == 404 or (status == 400 and not transient and any(word in complaint for word in _MODEL_GONE)):
                 self._unavailable.add(model)
                 successor = self._next_model(limited)
                 if successor is None:
                     raise Fatal(describe_status(status, reason))
                 self._use_model(successor)
                 continue
-            if status == 400 and adaptations < 4:
-                if not self._adapt(model, complaint):
+            if status == 400 and not transient and adaptations < 4:
+                if not self._adapt(model, complaint, reason):
                     raise RuntimeError(describe_status(400, reason))
                 adaptations += 1
                 continue
@@ -400,7 +433,7 @@ class LLMExtractor(RemoteJudge):
                     raise Quota(wait)
             if status in FATAL_STATUS:
                 raise Fatal(describe_status(status, reason))
-            if status != -1 and status not in RETRYABLE_STATUS:
+            if status != -1 and status not in RETRYABLE_STATUS and not transient:
                 raise self._rejection(status, reason)
             if status != -1:
                 last = describe_status(status, reason)

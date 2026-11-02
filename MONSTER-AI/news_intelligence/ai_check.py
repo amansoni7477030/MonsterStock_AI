@@ -152,9 +152,14 @@ def check_web(
         return AiCheck("web", label, "off", "disabled (LLM_WEB_SEARCH=false)")
     if settings.llm_web_max_per_run <= 0:
         return AiCheck("web", label, "off", "disabled (LLM_WEB_MAX_PER_RUN=0)")
-    enabled = f"enabled on {', '.join(settings.llm_web_models)}, up to {settings.llm_web_max_per_run} per news job"
+    if settings.llm_web_max_per_day <= 0:
+        return AiCheck("web", label, "off", "disabled (LLM_WEB_MAX_PER_DAY=0)")
+    enabled = (
+        f"enabled on {', '.join(settings.llm_web_models)}, up to {settings.llm_web_max_per_run} per news job and "
+        f"{settings.llm_web_max_per_day} per day"
+    )
     if not deep:
-        return AiCheck("web", label, "ok", enabled + " (ai-test makes one real search to prove it)")
+        return AiCheck("web", label, "ok", enabled + " (ai-test makes one real search of about 7,000 tokens to prove it)")
     researcher = WebResearcher(settings, session=session, clock=clock, resolver=resolver)
     started = researcher.clock.monotonic()
     brief = researcher.research(WEB_SAMPLE_TITLE, WEB_SAMPLE_TEXT, sample_context(researcher.clock.now()))

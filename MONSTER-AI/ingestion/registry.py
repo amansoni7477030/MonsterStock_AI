@@ -114,7 +114,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         coverage="Structured event extraction from news text: event type, entities with their direction, severity, horizon, event time and a verbatim evidence quote",
         timestamp_meaning="n/a", update_frequency="On demand (cost-capped: per-run call and time budgets, 14-day result cache)",
         history_depth="n/a",
-        rate_limits="Groq free tier (measured live): 8,000 tokens per minute and 1,000 requests per day per model, about 2,000 tokens per extraction, so roughly 4 extractions per minute per model; a rate-limited model hands over to the fallback model at once, a short Retry-After is waited out, a long one starts a cooldown that survives between runs",
+        rate_limits="Groq free tier (measured live): 8,000 tokens per minute, 200,000 tokens per day and 1,000 requests per day for each model, about 2,000 tokens per extraction, so roughly 4 extractions per minute and about 100 a day per model; a rate-limited model hands over to the fallback model at once, a short Retry-After is waited out, a long one starts a cooldown that survives between runs",
         license_notes="Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.",
         failure_behavior="Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health",
         backup_source="rules", criticality="optional",
@@ -124,9 +124,9 @@ SOURCES: tuple[dict[str, Any], ...] = (
         endpoint="https://api.groq.com/openai/v1/chat/completions with tools=[{\"type\": \"browser_search\"}] (GROQ_API_KEY)",
         coverage="Web check of one unconfirmed-looking company news item: do independent outlets report the same facts, did anyone deny or correct it, is it old news",
         timestamp_meaning="n/a",
-        update_frequency="On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job, 30% of the LLM time box, 1-day result cache)",
+        update_frequency="On demand (cost-capped: LLM_WEB_MAX_PER_RUN per news job and LLM_WEB_MAX_PER_DAY per IST day, 30% of the LLM time box, 1-day result cache)",
         history_depth="Live web only: never used for backtests or replays",
-        rate_limits="Works on Groq's free tier (verified live: the search's page reads, 4,000-12,000 input tokens, do not count against the 8,000 tokens per minute; only the request does); HTTP 413 or a rejected tool backs the check off for 6 h",
+        rate_limits="Works on Groq's free tier (verified live) but is its most expensive call: about 7,000 tokens per search (4,000-12,000; the pages the model reads count as input tokens), charged to both the per-minute and the per-day token limit, so about 28 searches use up a free-tier model's 200,000 tokens a day (hence the daily cap); a rate limit starts a cooldown that survives between runs, HTTP 413 or a rejected tool backs the check off for 6 h",
         license_notes="Governed by Groq's terms (built-in tools are not HIPAA covered and are not available on regional endpoints); only public news text is sent - never keys, positions or other data.",
         failure_behavior="The item is extracted and judged without the web check; repeated failures appear in source health",
         backup_source="llm_extraction", criticality="optional",
@@ -203,8 +203,11 @@ def _fetch_strategy() -> dict[str, str]:
         "llm_web": (
             "not scraped: the same Groq chat endpoint, with `tools=[{\"type\": \"browser_search\"}]` and `tool_choice=required` on a "
             "gpt-oss model (`reasoning_effort=low`, as Groq recommends for browser search; the tool is server-side, so there is "
-            "nothing to orchestrate). Its own call budget (`LLM_WEB_MAX_PER_RUN`), 30% of the LLM time box, a 1-day result cache, "
-            "circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for 6 h. The reply is a small JSON brief that is "
+            "nothing to orchestrate). Its own call budgets (`LLM_WEB_MAX_PER_RUN` per news job, `LLM_WEB_MAX_PER_DAY` per IST day), "
+            "30% of the LLM time box, a 1-day result cache, circuit breaker and cooldown; HTTP 413 or a rejected tool backs it off for "
+            "6 h. A model that delivers its answer as a call to a tool that does not exist (`tool_use_failed`, seen live on about one "
+            "search in six) is no refusal of the tool: the brief is read from the error body when it has the shape of one, else the "
+            "search is retried once. The reply is a small JSON brief that is "
             "validated field by field, and the sources it cites are checked against the pages the search tool really returned "
             "(`executed_tools`), before it reaches the extraction or Jev."),
         "jev_judgment": (

@@ -133,7 +133,7 @@ Optional capabilities, all off by default:
 | Capability | Variables |
 |------------|-----------|
 | Groq LLM: event extraction from news | `GROQ_API_KEY` (default model `openai/gpt-oss-120b`, fallback `openai/gpt-oss-20b`); tune with `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT` (low), `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_MAX_OUTPUT_TOKENS` (1200), `LLM_TIMEOUT_SEC` (40). Another OpenAI-compatible provider: `LLM_API_BASE` + `LLM_MODEL` (+ `LLM_API_KEY`). Rules-only without a key; every LLM claim needs a verifiable quote. See [the AI services](#the-ai-services-groq-and-jev) |
-| Groq web check: is an unconfirmed company story true, denied or old | on by default once `GROQ_API_KEY` is set (Groq with a gpt-oss model only); `LLM_WEB_SEARCH` (true), `LLM_WEB_MAX_PER_RUN` (8 per news job, 0 = off). Needs a plan with a per-minute token limit above one search (not Groq's free tier), `LLM_MAX_SECONDS_PER_RUN` of at least 34 (it gets 30 % of it), and is billed on top of the tokens |
+| Groq web check: is an unconfirmed company story true, denied or old | on by default once `GROQ_API_KEY` is set (Groq with a gpt-oss model only); `LLM_WEB_SEARCH` (true), `LLM_WEB_MAX_PER_RUN` (8 per news job) and `LLM_WEB_MAX_PER_DAY` (16 per IST day), 0 = off. Works on Groq's free tier (verified) but costs about 7,000 tokens a check against the per-minute and per-day token limits; needs `LLM_MAX_SECONDS_PER_RUN` of at least 34 (it gets 30 % of it) |
 | Jev (TypeSafe AI): news judgments | `TYPESAFE_API_KEY`; `JEV_MODEL` (`jev-1.14.0`, pinned), `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5), `JEV_TIMEOUT_SEC` (20) |
 | Off-box storage (backups, external models) | `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX` |
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
@@ -284,25 +284,37 @@ every configured service answers; a web check that cannot run is only a `WARN`, 
 | `FAIL ... cannot reach the service` | no outbound HTTPS to `api.groq.com` / `api.typesafe.ai` from this machine | allow it (firewall, proxy) |
 | `WARN ... expected order_win` | the service answered, but not what any sound model answers for the sample | check `LLM_MODEL` / `JEV_MODEL`; the answer is still used only after its own validation |
 | `WARN ... evidence quote was not found` | the LLM answered but did not quote the text word for word; the pipeline ignores such answers | try again; if it persists use a larger model |
-| `Groq web check WARN ... tokens-per-minute limit (HTTP 413)` | a web search reads far more tokens than the plan allows per minute (Groq's free tier: 8,000) | upgrade to Groq's Developer plan, or set `LLM_WEB_SEARCH=false`; until then every item is judged without the web check, and the check retries every 6 h |
-| `Groq web check WARN ... rejected the browser_search tool` | the configured models do not offer the tool (it exists on the gpt-oss models only) | keep a gpt-oss model as `LLM_MODEL` or `LLM_FALLBACK_MODEL`, or set `LLM_WEB_SEARCH=false` |
-| `Groq web check OFF ... disabled` / `needs Groq with a gpt-oss model` | `LLM_WEB_SEARCH=false`, `LLM_WEB_MAX_PER_RUN=0`, or another provider / model | nothing to fix unless you want the web check |
+| `FAIL ... http 400: Unknown model: ...` / `... does not exist or you do not have access` | the key cannot use the configured model (the provider's own words are shown) | set `LLM_MODEL` / `LLM_FALLBACK_MODEL` / `JEV_MODEL` to a model the key can use |
+| `Jev ... OK` although `jev-1.14.0` is not in the model list | the list shows only the aliases (`jev-latest`, `jev-preview`); a pinned version answers all the same | nothing: `ai-test` proves the pinned version with a real request |
+| the news job says `N withheld (instruction-like text)` and the log has `withholding an item from <site>` | an item's text tried to instruct the AI ("ignore previous instructions", a `SYSTEM:` line...); it was read by the rules only | nothing; look at the feed it came from if it happens often |
+| `Groq web check WARN ... http 413: ...` | the account's plan refuses a request of that size (not seen on a free-tier key in testing) | set `LLM_WEB_SEARCH=false` or move to a plan that accepts it; until then every item is judged without the web check, and the check retries every 6 h |
+| `Groq web check WARN ... (browser_search on <model>)` | the provider says the configured model does not offer the tool (it exists on the gpt-oss models only, and must be enabled for the account) | keep a gpt-oss model as `LLM_MODEL` or `LLM_FALLBACK_MODEL`, or set `LLM_WEB_SEARCH=false`; the check retries every 6 h |
+| log `llmweb failed: http 400: Tool call validation failed ... tool_use_failed` | the model delivered its answer as a call to a tool that does not exist (seen in roughly one search in six on gpt-oss-120b). The answer is read from the error when it has the shape of a brief (it is then unverified, so it can inform but never discount an item); otherwise the search is retried once | nothing: this is the model's slip, it never switches the web check off |
+| log `llmweb failed: rate limit: quota exhausted for N s` | Groq's per-minute or **per-day** token limit of the model(s) is used up: a free-tier model has 200,000 tokens a day and a web check costs about 7,000 | nothing: the check pauses (at most 6 h, remembered between runs) and items are judged without it; lower `LLM_WEB_MAX_PER_DAY` if the extraction runs short of tokens, or use Groq's paid tier |
+| log `web check: today's budget (LLM_WEB_MAX_PER_DAY=16) is spent` | the day's cap was reached (every news job, retry and manual run counts) | nothing; raise `LLM_WEB_MAX_PER_DAY` on a paid plan |
+| `Groq web check OFF ... disabled` / `needs Groq with a gpt-oss model` | `LLM_WEB_SEARCH=false`, `LLM_WEB_MAX_PER_RUN=0`, `LLM_WEB_MAX_PER_DAY=0`, or another provider / model | nothing to fix unless you want the web check |
 | report says "LLM extraction degraded" / "Jev judgment degraded (rule-based extraction used)" | that service failed in its latest run; the news was labelled by the rules | `sudo monster-ai logs --grep "llm failed"` or `--grep "jev failed"` for the reason; `ai-test` |
 | alert `health_source_llm_extraction` / `health_source_llm_web` / `health_source_jev_judgment` | the service failed 5 times in a row (within one run the web check's circuit opens after 3) | same as above; the daily news runs keep trying. A failing web check never affects the extraction |
 
 **Where to look.** `monster-ai logs --grep "jev failed"` (also `"llm failed"`, `"llmweb failed"`; WARNING lines carry the reason, never the
 key); `monster-ai diag` lists the counters `llm.calls`, `llm.failures`, `llm.tokens_in`, `llm.tokens_out`, `llm.cooldown_until` and the
-same with `llmweb.` and `jev.`; the `news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`,
+same with `llmweb.` and `jev.` (plus `llmweb.day`, the web checks made today as `<date>:<count>`); the `news.last_run` state key holds each run's counts (`llm_used`, `llm_cached`, `llm_failed`,
 `llm_skipped_budget` and the `web_*` and `jev_*` equivalents, plus `web_refuted`, `jev_retyped`, `jev_rumours`, `jev_denials`); an
 event's evidence shows what the web check found (`web`), and its `extraction_method` says which services contributed (`rules+web+llm+jev`).
 
 **Cost and limits.** Each distinct article is sent at most once in 14 days (results are cached by text and context); items the rules
 already call irrelevant are never sent; each news job is capped (`LLM_MAX_ARTICLES_PER_RUN`, `JEV_MAX_ITEMS_PER_RUN`,
 `LLM_WEB_MAX_PER_RUN`) and time-boxed (240 s, of which the web checks may use 30 %, / 180 s; a backlog drained in several batches shares
-the caps). Groq has a free tier with per-model limits (tokens per minute bind first, which is why the fallback model adds headroom;
-**the free tier is too small for the web check**); paid use and Jev are priced per token by the providers (at the time of writing Jev
-was a few cents per million input tokens, which at these caps is well under a dollar a month), and Groq bills the web search tool
-on top of the tokens: check their price lists. At most 8 searches per news job and 30 % of the time box bound the web check's share.
+the caps). The web checks have a daily cap too (`LLM_WEB_MAX_PER_DAY`, 16, counted per IST day over every news job, retry and manual
+run). Groq has a free tier with per-model limits, measured live: 8,000 tokens per minute and 200,000 tokens per day for each model, and
+about 2,000 tokens per extraction, so roughly four extractions per minute and about a hundred a day per model (the fallback model doubles
+that, and a 429 hands over to it at once). A web search is the expensive call: about 7,000 tokens (4,000-12,000; the pages the model reads
+count as input tokens), charged to the per-minute and to the per-day limit. On the free tier it works, but about 28 of them use up a
+model's whole day, which is why the daily cap exists: the checks must not starve the extraction. When Groq says a limit is used up the
+service is put on a cooldown (at most 6 h) that is remembered between runs. Paid use and Jev are priced per token by the providers (at
+the time of writing Jev was a few cents per million input tokens, which at these caps is well under a dollar a month); Groq's price list
+says what the web search tool costs on a paid plan: check it. On the free tier a 60-article news job does not fit in the 240-second time
+box (about thirty articles do); the rest are read by the rules and Jev, nothing is lost.
 
 **Turn off:** delete the key from `monster.env` and restart. Nothing else depends on them; cached answers expire after 14 days. To keep
 Groq but stop only the web searches: `LLM_WEB_SEARCH=false`.

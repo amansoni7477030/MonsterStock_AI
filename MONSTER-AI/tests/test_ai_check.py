@@ -11,7 +11,15 @@ import requests
 from news_intelligence import ai_check
 from news_intelligence.ai_check import SAMPLE_TEXT, SAMPLE_TITLE, check_jev, check_llm, check_web, run_checks
 from news_intelligence.entities import EntityResolver
-from tests.test_news_support import INSTRUMENTS, FakeResponse, FakeSession, add_instruments, jev_response, ok
+from tests.test_news_support import (
+    INSTRUMENTS,
+    FakeResponse,
+    FakeSession,
+    add_instruments,
+    jev_response,
+    ok,
+    web_ok,
+)
 
 GROQ_KEY = "gsk_test_groq_key_1234567890"
 JEV_KEY = "ts_test_typesafe_key_1234567890"
@@ -158,9 +166,21 @@ def test_a_healthy_jev_check_lists_the_models_then_asks_the_five_questions(jev, 
     assert JEV_KEY not in json.dumps(check.to_dict())
 
 
-def test_a_pinned_jev_model_the_account_does_not_list_is_a_warning(jev, fake_clock):
-    check = check_jev(jev, session=FakeSession(jev_response(), gets=[jev_models("jev-latest")]), clock=fake_clock)
-    assert check.status == "warn" and "not listed for this key: jev-1.14.0" in check.detail
+def test_a_pinned_jev_version_is_not_expected_in_the_alias_list_but_a_missing_alias_is_a_warning(jev, fake_clock):
+    # verified on a live key: GET /v1/models lists only the aliases (jev-latest, jev-preview) although jev-1.14.0 answers
+    pinned = check_jev(jev, session=FakeSession(jev_response(), gets=[jev_models("jev-latest", "jev-preview")]), clock=fake_clock)
+    assert pinned.status == "ok" and "not listed" not in pinned.detail and "model jev-1.14.0: order_win" in pinned.detail
+    alias = dataclasses.replace(jev, jev_model="jev-latest")
+    assert check_jev(alias, session=FakeSession(jev_response(), gets=[jev_models("jev-latest")]), clock=fake_clock).status == "ok"
+    missing = check_jev(alias, session=FakeSession(jev_response(), gets=[jev_models("jev-preview")]), clock=fake_clock)
+    assert missing.status == "warn" and "not listed for this key: jev-latest" in missing.detail
+
+
+def test_a_model_name_the_service_does_not_know_fails_with_the_providers_own_words_and_the_remedy(jev, fake_clock):
+    unknown = FakeResponse(400, {"detail": {"error_type": "api_usage_error", "message": "Unknown model: jev-9.99.9"}})
+    check = check_jev(dataclasses.replace(jev, jev_model="jev-9.99.9"), session=FakeSession(unknown, gets=[jev_models()]), clock=fake_clock)
+    assert check.status == "fail" and "http 400: Unknown model: jev-9.99.9" in check.detail
+    assert "this key cannot use that model, check LLM_MODEL / LLM_FALLBACK_MODEL / JEV_MODEL" in check.detail
 
 
 def test_a_rejected_jev_key_fails_at_the_listing(jev, fake_clock):
@@ -171,15 +191,18 @@ def test_a_rejected_jev_key_fails_at_the_listing(jev, fake_clock):
 
 def test_a_jev_request_failure_and_an_unexpected_answer_are_reported(jev, fake_clock):
     refused = check_jev(jev, session=FakeSession(FakeResponse(422, {"detail": "bad"}), gets=[jev_models()]), clock=fake_clock)
-    assert refused.status == "fail" and "422" in refused.detail
+    assert refused.status == "fail" and "http 422: bad" in refused.detail
     odd = check_jev(jev, session=FakeSession(jev_response(event="litigation_regulatory"), gets=[jev_models()]), clock=fake_clock)
     assert odd.status == "warn" and "expected order_win" in odd.detail
 
 
 def test_jev_list_only_spends_no_tokens(jev, fake_clock):
-    session = FakeSession(jev_response(), gets=[jev_models()])
-    check = check_jev(jev, deep=False, session=session, clock=fake_clock)
+    session = FakeSession(jev_response(), gets=[jev_models("jev-latest")])
+    alias = dataclasses.replace(jev, jev_model="jev-latest")
+    check = check_jev(alias, deep=False, session=session, clock=fake_clock)
     assert check.status == "ok" and check.detail == "key accepted" and len(session.calls) == 1
+    pinned = check_jev(jev, deep=False, session=FakeSession(jev_response(), gets=[jev_models("jev-latest")]), clock=fake_clock)
+    assert pinned.status == "ok" and "pinned jev-1.14.0 is not in the alias list" in pinned.detail
 
 
 # ------------------------------------------------------------------------------------------- the rest
@@ -207,6 +230,9 @@ def test_to_dict_rounds_the_seconds_and_keeps_every_field():
 
 
 # -------------------------------------------------------------------------------------------- web check
+SEARCH_PAGES = (("https://www.reuters.com/markets/reliance-media-stake", "Reliance in talks over a media stake, sources say", ""),)
+
+
 def brief(**over) -> str:
     data = {"confirmed": "unclear", "independent_outlets": 0, "denial_found": False, "earlier_coverage": False,
             "facts": ["The company declined to comment"], "sources": ["reuters.com"]}
@@ -214,10 +240,16 @@ def brief(**over) -> str:
     return json.dumps(data)
 
 
+def search_ok(**over):
+    """A reply to a web search: the brief as text, and the pages the search tool returned (as Groq reports them)."""
+    return web_ok(brief(**over), SEARCH_PAGES)
+
+
 @pytest.mark.parametrize(("changes", "needle"), [
     ({"groq_api_key": None}, "needs the LLM: set GROQ_API_KEY"),
     ({"llm_web_search": False}, "disabled (LLM_WEB_SEARCH=false)"),
     ({"llm_web_max_per_run": 0}, "disabled (LLM_WEB_MAX_PER_RUN=0)"),
+    ({"llm_web_max_per_day": 0}, "disabled (LLM_WEB_MAX_PER_DAY=0)"),
     ({"llm_model": "qwen/qwen3.8-27b", "llm_fallback_model": "meta-models/muse-spark-open"}, "gpt-oss"),
     ({"groq_api_key": None, "llm_api_base": "https://llm.example/v1", "llm_model": "m", "llm_api_key": "sk-x"}, "gpt-oss"),
 ])
@@ -227,7 +259,7 @@ def test_the_web_check_is_off_and_says_why(groq, changes, needle):
 
 
 def test_a_healthy_web_check_makes_one_real_search_with_the_sample(groq, fake_clock):
-    session = FakeSession(ok(brief(confirmed="no", independent_outlets=1)))
+    session = FakeSession(search_ok(confirmed="no", independent_outlets=1))
     check = check_web(groq, session=session, clock=fake_clock)
     assert check.status == "ok" and check.usable and f"model {PRIMARY}: " in check.detail
     assert "independent outlets report the same facts: no (1 found)" in check.detail and "Sources: reuters.com" in check.detail
@@ -239,16 +271,17 @@ def test_a_healthy_web_check_makes_one_real_search_with_the_sample(groq, fake_cl
 
 
 def test_the_web_check_without_a_search_only_reports_how_it_is_configured(groq, fake_clock):
-    session = FakeSession(ok(brief()))
+    session = FakeSession(search_ok())
     check = check_web(groq, deep=False, session=session, clock=fake_clock)
     assert check.status == "ok" and session.calls == []
-    assert f"enabled on {PRIMARY}, {FALLBACK}, up to 8 per news job" in check.detail and "ai-test makes one real search" in check.detail
+    assert f"enabled on {PRIMARY}, {FALLBACK}, up to 8 per news job and 16 per day" in check.detail
+    assert "ai-test makes one real search of about 7,000 tokens" in check.detail
 
 
 @pytest.mark.parametrize(("response", "needle"), [
-    (FakeResponse(413, {"error": {"message": "Request too large for model on tokens per minute (TPM): Limit 8000"}}), "tokens-per-minute"),
-    (FakeResponse(400, {"error": {"message": "tools are not supported with this model"}}), "browser_search tool"),
-    (FakeResponse(500), "http 500"),
+    (FakeResponse(413, {"error": {"message": "Request too large for model on tokens per minute (TPM): Limit 8000"}}), "http 413: Request too large"),
+    (FakeResponse(400, {"error": {"message": "tools are not supported with this model"}}), "(browser_search on openai/gpt-oss-120b)"),
+    (FakeResponse(500, {"error": {"message": "internal error"}}), "http 500: internal error"),
     (ok("no json at all"), "not a JSON object"),
 ])
 def test_a_web_check_that_cannot_run_is_a_warning_because_items_are_then_judged_without_it(groq, fake_clock, response, needle):
@@ -257,7 +290,7 @@ def test_a_web_check_that_cannot_run_is_a_warning_because_items_are_then_judged_
 
 
 def test_the_web_check_is_skipped_when_the_llm_check_has_just_failed_on_the_same_key(groq, fake_clock):
-    sessions = {"llm": FakeSession(ok(reply()), gets=[FakeResponse(401)]), "web": FakeSession(ok(brief()))}
+    sessions = {"llm": FakeSession(ok(reply()), gets=[FakeResponse(401)]), "web": FakeSession(search_ok())}
     llm, web, jev_check = run_checks(groq, sessions=sessions, clock=fake_clock)
     assert llm.status == "fail" and web.status == "off" and "skipped" in web.detail and jev_check.status == "off"
     assert sessions["web"].calls == []
@@ -265,7 +298,7 @@ def test_the_web_check_is_skipped_when_the_llm_check_has_just_failed_on_the_same
 
 def test_all_three_services_are_checked_in_a_fixed_order(groq, fake_clock):
     both = dataclasses.replace(groq, typesafe_api_key=JEV_KEY)
-    sessions = {"llm": FakeSession(ok(reply()), gets=[groq_models()]), "web": FakeSession(ok(brief())),
+    sessions = {"llm": FakeSession(ok(reply()), gets=[groq_models()]), "web": FakeSession(search_ok()),
                 "jev": FakeSession(jev_response(), gets=[jev_models()])}
     checks = run_checks(both, sessions=sessions, clock=fake_clock)
     assert [(c.service, c.status) for c in checks] == [("llm", "ok"), ("web", "ok"), ("jev", "ok")]

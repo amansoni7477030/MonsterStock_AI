@@ -18,7 +18,9 @@ reply cites contains denial wording; without that evidence the brief still infor
 
 Safety rails (the service is optional enrichment: any failure means the item is judged without the web check):
 
-* its own call budget (``LLM_WEB_MAX_PER_RUN``), wall-clock share (30 % of the LLM time box; a hard bound: each request is cut to what
+* its own call budgets (``LLM_WEB_MAX_PER_RUN`` per job and ``LLM_WEB_MAX_PER_DAY`` over every job, retry and manual run of an IST day:
+  a check costs about 7,000 tokens, measured, which Groq charges to the per-minute *and* the per-day token limit, so about 28 of them
+  use up a free-tier model's day), wall-clock share (30 % of the LLM time box; a hard bound: each request is cut to what
   is left of it), circuit breaker, cooldown, result cache and health row, so a slow or refused web search never uses up the
   extraction's budget or trips its circuit (they do share Groq's per-model token quota: when it is spent the extraction hands over
   to its fallback model and this service backs off);
@@ -34,11 +36,13 @@ the state of the web today is not reproducible.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
+from app.clock import date_str, ist_date
 from app.config import Settings
 from news_intelligence.context import NewsContext, WebBrief, host_of, strip_links
 from news_intelligence.events import mentions_denial
@@ -52,6 +56,7 @@ PROMPT_VERSION = "w2"
 CACHE_PREFIX = "llmweb:"
 CACHE_TTL_DAYS = 1  # the web changes: a denial can appear within hours
 CAPS_PREFIX = "llmweb.caps:"
+DAY_KEY = "llmweb.day"  # ``<IST date>:<checks admitted that day>``: the daily budget survives between runs
 MAX_EXCERPT_CHARS = 1500  # what of the text the search model gets: enough to know what to look for
 WEB_TIMEOUT_SEC = 45.0  # a search runs several tool steps on Groq's side before it answers
 MIN_SEARCH_SEC = 10.0  # a search that would get less of the run's web time than this is not started
@@ -61,6 +66,9 @@ BACKOFF_SEC = 6 * 3600.0  # how long to stay away from a tool or a request size 
 EFFORT = "low"  # Groq: low reasoning effort gives the best balance of search quality and tokens for browser search
 MAX_PAGES = 60  # pages of one search that are looked at (a search returns about ten results per step)
 MAX_PAGE_CHARS = 30_000  # of an opened page: more than the pages Groq returns (about 14 000 characters)
+# What a 400 says when the tool itself is unavailable for a model or an account (as opposed to the model's own malformed call).
+_TOOL_UNSUPPORTED = ("not supported", "unsupported", "not compatible", "does not support", "not available", "not enabled",
+                     "unknown tool", "invalid tool")
 
 SYSTEM_PROMPT = (
     "You verify ONE news item about an Indian listed company for a stock-market desk before the NSE opens. Use web search to "
@@ -122,6 +130,28 @@ def verify_brief(brief: WebBrief, pages: list[Page]) -> WebBrief:
     return replace(brief, sources=sources, outlets=outlets, denial_verified=verified)
 
 
+def salvage_generation(payload: Any) -> str | None:
+    """The brief the model wrote when Groq rejected its *format* (HTTP 400, code ``tool_use_failed``): with ``tool_choice=required``
+    gpt-oss sometimes delivers its final answer as a call to a non-existent tool named ``json``. The error body carries what it
+    wrote (``failed_generation``), either as ``{"name": "json", "arguments": {...}}`` or as the bare object. Returned as JSON text,
+    only when it has the shape of a brief; everything else is ``None`` and the 400 is handled as an error. The text is untrusted
+    like any reply and goes through :meth:`WebBrief.from_raw`; the pages the search read are not in an error body, so such a brief
+    is never verified (it informs the readers but can never discount an item)."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or str(error.get("code") or "").lower() != "tool_use_failed":
+        return None
+    generated = error.get("failed_generation")
+    data = parse_reply_json(generated) if isinstance(generated, str) else None
+    if data is None:
+        return None
+    arguments = data.get("arguments")
+    if isinstance(arguments, str):
+        arguments = parse_reply_json(arguments)
+    if isinstance(arguments, dict):
+        data = arguments
+    return json.dumps(data) if "confirmed" in data else None
+
+
 def prune_web_cache(store: Any, now: datetime) -> int:
     """Delete web-check cache entries older than the TTL (works without a researcher instance)."""
     return prune_prefix(store, now, CACHE_PREFIX, CACHE_TTL_DAYS)
@@ -161,6 +191,39 @@ class WebResearcher(LLMExtractor):
         """A search may take up to ``WEB_TIMEOUT_SEC``, but never past the end of this service's share of the run's time."""
         return self.budgeted_timeout(max(float(self.settings.llm_timeout_sec), WEB_TIMEOUT_SEC), minimum=MIN_SEARCH_SEC)
 
+    # ---------------------------------------------------------------------------------- the day's budget
+    def _today(self) -> str:
+        return date_str(ist_date(self.clock.now()))
+
+    def _day_used(self) -> int:
+        """Checks admitted today (IST) by every run so far; without a store there is nothing to count against."""
+        if self.store is None:
+            return 0
+        day, _, count = str(self.store.kv_get(DAY_KEY) or "").partition(":")
+        return int(count) if day == self._today() and count.isdigit() else 0
+
+    def _set_day_used(self, count: int) -> None:
+        if self.store is not None:
+            self.store.kv_set(DAY_KEY, f"{self._today()}:{max(0, count)}")
+
+    def _admit(self, max_calls: int) -> bool:
+        """The shared admission plus the daily cap. A search costs about 7,000 tokens of a day's allowance that the extraction
+        needs too (Groq's free tier: 200,000 per model), so retries and manual runs cannot add up to more than the day's cap."""
+        cap = int(self.settings.llm_web_max_per_day)
+        if not self.tripped and self._day_used() >= cap:
+            if not self.run_budget_skipped:
+                log.info("web check: today's budget (LLM_WEB_MAX_PER_DAY=%d) is spent; items are judged without it", cap)
+            self.run_budget_skipped += 1
+            return False
+        if not super()._admit(max_calls):
+            return False
+        self._set_day_used(self._day_used() + 1)
+        return True
+
+    def _refund(self) -> None:
+        super()._refund()
+        self._set_day_used(self._day_used() - 1)
+
     # ------------------------------------------------------------------------------------- request
     def _web_body(self, title: str, text: str, model: str, context: NewsContext | None) -> dict[str, Any]:
         caps = self._caps(model)
@@ -185,13 +248,17 @@ class WebResearcher(LLMExtractor):
     def _observe(self, payload: Any) -> None:
         self._pages = pages_of(payload)
 
-    def _adapt(self, model: str, complaint: str) -> bool:
-        """A 400 about a sampling or token parameter is adapted to as for the extraction; one about the tool itself means this
-        model (or account) cannot search the web, and asking again would fail the same way."""
-        if super()._adapt(model, complaint):
+    def _salvage(self, payload: Any) -> str | None:
+        return salvage_generation(payload)
+
+    def _adapt(self, model: str, complaint: str, reason: str = "") -> bool:
+        """A 400 about a sampling or token parameter is adapted to as for the extraction. One that says the tool itself is not
+        available for this model or account means asking again would fail the same way, so the service backs off. A 400 that merely
+        mentions a tool (a malformed call: ``tool_use_failed``) is the model's slip and never gets here."""
+        if super()._adapt(model, complaint, reason):
             return True
-        if "browser" in complaint or "tool" in complaint:
-            raise Backoff(BACKOFF_SEC, f"{model} rejected the browser_search tool (HTTP 400)")
+        if ("browser" in complaint or "tool" in complaint) and any(phrase in complaint for phrase in _TOOL_UNSUPPORTED):
+            raise Backoff(BACKOFF_SEC, describe_status(400, f"{reason or 'the tool is not available'} (browser_search on {model})"))
         return False
 
     def _rejection(self, status: int, reason: str) -> Exception:

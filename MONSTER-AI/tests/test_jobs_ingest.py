@@ -101,6 +101,8 @@ def test_the_news_job_says_what_the_ai_services_contributed(env, monkeypatch):
     ({"jev_cached": 4}, "; AI: jev 0 used, 4 cached"), ({"llm_failed": 2}, "; AI: llm 0 used, 2 failed"),
     ({"llm_used": None, "jev_used": 1}, "; AI: jev 1 used"),
     ({"web_used": 3, "web_cached": 1, "web_failed": 1}, "; AI: web 3 used, 1 cached, 1 failed"),
+    ({"ai_withheld": 2}, "; AI: 2 withheld (instruction-like text)"),
+    ({"llm_used": 5, "ai_withheld": 1}, "; AI: llm 5 used; 1 withheld (instruction-like text)"),
 ])
 def test_the_ai_note_only_mentions_services_that_did_something(processed, expected):
     assert jobs.ai_note(processed) == expected

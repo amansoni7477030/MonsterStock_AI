@@ -26,11 +26,12 @@ server with native systemd (no containers).
   `LOG_FORMAT`, `LOG_RETENTION_DAYS`, `LOG_MAX_MB`. `MONSTER_TIMEZONE` now selects the zone of **log stamps only** (market logic is
   always IST).
 - **Optional AI settings** (everything stays off until a key is set): `GROQ_API_KEY`, `LLM_FALLBACK_MODEL`, `LLM_REASONING_EFFORT`,
-  `LLM_MAX_SECONDS_PER_RUN`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`, `TYPESAFE_API_KEY`, `JEV_MODEL`,
-  `JEV_TIMEOUT_SEC`, `JEV_MAX_ITEMS_PER_RUN`, `JEV_MIN_CONFIDENCE`. `LLM_API_BASE` + `LLM_MODEL` still select another
+  `LLM_MAX_SECONDS_PER_RUN`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`, `LLM_WEB_MAX_PER_DAY`, `TYPESAFE_API_KEY`,
+  `JEV_MODEL`, `JEV_TIMEOUT_SEC`, `JEV_MAX_ITEMS_PER_RUN`, `JEV_MIN_CONFIDENCE`. `LLM_API_BASE` + `LLM_MODEL` still select another
   OpenAI-compatible provider; `GROQ_API_KEY` is never sent to any endpoint but Groq's. The web check is **on by default as soon as
-  a Groq key is set** (it bills a search fee and needs more than Groq's free per-minute token limit; `LLM_WEB_SEARCH=false` turns it
-  off). After adding a key: `sudo systemctl restart monster-ai` and `sudo monster-ai ai-test`.
+  a Groq key is set**. A check costs about 7,000 tokens (measured on a live key) and Groq's free tier gives a model 200,000 tokens a
+  day, so it is capped at 8 per news job and 16 per IST day (`LLM_WEB_MAX_PER_RUN`, `LLM_WEB_MAX_PER_DAY`) to leave the extraction its
+  share; `LLM_WEB_SEARCH=false` turns it off. After adding a key: `sudo systemctl restart monster-ai` and `sudo monster-ai ai-test`.
 - **New dependency** `curl_cffi` (binary wheels for linux x86-64 and aarch64, Python 3.10-3.13; the installer and the CI wheel guard
   cover it).
 - **logrotate** no longer touches the application's own log files (they are daily files pruned by the application); the installer
@@ -113,18 +114,39 @@ server with native systemd (no containers).
   Prices, returns and the rules' verdict are left out on purpose (an independent second reader). Free text is single-line, capped,
   stripped of control characters and of the prompt's block tags. Cache keys follow everything the prompt shows (the publication minute,
   the source, the matched companies, the web brief) but not the time of the check.
-  Prompt versions `v3` / `j2` retire older cached answers.
+  Prompt versions `v4` / `j2` retire older cached answers. The LLM prompt anchors the direction scale (a bond issue is about 0, an
+  order win +0.5 to +1, a fraud or a default -0.5 to -1): measured live, the size of an unanchored direction varied a lot between
+  identical requests while its sign was stable.
 - **Optional web check** (`news_intelligence/web.py`): Groq's server-side `browser_search` tool on the gpt-oss models, used before the
   extraction for company news that is not first-hand and is a rumour or could matter. A request of its own, because Groq documents that
   browser search cannot be combined with structured outputs; it returns a small brief validated field by field, which joins both
-  readers' context. By itself it changes one thing: a *sourced denial* found elsewhere (the brief names a host the source registry
-  knows as reputable: an exchange, an official body, a wire, a business newspaper) turns the item into a refuted rumour (half the
-  severity, the rumour horizon); a confirmation changes nothing. Own budget (`LLM_WEB_MAX_PER_RUN`, 8), 30 % of the LLM time box
+  readers' context. By itself it changes one thing: a *verified denial* (a page of a reputable publisher - an exchange, an official
+  body, a wire, a business newspaper - that the search really returned and the reply cites contains the wording of a denial) turns the
+  item into a refuted rumour (half the severity, the rumour horizon); a confirmation changes nothing. Own budgets
+  (`LLM_WEB_MAX_PER_RUN`, 8 per job, and `LLM_WEB_MAX_PER_DAY`, 16 per IST day), 30 % of the LLM time box
   (a hard bound: every request of the three services is cut to the time left in the run and not started when almost none is
-  left), 1-day cache, circuit breaker, cooldown and `source_health` row (`llm_web`); HTTP 413 (Groq's free tier of 8 000 tokens per
-  minute) or a rejected tool backs it off for 6 h; never used by a replay, even when a researcher is injected; shown by `ai-test`,
+  left), 1-day cache, circuit breaker, cooldown and `source_health` row (`llm_web`); HTTP 413 (a request above the plan's per-minute
+  token limit) or a model the provider says lacks the tool backs it off for 6 h; never used by a replay, even when a researcher is
+  injected; shown by `ai-test`,
   `doctor`, the test message and the news job's AI note. It shares Groq's per-model quota with the extraction, whose fallback model
   absorbs the contention.
+- **Text that tries to instruct the AI is withheld** (`news_intelligence/context.py`, `pipeline.py`): a news item whose text addresses
+  the AI ("ignore all previous instructions", a `SYSTEM:` line, a chat-template token, "set severity to 1", a closing `</article>`
+  tag) is read by the rules only and sent to no AI service; it is logged as a WARNING and counted in the news job's message.
+  Deliberately narrow, so that ordinary regulatory wording is not flagged.
+- **Verified against the live services (2026-11-02)** with the project's own keys: `ai-test` for all three services, a live end-to-end
+  news run on a scratch database, a burst against Groq's free-tier limits (14 of 14 items extracted, 429s handed over to the fallback
+  model), a prompt-injection test and dozens of live web searches. What it found, and what was done about it:
+  - About one web search in six came back from Groq as HTTP 400 `tool_use_failed` (the model delivered its answer as a call to a tool
+    named `json`). The first version took any 400 that mentioned a tool for a refusal of the tool and switched the web check off for
+    six hours. It is now the model's slip: the brief is read from the error body when it has the shape of one (unverified, so it can
+    inform but never discount an item), otherwise the search is retried once.
+  - An earlier note, that Groq's free tier is too small for a web search (HTTP 413), was wrong: a search works there. It costs about
+    7,000 tokens, charged to the per-minute **and** the per-day limit, so about 28 searches use up a free-tier model's 200,000 tokens
+    a day. Hence the daily cap `LLM_WEB_MAX_PER_DAY` (16), kept in `kv` across runs and counted per IST day.
+  - Jev lists only the aliases `jev-latest` and `jev-preview`; the pinned `jev-1.14.0` answers although it is not listed, and
+    `ai-test` no longer warns about it.
+  - The size of the direction the LLM returned varied between identical requests (its sign was stable): the scale is anchored now.
 - **Credential hygiene for the LLM endpoint** (`app/config.py`): `GROQ_API_KEY` is sent only to a URL that is exactly
   `https://api.groq.com...` (a look-alike such as `https://api.groq.com.evil.example` or a URL with credentials or a backslash is
   not Groq's: it is refused at load or treated as another provider that never gets the key), and plain `http` is accepted for
@@ -257,9 +279,9 @@ small in every case except the first; the gain is less to run, maintain and expl
   limits table in [docs/BLUEPRINT_TRACEABILITY.md](docs/BLUEPRINT_TRACEABILITY.md).
 - Lunar-calendar exchange holidays of a year whose official list is not yet published are confirmed live on the day (no report is sent,
   the operator is told), not predicted.
-- The Groq and Jev integrations, the web check included, were built and tested against scripted responses, never against the live
-  services (no keys existed at build time); `sudo monster-ai ai-test` is the first live test. Groq's model names and the web tool's
-  contract were read from Groq's documentation on 2026-11-02; Groq retires models from time to time, so a model name may need
-  updating (the fallback model and `ai-test` surface it). The shape of a browser-search reply is only read defensively (the
-  final message text), never relied on. Jev judges news; it was not evaluated as a price forecaster. The web check cannot be
+- The Groq and Jev integrations, the web check included, were verified live on 2026-11-02 (see *Verified against the live services*)
+  and tested against scripted responses; that is one day's behaviour of two third-party services. Groq retires models from time to
+  time, so a model name may need updating (the fallback model and `ai-test` surface it), and the shape of a browser-search reply is
+  read defensively. The size of the LLM's direction is noisy even with an anchored scale: the AI only enriches the news evidence and
+  never changes the calibrated forecast. Jev judges news; it was not evaluated as a price forecaster. The web check cannot be
   evaluated historically (the web of the past is not available), so its value is judged by reading its evidence, not by a backtest.

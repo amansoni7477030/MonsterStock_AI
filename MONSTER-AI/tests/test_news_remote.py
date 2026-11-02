@@ -10,7 +10,14 @@ import pytest
 from ingestion.registry import register_all
 from news_intelligence.jev import JevJudge
 from news_intelligence.llm import LLMExtractor
-from news_intelligence.remote import RemoteJudge, clamp, prune_prefix, retry_after_seconds
+from news_intelligence.remote import (
+    RemoteJudge,
+    clamp,
+    describe_status,
+    error_reason,
+    prune_prefix,
+    retry_after_seconds,
+)
 from tests.test_news_support import FakeResponse, FakeSession, jev_response, ok
 
 TITLE = "Reliance bags Rs 5,000 crore NTPC order"
@@ -28,6 +35,36 @@ def test_clamp_limits_a_number_and_rejects_everything_else(value, expected):
 
 def test_clamp_returns_the_default_for_what_is_not_a_finite_number():
     assert clamp("junk", 0.0, 1.0, default=0.4) == 0.4 and clamp(float("nan"), 0, 1, default=0.0) == 0.0
+
+
+@pytest.mark.parametrize(("payload", "text", "reason"), [
+    ({"error": {"message": "Rate limit reached for model `x`", "type": "tokens"}}, "", "Rate limit reached for model `x`"),
+    ({"detail": {"error_type": "api_usage_error", "message": "Unknown model: jev-9"}}, "", "Unknown model: jev-9"),
+    ({"detail": {"error_type": "api_usage_error"}}, "", "api_usage_error"),
+    ({"detail": "plain detail"}, "", "plain detail"),
+    ({"error": "just a string"}, "", "just a string"),
+    ({"error": {"message": "  spaced \n out  "}}, "", "spaced out"),
+    (None, "gateway timeout", "gateway timeout"),
+    (None, "<html><body>502 Bad Gateway</body></html>", ""),  # an error page is not an explanation
+    ({"unrelated": 1}, "", ""), ({"error": {}}, "", ""), ([], "", ""), (None, "", ""),
+])
+def test_error_reason_extracts_the_providers_own_short_explanation(payload, text, reason):
+    assert error_reason(payload, text) == reason
+
+
+def test_error_reason_is_capped_and_redacted():
+    from app.logging_setup import register_secret
+
+    register_secret("gsk_leaky_secret_value_0123456789")
+    long = error_reason({"error": {"message": "x" * 1000}})
+    assert len(long) == 140
+    assert "gsk_leaky_secret_value_0123456789" not in error_reason({"error": {"message": "key gsk_leaky_secret_value_0123456789 bad"}})
+    assert len(error_reason({"error": {"message": "y" * 1000}}, limit=30)) == 30
+
+
+def test_describe_status_adds_the_reason_only_when_there_is_one():
+    assert describe_status(400) == "http 400" and describe_status(400, "") == "http 400"
+    assert describe_status(401, "Invalid API Key") == "http 401: Invalid API Key"
 
 
 @pytest.mark.parametrize(("header", "expected"), [

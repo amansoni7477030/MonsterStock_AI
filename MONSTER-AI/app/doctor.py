@@ -169,7 +169,7 @@ def _ai_config(report: DoctorReport, s: Settings) -> None:
     if s.llm_configured:
         on.append(f"LLM via {s.llm_provider} ({', '.join(m for m in (s.llm_model_name, s.llm_fallback_name) if m)})")
     if s.llm_web_configured:
-        on.append(f"web check (up to {s.llm_web_max_per_run} per news job)")
+        on.append(f"web check (up to {s.llm_web_max_per_run} per news job, {s.llm_web_max_per_day} per day)")
     if s.jev_configured:
         on.append(f"Jev ({s.jev_model})")
     report.add("ai services", "ok", " + ".join(on) or "off (optional): GROQ_API_KEY / TYPESAFE_API_KEY not set, the rules run alone")

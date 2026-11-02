@@ -292,6 +292,15 @@ def test_every_event_type_has_a_definition_and_the_discount_constants_match_the_
     assert rumour.is_rumour and rumour.severity == pytest.approx(plain.severity * ev.RUMOUR_SEVERITY, abs=0.002)
 
 
+@pytest.mark.parametrize(("text", "denial"), [
+    ("Infosys denies reports of a large acquisition", True), ("Company dismissed the report as baseless", True),
+    ("The firm clarifies its position", True), ("Reliance said the claims are not true", True),
+    ("Reliance wins Rs 900 crore order", False), ("Reliance in talks to buy a stake", False), ("", False), (None, False),
+])
+def test_the_rules_denial_wording_is_offered_to_the_web_check(text, denial):
+    assert ev.mentions_denial(text) is denial
+
+
 # ----------------------------------------------------------------------------------- web refutation
 def test_a_refuted_report_becomes_a_rumour_with_a_denials_discounts():
     draft = ev.EventDraft(event_type="merger_acquisition", severity=0.7, confidence=0.8, polarity_hint=0.6, rules=("ma_deal",))
