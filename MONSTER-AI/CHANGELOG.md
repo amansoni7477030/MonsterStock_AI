@@ -155,6 +155,19 @@ the other records.
 - **The cause of "no quotes" never reached the alert or the notice** (they always said "blocked or offline"), contrary to the runbook:
   the reason NSE's client gave, such as "no live-quote endpoint knows SECURITIES IN F&O ... did NSE change its API?", is now in both.
 
+### Found by the first real deployment (Oracle Cloud, Ubuntu 24.04, 2026-11-02), and fixed
+
+- **The installer waited five minutes for nothing and then failed on a stock Ubuntu server.** Its check for a busy package manager
+  matched process names, and the resident `unattended-upgrade-shutdown` helper that every Ubuntu server runs idle has the process name
+  `unattended-upgr`, so "another package manager is running" was always true while no apt or dpkg lock was held. `apt_busy`
+  (`deployment/lib/system.sh`) now asks the lock files themselves (`fuser` on the dpkg and apt locks) and only without `psmisc`
+  falls back to names, with the unattended upgrade matched by its command line and never the helper. A regression test covers
+  the idle helper, a held lock and the fallback.
+- **The preflight reported a blocked NSE that was not blocked.** The connectivity probe used curl's own User-Agent, and NSE's CDN
+  drops such a request without any answer (HTTP 000, even for a real file), while it answers a browser's (200) at once, as the
+  application's client, which impersonates a browser, always did. The probe now sends a browser's User-Agent
+  (`PROBE_USER_AGENT` in `deployment/install.sh`); any HTTP answer still proves the route works. A test pins both.
+
 ## [1.0.0] - 2026-11-01
 
 First complete release: a shadow-mode NSE large-move intelligence engine that runs unattended on a 1 GB / 8 GB Ubuntu

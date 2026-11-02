@@ -125,7 +125,21 @@ pkg_installed() {
   [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == 'install ok installed' ]]
 }
 
-apt_busy() { pgrep -x 'apt|apt-get|aptitude|dpkg|unattended-upgr|packagekitd|apt.systemd.dai' >/dev/null 2>&1; }
+# The apt/dpkg lock files: a package manager that really works holds one of them open. Process names alone cannot tell: the resident
+# "unattended-upgrade-shutdown" helper (comm "unattended-upgr") runs on every Ubuntu server and is no upgrade in progress, so a
+# name check made the installer wait the full timeout on a stock image and fail.
+readonly APT_LOCK_FILES=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+
+# apt_busy: true while a package manager holds the apt/dpkg locks (needs root to see every process).
+apt_busy() {
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -s "${APT_LOCK_FILES[@]}" >/dev/null 2>&1
+    return
+  fi
+  # No psmisc: fall back to the process names, with the unattended upgrade itself matched by its command line (never the helper).
+  pgrep -x 'apt|apt-get|aptitude|dpkg|packagekitd|apt.systemd.dai' >/dev/null 2>&1 ||
+    pgrep -f '(^|/)unattended-upgrade( |$)' >/dev/null 2>&1
+}
 
 # wait_for_apt [SECONDS]: a fresh VM often runs unattended-upgrades for minutes after first boot.
 wait_for_apt() {

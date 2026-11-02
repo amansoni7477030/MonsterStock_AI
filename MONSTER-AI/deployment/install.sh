@@ -358,6 +358,11 @@ ensure_download_tool() {
   apt_get install curl ca-certificates
 }
 
+# NSE's CDN drops the connection (no answer at all) for curl's own User-Agent, even for a real file, and answers normally to a
+# browser's. The application's HTTP client impersonates a browser, so the probe asks the same way: otherwise it reports a blocked
+# NSE that is not blocked.
+readonly PROBE_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+
 # probe_endpoint NAME URL required|optional [HINT]: any HTTP answer proves the route works; 000 means no answer.
 # Required endpoints get 3 attempts, optional ones 2, so a blocked optional feed costs about half a minute.
 probe_endpoint() {
@@ -368,7 +373,7 @@ probe_endpoint() {
     return 0
   fi
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$url" 2>/dev/null) || code="000"
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -A "$PROBE_USER_AGENT" --connect-timeout 8 --max-time 20 "$url" 2>/dev/null) || code="000"
     if [[ $code != 000 ]]; then
       ok "$name reachable (HTTP $code)"
       return 0

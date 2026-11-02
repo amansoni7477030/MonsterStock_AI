@@ -1088,6 +1088,73 @@ check committed "1" "$RELEASE_COMMITTED"
     assert_harness_ok(result)
 
 
+@needs_bash
+def test_apt_busy_follows_the_lock_files_not_the_resident_helper(tmp_path: Path):
+    """On a stock Ubuntu server the idle ``unattended-upgrade-shutdown`` helper (comm ``unattended-upgr``) always runs. The
+    installer once took it for an upgrade in progress, waited the whole timeout on a fresh server and failed; it must wait only
+    while a package manager really holds the apt/dpkg locks."""
+    script = SANDBOX_HEADER + r"""
+PROCS=()   # the fake process table: "comm|command line"
+pgrep() {  # pgrep -x REGEX (the process name) and pgrep -f REGEX (the command line) against PROCS
+  local mode=$1 re=$2 line comm cmd
+  for line in ${PROCS[@]+"${PROCS[@]}"}; do
+    comm=${line%%|*}; cmd=${line#*|}
+    case $mode in
+      -x) [[ $comm =~ ^($re)$ ]] && return 0 ;;
+      -f) [[ $cmd =~ $re ]] && return 0 ;;
+    esac
+  done
+  return 1
+}
+HELPER="unattended-upgr|/usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal"
+
+# with fuser: the lock files decide, whatever the process names say
+PROCS=("$HELPER")
+fuser() { printf '%s\n' "$*" >"$WORK/fuser.args"; return 1; }
+no_ idle-server-with-the-helper-is-not-busy apt_busy
+check fuser-asked-about-the-locks "-s ${APT_LOCK_FILES[*]}" "$(cat "$WORK/fuser.args")"
+check lock-files "/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock" "${APT_LOCK_FILES[*]}"
+fuser() { return 0; }
+yes_ lock-held-is-busy apt_busy
+
+# without psmisc the names decide, with the helper excluded
+unset -f fuser
+command() { if [[ ${1:-} == -v && ${2:-} == fuser ]]; then return 1; fi; builtin command "$@"; }
+PROCS=()
+no_ no-fuser-nothing-running "apt_busy"
+PROCS=("$HELPER")
+no_ no-fuser-the-helper-alone-is-not-busy apt_busy
+PROCS=("$HELPER" "unattended-upgr|/usr/bin/python3 /usr/bin/unattended-upgrade")
+yes_ no-fuser-a-real-unattended-upgrade-is-busy apt_busy
+PROCS=("apt-get|apt-get -y install libgomp1")
+yes_ no-fuser-apt-get-is-busy apt_busy
+PROCS=("dpkg|/usr/bin/dpkg --configure -a")
+yes_ no-fuser-dpkg-is-busy apt_busy
+PROCS=("packagekitd|/usr/libexec/packagekitd")
+yes_ no-fuser-packagekit-is-busy apt_busy
+unset -f command
+""" + HARNESS_FOOTER
+    result = run_bash(script, tmp_path)
+    assert_harness_ok(result)
+
+
+@needs_bash
+def test_connectivity_probe_asks_like_a_browser(tmp_path: Path):
+    """NSE's CDN gives no answer at all to curl's own User-Agent (the installer reported a blocked NSE that was not blocked), so the
+    preflight probe sends a browser's and still treats any HTTP answer as proof that the route works."""
+    script = SANDBOX_HEADER + r"""
+curl() { printf '%s\n' "$*" >>"$CALLS"; printf '404'; }
+probe_endpoint "NSE archives" https://nsearchives.nseindia.com/ optional hint >"$WORK/probe.out" 2>&1
+check probe-sends-a-browser-user-agent "yes" "$(grep -q -- '-A Mozilla/5.0 (X11; Linux x86_64)' "$CALLS" && echo yes || echo no)"
+check any-http-answer-is-reachable "yes" "$(grep -q 'reachable (HTTP 404)' "$WORK/probe.out" && echo yes || echo no)"
+curl() { printf '000'; return 7; }
+probe_endpoint "NSE archives" https://nsearchives.nseindia.com/ optional "hint text" >"$WORK/probe2.out" 2>&1
+check no-answer-is-a-warning "yes" "$(grep -q 'is unreachable. hint text' "$WORK/probe2.out" && echo yes || echo no)"
+""" + HARNESS_FOOTER
+    result = run_bash(script, tmp_path)
+    assert_harness_ok(result)
+
+
 FAKE_PYTHON = r"""#!/usr/bin/env bash
 # Fake interpreter: records what the installer asks pip / venv / compileall to do.
 LOG="${FAKE_LOG:?}"
