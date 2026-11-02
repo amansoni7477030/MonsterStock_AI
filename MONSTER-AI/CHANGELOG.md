@@ -163,6 +163,14 @@ server with native systemd (no containers).
     items fell from 0.63 to 0.35.
   - **The web check needs a listed company.** One of the two searches of that job went to a market-wide FII story typed as an
     acquisition; a story with no listed company has nothing to look up, whatever its type.
+  - **A company-type event that names no listed company is a lead, not a headline** (`cap_unattributed`). "GST collections jump 22.9%"
+    was typed `earnings_result` at severity 0.95 (two body rules, 3.3 of rule weight, so the cap above did not apply) and was the top
+    catalyst the report would have listed for five of sixteen unrelated stocks. A company-type event whose text names no listed
+    company keeps its type but gets the same 0.35 cap, recorded as `no_listed_company`; exchange filings, official statements and a
+    company's own releases are exempt, and a verified AI answer may still raise it. Of the 855 events, 31 were of this kind (macro or
+    sector scope, company type): average severity 0.61, 20 of them at 0.6 or more; with the cap the average is 0.36 and one is left
+    at 0.6 or more. Together with the changes above, the events at severity 0.8 or more fell from 69 to 39 and those at 0.6 or more
+    from 331 to 209 on the same data (rules only: the earlier figures include the AI-judged items).
   - **`news.last_run` describes the whole job.** A backlog is drained in batches under one AI budget, and the pipeline saved the
     counts of the last batch only (`llm_used` 0, `jev_skipped_budget` 241) beside a job message that said "llm 9 used, jev 30
     used". The job now saves its summed totals.
@@ -170,6 +178,11 @@ server with native systemd (no containers).
     failed at once, about two minutes in all) and the job carried on with the feeds and filings, as designed; Groq's daily token
     quota ran out part-way (earlier tests of the same day had spent it) and the extraction fell back to the rules for the rest of
     the job with a 353 s cooldown.
+  - **Verified on live NSE payloads, which had only been seen as recorded fixtures** (2026-11-02, 13:10 IST, market open): the
+    pre-open endpoint (`market-data-pre-open?key=ALL`) still served the day's book, stamped 09:09:31 IST, and the parser read all
+    2 411 rows with every field present, no non-positive price and the IST stamps converted to UTC; the `giftnifty` block of
+    `marketStatus` parsed (price, change, previous close, timestamp). The book was read after the session, so the 09:00-09:12
+    polling window itself, and the delivery latency before the cutoff, have still not run live.
 - **Credential hygiene for the LLM endpoint** (`app/config.py`): `GROQ_API_KEY` is sent only to a URL that is exactly
   `https://api.groq.com...` (a look-alike such as `https://api.groq.com.evil.example` or a URL with credentials or a backslash is
   not Groq's: it is refused at load or treated as another provider that never gets the key), and plain `http` is accepted for
@@ -292,8 +305,9 @@ small in every case except the first; the gain is less to run, maintain and expl
 ### Known limitations
 
 - The Linux installer and systemd units were validated by static analysis, stubs and ShellCheck, not on a real host.
-- The NSE pre-open JSON parser is verified against recorded fixtures, not a live session (first chance: the next trading
-  morning at 09:00 IST). NSE blocks some data-centre address ranges; the system degrades and reports it.
+- The NSE pre-open JSON parser was verified against recorded fixtures and, later, against one live NSE book (2026-11-02, read after the
+  session had closed: see "Found by a live news run"); the 09:00-09:12 polling window itself has not run live yet. NSE blocks some
+  data-centre address ranges; the system degrades and reports it.
 - No soak test was run on a real 1 GB server; the memory budget comes from measured peaks on a development PC.
 - Edge over simple baselines is modest and was measured on one market regime; a live shadow record of weeks to months is
   the real test. Nothing in this project places orders.

@@ -425,7 +425,7 @@ def test_prune_removes_old_raw_rows_but_keeps_events(store, pipe):
     assert len(events(store)) == 3 and count(store, "event_articles") == 3  # events and their links survive
     assert count(store, "event_articles", "article_id IS NULL AND filing_id IS NULL") == 2
     assert pipe.prune() == {
-        "news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0,
+        "news_raw": 0, "filings": 0, "event_articles_detached": 0, "signatures": 0, "llm_cache": 0, "jev_cache": 0, "web_cache": 0,
     }
 
 

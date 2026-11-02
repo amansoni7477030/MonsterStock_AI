@@ -456,8 +456,10 @@ tests/          hermetic tests built on real captured provider responses
   outright still gets a wrong type; the optional AI services correct what their budgets cover, and none of it reaches the model.
 - The live evidence base starts empty: statistics are shown with sample sizes and intervals and the "VALIDATED" label has to be earned.
   The measured edge over the best simple baseline is real but modest.
-- The Linux installer and systemd units were validated by static analysis, stubs and ShellCheck on a Windows development machine, and
-  the NSE pre-open parser against recorded fixtures: the first real morning on a server is the first live test of both.
+- The Linux installer and systemd units were validated by static analysis, stubs and ShellCheck on a Windows development machine:
+  the first real morning on a server is their first live test. The NSE pre-open and GIFT Nifty parsers, which had only seen recorded
+  fixtures, were run on live NSE payloads on 2 Nov 2026 (2 411 pre-open rows, every field present), but after the session: the
+  09:00-09:12 polling window itself has not run live.
 - Lunar-calendar exchange holidays of a year whose official list is not yet published are confirmed live on the day (the system sends no
   report and tells you), not predicted.
 

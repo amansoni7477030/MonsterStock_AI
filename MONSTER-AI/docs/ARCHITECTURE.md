@@ -274,16 +274,24 @@ flowchart TB
     EV --> USE["catalysts in the report, event-graph propagation,<br/>'already priced in' check"]
 ```
 
-**What the rules decide first, before any AI is asked** (`news_intelligence/events.py`): an exchange filing that only re-publishes an
-earlier one (the newspaper copy of the results, the audio recording or the transcript of the call) is dropped, because the first-hand
-filing is the event and the copy only repeats its words; so is a routine notice (trading window, record date, schedule of a meet) that
-says nothing specific. A type that rests on passing words in the body alone (nothing in the headline, no filing category behind it, and
-less than `WEAK_EVIDENCE_SCORE` (3.0) of rule weight, i.e. one or two rules) keeps its type, which may still be right, but its severity
-is capped at `WEAK_EVIDENCE_SEVERITY` (0.35) and it is marked `weak_evidence` in the event's rules. Both came out of a live run on real
-feeds and filings: of 178 filings that became events, 31 were such copies and recordings (typed `earnings_result`, severity up to 0.6,
-and a third of Jev's calls), and about one article in seven carried a type from a stray word ("escalation" in a power-demand story
-typed as a geopolitical conflict at severity 0.95, "divest" in a story about FII selling typed as an acquisition at 0.9). Sources that
-speak for themselves (exchange filings, official statements, a company's own release) are never capped.
+**What the rules decide first, before any AI is asked** (`news_intelligence/events.py`). Three rules came out of a live run on real
+feeds and filings, in which 1 098 articles and 419 filings became 855 events:
+
+- *A filing that only re-publishes an earlier one is dropped*: the newspaper copy of the results, the audio recording or the
+  transcript of the call. The first-hand filing is the event; the copy only repeats its words. 31 of the 178 filings that became
+  events were such copies (typed `earnings_result`, severity up to 0.6, and a third of Jev's calls). A routine notice (trading
+  window, record date, schedule of a meet) that says nothing specific is dropped too.
+- *A type resting on passing words in the body alone is a lead, not a headline*: nothing in the headline, no filing category behind
+  it, and less than `WEAK_EVIDENCE_SCORE` (3.0) of rule weight, i.e. one or two rules. It keeps its type, which may still be right,
+  but its severity is capped at `WEAK_EVIDENCE_SEVERITY` (0.35) and the event's rules say `weak_evidence`. About one article in
+  seven was typed from a stray word: "escalation" in a power-demand story became a geopolitical conflict at severity 0.95, "divest"
+  in a story about FII selling an acquisition at 0.9.
+- *A company-type event whose text names no listed company gets the same cap* (`cap_unattributed`, rule `no_listed_company`):
+  "GST collections jump 22.9%" is not a company's results, and without the cap it was the top catalyst for five of sixteen
+  unrelated stocks.
+
+Exchange filings, official statements and a company's own releases are never capped, and a verified AI answer can still raise a
+severity the rules capped.
 
 All three services (the extraction, the web check and Jev) run behind the same safety rails (`news_intelligence/remote.py`), each with
 its own budget, circuit breaker, cooldown, cache and health row, so a slow, rate-limited or broken provider can only make the rules
