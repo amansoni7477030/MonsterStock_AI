@@ -134,6 +134,33 @@ def test_alerts_are_deduplicated(env):
     assert raise_alerts(env.store, report) > 0  # warnings repeat after 12 h
 
 
+def test_a_model_trained_by_the_bootstrap_is_not_reported_as_never_trained(env):
+    """The first-time bootstrap trains through the job function and records no ``train`` job: the active model's own age has to
+    count, or a fresh install is warned "never trained" (and alerted every 12 h) until the first weekly training."""
+    assert env.settings.training_mode == "local-light"
+    assert env.store.last_job_success("train") is None
+    env.store.register_model(model_version="m-pre-1", stage="pre", status="validated")
+    env.store.activate_model("m-pre-1")
+    assert "training_overdue" not in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
+def test_training_overdue_needs_both_the_model_and_the_last_training_to_be_old(env):
+    env.store.register_model(model_version="m-pre-1", stage="pre", status="validated")
+    env.store.activate_model("m-pre-1")
+    env.clock.advance(20 * 86400)
+    problem = next(p for p in evaluate_health(env.store, env.settings, env.clock).problems if p.code == "training_overdue")
+    assert problem.level == "warn" and "20 days ago" in problem.message
+    env.store.job_record("train", "2026-11-22", "success", message="ok")  # a recent weekly training clears it, the model being old
+    assert "training_overdue" not in codes(evaluate_health(env.store, env.settings, env.clock))
+    env.clock.advance(15 * 86400)  # a successful training long ago and a model just as old: overdue again
+    assert "training_overdue" in codes(evaluate_health(env.store, env.settings, env.clock))
+    env.store.register_model(model_version="m-pre-2", stage="pre", status="validated")  # a freshly trained, activated model
+    env.store.activate_model("m-pre-2")
+    assert "training_overdue" not in codes(evaluate_health(env.store, env.settings, env.clock))
+    assert "training_overdue" not in codes(evaluate_health(env.store, env.settings.__class__(
+        **{**env.settings.__dict__, "training_mode": "external"}), env.clock))  # external training is judged by model age alone
+
+
 def test_stale_holiday_calendar_is_flagged_once_the_system_has_been_running(env):
     env.store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
     report = evaluate_health(env.store, env.settings, env.clock)

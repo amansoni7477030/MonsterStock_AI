@@ -167,6 +167,11 @@ the other records.
   drops such a request without any answer (HTTP 000, even for a real file), while it answers a browser's (200) at once, as the
   application's client, which impersonates a browser, always did. The probe now sends a browser's User-Agent
   (`PROBE_USER_AGENT` in `deployment/install.sh`); any HTTP answer still proves the route works. A test pins both.
+- **A fresh install was warned "training overdue: last successful training was never" and the warning was sent to Telegram.** The
+  check read the age of the last `train` job, and the first-time bootstrap trains through the job function without recording one,
+  so two freshly validated models still counted as "never trained" until the first Saturday training (the alert repeats every
+  12 hours). The age is now the younger of the last `train` job and the active model itself, whichever way it was trained; a
+  model and a training that are both old still warn. Two tests cover it and fail without the change.
 
 ## [1.0.0] - 2026-11-01
 

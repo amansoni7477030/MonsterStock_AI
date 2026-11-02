@@ -200,10 +200,16 @@ def _check_models(report: HealthReport, store: Store, settings: Settings, now: d
         if age is not None and age > MODEL_STALE_DAYS * 24:
             report.add("warn", f"model_stale_{stage}", f"active {stage} model is {age / 24:.0f} days old")
     if settings.training_mode == "local-light":
-        last = store.last_job_success("train")
-        age = _age_hours(last["finished_at"], now) if last else None
-        if store.active_model("pre") is not None and (age is None or age > TRAIN_WARN_DAYS * 24):
-            report.add("warn", "training_overdue", f"last successful training was {'never' if age is None else f'{age / 24:.0f} days ago'}")
+        pre = store.active_model("pre")
+        if pre is not None:
+            last = store.last_job_success("train")
+            # The active model is itself the product of the latest training, however it was started: the first-time bootstrap trains
+            # without a "train" job record, and a fresh install used to be warned "never trained" (and alerted) for days.
+            ages = [a for a in (_age_hours(last["finished_at"], now) if last else None, _age_hours(pre.get("created_at"), now))
+                    if a is not None]
+            age = min(ages) if ages else None
+            if age is None or age > TRAIN_WARN_DAYS * 24:
+                report.add("warn", "training_overdue", f"last successful training was {'never' if age is None else f'{age / 24:.0f} days ago'}")
 
 
 def _check_sources(report: HealthReport, store: Store) -> None:
