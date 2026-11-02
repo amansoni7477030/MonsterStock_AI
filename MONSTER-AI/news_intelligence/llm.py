@@ -6,9 +6,9 @@ become ``other``; entities must resolve through the :class:`EntityResolver`; the
 Any failure returns ``None`` so the caller falls back to the deterministic rules. Results are cached by content hash.
 
 On Groq the request asks for a strict JSON schema (constrained decoding, so a reply is always valid JSON of the right shape),
-sends ``reasoning_effort`` to the gpt-oss reasoning models, switches to a second model when the first is rate-limited (Groq
-limits are per model) and remembers, per model, which parameters it rejected. Other OpenAI-compatible endpoints get the plain
-``json_object`` request they always got.
+sends ``reasoning_effort`` to the reasoning models (gpt-oss, Qwen 3.x), walks down a chain of models when one is rate-limited
+or unavailable (Groq's limits are per model, so every model of the chain adds its own allowance) and remembers, per model,
+which parameters it rejected. Other OpenAI-compatible endpoints get the plain ``json_object`` request they always got.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import json
 import logging
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -33,6 +33,7 @@ from news_intelligence.context import NewsContext, defang
 from news_intelligence.entities import Entity, EntityResolver
 from news_intelligence.events import EVENT_DESCRIPTIONS, EVENT_TYPES, HORIZONS
 from news_intelligence.remote import (
+    COOLDOWN_MAX_SEC,
     RETRY_AFTER_CAP_SEC,
     Fatal,
     OutOfTime,
@@ -63,6 +64,9 @@ ENTITY_TYPES = ("company", "sector", "macro", "commodity", "fx", "rate", "index"
 GROQ_FORMATS = ("json_schema", "json_object", "none")  # strongest first; a rejected one steps down to the next
 PLAIN_FORMATS = ("json_object", "none")
 _MODEL_GONE = ("decommission", "model_not_found", "does not exist", "model_terminated", "no longer supported")
+# A 403 that is about ONE model, not about the key: the organisation has not enabled it (Groq: ``model_permission_blocked_org``),
+# or it is a preview that needs access. The chain skips such a model; a 403 about the key itself still stops the service.
+_MODEL_BLOCKED = ("blocked", "permission", "not enabled", "no access", "not allowed", "access to")
 # A 400 that is the model's own slip, not a fault of the request: a tool call written in a format the API rejects, or JSON that
 # failed its schema. Seen on a live key (gpt-oss answering a web search with a call to a tool named "json", code tool_use_failed).
 # Asking again usually works, so it is retried like a 5xx and never makes a service back off.
@@ -84,6 +88,14 @@ def is_transient_400(payload: Any, complaint: str) -> bool:
     error = payload.get("error") if isinstance(payload, dict) else None
     code = str(error.get("code") or "").lower() if isinstance(error, dict) else ""
     return code in TRANSIENT_CODES or any(word in complaint for word in _TRANSIENT_WORDS)
+
+
+def is_model_blocked(complaint: str) -> bool:
+    """True for a 403 whose words are about a model (not enabled for the organisation, preview access) and not about the key."""
+    return "model" in complaint and any(word in complaint for word in _MODEL_BLOCKED)
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 SYSTEM_PROMPT = (
     "You extract structured facts from ONE news article or exchange filing about Indian listed companies and global "
@@ -171,8 +183,9 @@ _clamp = clamp
 
 
 def parse_reply_json(content: str) -> dict[str, Any] | None:
-    """Extract one JSON object from a model reply (handles code fences and surrounding prose)."""
-    text = (content or "").strip()[:MAX_REPLY_CHARS]
+    """Extract one JSON object from a model reply (handles code fences, surrounding prose and the ``<think>`` block a Qwen model
+    writes before its answer when thinking is on)."""
+    text = _THINK.sub("", (content or "").strip()[:MAX_REPLY_CHARS]).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```\s*$", "", text)
     start, end = text.find("{"), text.rfind("}")
@@ -186,8 +199,20 @@ def parse_reply_json(content: str) -> dict[str, Any] | None:
 
 
 def is_reasoning_model(model: str | None) -> bool:
-    """gpt-oss models think before they answer: they take ``reasoning_effort`` and spend output tokens on it."""
-    return "gpt-oss" in (model or "").lower()
+    """gpt-oss and Qwen 3.x models think before they answer: they take ``reasoning_effort`` and spend output tokens on it."""
+    name = (model or "").lower()
+    return "gpt-oss" in name or "qwen3" in name
+
+
+def reasoning_effort_for(model: str | None, effort: str) -> str | None:
+    """The ``reasoning_effort`` to send to ``model`` (``None`` = send nothing). gpt-oss gets the configured value. Qwen 3.x thinks by
+    default too, but has an instruct mode that answers at once (``none``): that is what an extraction needs, so the cheapest
+    setting (``low``) selects it there, and a higher one is passed on. Any other model, or an empty setting, sends nothing."""
+    if not effort or not is_reasoning_model(model):
+        return None
+    if "qwen3" in (model or "").lower() and effort == "low":
+        return "none"
+    return effort
 
 
 class LLMExtractor(RemoteJudge):
@@ -223,17 +248,19 @@ class LLMExtractor(RemoteJudge):
         self._formats = GROQ_FORMATS if settings.llm_provider == "groq" else PLAIN_FORMATS
         self._token_param = "max_completion_tokens" if settings.llm_provider == "groq" else "max_tokens"
         self._caps_by_model: dict[str, dict[str, Any]] = {}
-        self._model_idx = 0
+        self._cooling: dict[str, float] = {}  # model -> clock.monotonic() instant until which it is rate-limited (this run only)
         self._unavailable: set[str] = set()
-        self.last_model: str | None = None  # the model that gave the latest answer (the fallback when the first was limited)
+        self.run_models: dict[str, int] = {}  # answers per model in this run: the fallback models show up here
+        self.last_model: str | None = None  # the model that gave the latest answer (a fallback when the first was limited)
         if settings.llm_key:
             register_secret(settings.llm_key)
 
     # ------------------------------------------------------------------------------------- plumbing
     def start_run(self) -> None:
         super().start_run()
-        self._model_idx = 0
+        self._cooling = {}
         self._unavailable = set()
+        self.run_models = {}
 
     @property
     def configured(self) -> bool:
@@ -241,25 +268,38 @@ class LLMExtractor(RemoteJudge):
 
     @property
     def models(self) -> list[str]:
-        """The primary model, then the fallback (when there is one)."""
-        names = [self.settings.llm_model_name, self.settings.llm_fallback_name]
-        return [name for name in names if name]
+        """The chain: the primary model, the fallback and the further ones, in the order they are tried. Groq limits tokens
+        and requests per model, so each one has its own allowance."""
+        return list(self.settings.llm_model_chain)
 
-    def _active_model(self) -> str:
-        models = self.models
-        return models[min(self._model_idx, len(models) - 1)]
-
-    def _next_model(self, exclude: set[str]) -> str | None:
-        """The next configured model that is not in ``exclude``, trying the ones after the active one first."""
-        models = self.models
-        for step in range(1, len(models)):
-            candidate = models[(self._model_idx + step) % len(models)]
-            if candidate not in exclude and candidate not in self._unavailable:
-                return candidate
+    def _pick(self, exclude: Collection[str] = ()) -> str | None:
+        """The first model of the chain that is not gone, not in ``exclude`` and not rate-limited right now. The best model
+        wins every time, so one whose limit has reset takes over again from the fallback that covered for it."""
+        now = self.clock.monotonic()
+        for name in self.models:
+            if name not in exclude and name not in self._unavailable and self._cooling.get(name, 0.0) <= now:
+                return name
         return None
 
-    def _use_model(self, model: str) -> None:
-        self._model_idx = self.models.index(model)
+    def _active_model(self) -> str:
+        """The model the next request goes to; when every model is limited, the one that recovers first."""
+        chosen = self._pick()
+        if chosen is not None:
+            return chosen
+        usable = [name for name in self.models if name not in self._unavailable] or self.models
+        return min(usable, key=lambda name: self._cooling.get(name, 0.0))
+
+    def _seconds_until_free(self) -> float:
+        """How long until the first model that is not gone leaves its rate limit (0 when one already has)."""
+        usable = [name for name in self.models if name not in self._unavailable]
+        soonest = min((self._cooling.get(name, 0.0) for name in usable), default=0.0)
+        return max(0.0, soonest - self.clock.monotonic())
+
+    def _note_answer(self, model: str) -> None:
+        """Remember which model answered: ``last_model``, this run's tally and the per-model counter in ``monster-ai diag``."""
+        self.last_model = model
+        self.run_models[model] = self.run_models.get(model, 0) + 1
+        self._bump(f"{self.COUNTER}.model:{model}")
 
     def _cache_key(self, title: str, text: str, context: NewsContext | None = None) -> str:
         fingerprint = context.fingerprint() if context is not None else ""
@@ -351,8 +391,8 @@ class LLMExtractor(RemoteJudge):
         response_format = self._response_format(caps["fmt"])
         if response_format is not None:
             body["response_format"] = response_format
-        effort = self.settings.llm_reasoning_effort
-        if effort and is_reasoning_model(model) and "reasoning_effort" not in caps["drop"]:
+        effort = reasoning_effort_for(model, self.settings.llm_reasoning_effort)
+        if effort and "reasoning_effort" not in caps["drop"]:
             body["reasoning_effort"] = effort
         if "temperature" in caps["drop"]:
             body.pop("temperature")
@@ -376,61 +416,75 @@ class LLMExtractor(RemoteJudge):
 
     def _request(self, make_body: Callable[[str], dict[str, Any]]) -> str:
         """POST ``make_body(model)`` with bounded retries; returns the reply content or raises ``Fatal`` / ``Quota`` /
-        ``OutOfTime`` / ``RuntimeError``. A rate-limited model hands over to the other one at once (Groq's limits are per model);
-        a 400 that names a parameter adapts the request; a long ``Retry-After`` is a quota, not something to sleep through."""
+        ``OutOfTime`` / ``RuntimeError``. A rate-limited model hands over to the next model of the chain at once (Groq's limits
+        are per model) and is asked again once its limit has reset; a 400 that names a parameter adapts the request; when every
+        model is limited the first to recover is waited for, unless that is longer than a pause is worth: that is a quota."""
         last = "no attempt"
         attempt = adaptations = 0
         limited: set[str] = set()
         while attempt < self.max_attempts:
             if self.out_of_time:
                 raise OutOfTime()
-            model = self._active_model()
-            try:
-                status, payload, snippet, headers = self.send(
-                    "POST", self._url(), self.settings.llm_key, self._timeout(), make_body(model),
-                )
-            except (requests.RequestException, OSError) as exc:
-                last = f"transport error {type(exc).__name__}"
-                status, payload, snippet, headers = -1, None, "", {}
-            if status == 200:
+            pause = 0.0
+            model = self._pick(limited)
+            if model is None:  # every model that is left answered 429 a moment ago or is still inside its limit
+                if all(name in self._unavailable for name in self.models):
+                    raise Fatal("no model of the chain is available")
+                pause = self._seconds_until_free()
+                if pause > RETRY_AFTER_CAP_SEC:
+                    raise Quota(pause)
+                status, payload, snippet, headers = 429, None, "", {}
+            else:
+                try:
+                    status, payload, snippet, headers = self.send(
+                        "POST", self._url(), self.settings.llm_key, self._timeout(), make_body(model),
+                    )
+                except (requests.RequestException, OSError) as exc:
+                    last = f"transport error {type(exc).__name__}"
+                    status, payload, snippet, headers = -1, None, "", {}
+            if status == 200 and model is not None:
                 content = self._content_of(payload)
                 if content is None:
                     raise RuntimeError("unexpected response shape")
                 usage = payload.get("usage") if isinstance(payload, dict) else None
                 if isinstance(usage, dict):
                     self._count_tokens(usage.get("prompt_tokens"), usage.get("completion_tokens"))
-                self.last_model = model
+                self._note_answer(model)
                 self._observe(payload)
                 return content
             reason = error_reason(payload, snippet) if status != -1 else ""
-            complaint = complaint_of(payload, snippet) if status == 400 else ""
-            if status == 400:
+            complaint = complaint_of(payload, snippet) if status in (400, 403) else ""
+            if status == 400 and model is not None:
                 salvaged = self._salvage(payload)
                 if salvaged is not None:  # the answer is in the error body: use it instead of paying for the search again
-                    self.last_model = model
+                    self._note_answer(model)
                     return salvaged
             transient = status == 400 and is_transient_400(payload, complaint)
-            if status == 404 or (status == 400 and not transient and any(word in complaint for word in _MODEL_GONE)):
+            gone = (
+                status == 404
+                or (status == 400 and not transient and any(word in complaint for word in _MODEL_GONE))
+                or (status == 403 and is_model_blocked(complaint))
+            )
+            if gone and model is not None:
                 self._unavailable.add(model)
-                successor = self._next_model(limited)
-                if successor is None:
+                if all(name in self._unavailable for name in self.models):
                     raise Fatal(describe_status(status, reason))
-                self._use_model(successor)
                 continue
-            if status == 400 and not transient and adaptations < 4:
+            if status == 400 and not transient and adaptations < 4 and model is not None:
                 if not self._adapt(model, complaint, reason):
                     raise RuntimeError(describe_status(400, reason))
                 adaptations += 1
                 continue
-            if status == 429:
+            if status == 429 and model is not None:
                 limited.add(model)
-                successor = self._next_model(limited)
-                if successor is not None:
-                    self._use_model(successor)
-                    continue
                 wait = retry_after_seconds(headers)
-                if wait is not None and wait > RETRY_AFTER_CAP_SEC:
-                    raise Quota(wait)
+                self._cooling[model] = self.clock.monotonic() + min(
+                    self.backoff_base if wait is None else wait, COOLDOWN_MAX_SEC)
+                if self._pick(limited) is not None:
+                    continue  # the next model of the chain takes over at once
+                pause = self._seconds_until_free()
+                if pause > RETRY_AFTER_CAP_SEC:
+                    raise Quota(pause)
             if status in FATAL_STATUS:
                 raise Fatal(describe_status(status, reason))
             if status != -1 and status not in RETRYABLE_STATUS and not transient:
@@ -441,7 +495,7 @@ class LLMExtractor(RemoteJudge):
             attempt += 1
             if attempt < self.max_attempts:
                 delay = min(self.backoff_cap, self.backoff_base * 2 ** (attempt - 1))
-                self.sleep_within_budget(max(delay, min(retry_after_seconds(headers) or 0.0, RETRY_AFTER_CAP_SEC)))
+                self.sleep_within_budget(max(delay, min(pause or retry_after_seconds(headers) or 0.0, RETRY_AFTER_CAP_SEC)))
         raise RuntimeError(f"gave up after {self.max_attempts} attempts ({last})")
 
     def _timeout(self) -> float:

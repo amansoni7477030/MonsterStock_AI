@@ -143,18 +143,69 @@ class FakeIntel:
         return {}
 
 
+LIVE_STAMP = "2026-11-02T09:00:00Z"  # 14:30 IST on the FakeClock day
+
+
+def live_rows(panel: Panel, *, moves: dict[str, float] | None = None, strength: dict[str, float] | None = None,
+              volume: dict[str, float] | None = None, fraction: float = 0.79, stamp: str = LIVE_STAMP, default_move: float = 0.1,
+              ) -> list[dict[str, Any]]:
+    """The live ``equity-stockIndices`` rows (as ``parse_live_equities`` returns them) of today's session in progress for every
+    symbol of ``panel``, which ends on the previous session. ``moves`` is the change in % (default a flat day), ``strength`` the
+    position of the last price in the day's range (0 = at the low, 1 = at the high) and ``volume`` today's projected-day volume
+    relative to the 20-day average (default 1.0); ``fraction`` is the share of that volume done by the stamp."""
+    rows = []
+    for symbol in panel.symbols:
+        prev = float(panel.c[symbol].iloc[-1])
+        move = (moves or {}).get(symbol, default_move)
+        last = prev * (1 + move / 100.0)
+        opened = prev * (1 + move / 300.0)
+        span = prev * 0.02
+        low = last - (strength or {}).get(symbol, 0.5) * span
+        low, high = min(low, opened), max(low + span, opened)
+        shares = float(panel.v[symbol].iloc[-20:].mean()) * (volume or {}).get(symbol, 1.0) * fraction
+        rows.append({"symbol": symbol, "open": opened, "high": high, "low": low, "last": last, "prev_close": prev,
+                     "change_pct": move, "volume": shares, "turnover": shares * last, "year_high": None, "year_low": None,
+                     "row_ts": stamp})
+    return rows
+
+
 class FakeNseApi:
     """Scripted NSE API: ``books`` is a list of row-lists returned one per call (the last one repeats), stamped ``book_ts``
-    (the book's own timestamp; set it to an earlier day to simulate NSE serving the previous session's book)."""
+    (the book's own timestamp; set it to an earlier day to simulate NSE serving the previous session's book). ``live`` are the
+    rows ``live_equities`` answers (see ``live_rows``), ``indices`` what ``all_indices`` answers; ``fail`` breaks every endpoint,
+    ``indices_fail`` only the index one."""
 
     def __init__(self, books: list[list[dict[str, Any]]] | None = None, *, fail: bool = False, gift: dict | None = None,
-                 holidays: list[dict[str, Any]] | None = None, book_ts: str = "02-Nov-2026 09:08:30") -> None:
+                 holidays: list[dict[str, Any]] | None = None, book_ts: str = "02-Nov-2026 09:08:30",
+                 live: list[dict[str, Any]] | None = None, live_ts: str | None = LIVE_STAMP,
+                 indices: dict[str, dict[str, Any]] | None = None, indices_fail: bool = False) -> None:
         self.books = books or []
         self.calls = 0
         self.fail = fail
         self.gift = gift
         self._holidays = holidays
         self.book_ts = book_ts
+        self.live = live or []
+        self.live_ts = live_ts
+        self.live_calls: list[str] = []
+        self.indices = indices or {}
+        self.indices_fail = indices_fail
+
+    def live_equities(self, index: str = "SECURITIES IN F&O", symbols: Any = None, *, deadline: float | None = None):
+        from app.errors import DataUnavailable
+        from ingestion.nse import LiveEquities
+
+        self.live_calls.append(index)
+        if self.fail:
+            raise DataUnavailable("nse", "simulated block", retryable=True)
+        return LiveEquities(self.live_ts, [row for row in self.live if symbols is None or row["symbol"] in symbols])
+
+    def all_indices(self, *, deadline: float | None = None):
+        from app.errors import DataUnavailable
+
+        if self.fail or self.indices_fail:
+            raise DataUnavailable("nse", "simulated block", retryable=True)
+        return self.indices
 
     def preopen(self, key: str = "ALL", symbols: Any = None, *, deadline: float | None = None):
         from app.errors import DataUnavailable

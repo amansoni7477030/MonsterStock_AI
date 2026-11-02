@@ -1,4 +1,4 @@
-"""Transaction-cost model for NSE intraday equity (blueprint section 15 "Costs").
+"""Transaction-cost model for NSE equity: intraday (blueprint section 15 "Costs") and delivery (a BTST or swing trade held overnight).
 
 Statutory/brokerage components are configurable schedule values (they change over time and by broker); slippage and
 impact are liquidity based estimates. The model is used (a) to reject candidates whose round-trip cost is a large share
@@ -20,6 +20,8 @@ class CostModel:
     sebi_pct: float = 0.000001
     stamp_buy_pct: float = 0.00003  # buy side only
     gst_pct: float = 0.18  # on brokerage + exchange + SEBI charges
+    stt_delivery_pct: float = 0.001  # delivery: 0.1 % on both sides
+    stamp_delivery_buy_pct: float = 0.00015  # delivery: buy side only
 
     def brokerage(self, value: float) -> float:
         return min(self.brokerage_flat, self.brokerage_pct * value)
@@ -37,6 +39,21 @@ class CostModel:
         if notional <= 0:
             return float("nan")
         return self.fees(notional, notional) / notional * 100.0
+
+    def delivery_fees(self, buy_value: float, sell_value: float) -> float:
+        """Total INR cost of a round trip that holds the shares overnight (BTST or a swing): securities transaction tax on BOTH
+        sides and the delivery stamp duty, otherwise the same schedule. Excludes slippage and impact."""
+        brokerage = self.brokerage(buy_value) + self.brokerage(sell_value)
+        exchange = self.exch_txn_pct * (buy_value + sell_value)
+        sebi = self.sebi_pct * (buy_value + sell_value)
+        gst = self.gst_pct * (brokerage + exchange + sebi)
+        return (brokerage + exchange + sebi + gst + self.stt_delivery_pct * (buy_value + sell_value)
+                + self.stamp_delivery_buy_pct * buy_value)
+
+    def delivery_round_trip_pct(self, notional: float) -> float:
+        if notional <= 0:
+            return float("nan")
+        return self.delivery_fees(notional, notional) / notional * 100.0
 
 
 def slippage_bps(turnover_cr: float | None) -> float:
@@ -64,3 +81,13 @@ def estimate_round_trip_cost_pct(
     adv = turnover_cr * 1e7 if turnover_cr and turnover_cr == turnover_cr else None
     per_side = slippage_bps(turnover_cr) + impact_bps(notional, adv)
     return model.round_trip_pct(notional) + 2.0 * per_side / 100.0
+
+
+def estimate_delivery_round_trip_cost_pct(
+    turnover_cr: float | None, *, notional: float = 200_000.0, model: CostModel | None = None
+) -> float:
+    """All-in round-trip cost (% of notional) of a trade held overnight: delivery fees + 2 x slippage + 2 x impact."""
+    model = model or CostModel()
+    adv = turnover_cr * 1e7 if turnover_cr and turnover_cr == turnover_cr else None
+    per_side = slippage_bps(turnover_cr) + impact_bps(notional, adv)
+    return model.delivery_round_trip_pct(notional) + 2.0 * per_side / 100.0

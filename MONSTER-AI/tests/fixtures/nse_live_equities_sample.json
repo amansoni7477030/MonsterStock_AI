@@ -1,0 +1,49 @@
+{
+  "name": "SECURITIES IN F&O",
+  "advance": {"declines": "61", "advances": "133", "unchanged": "6"},
+  "timestamp": "02-Nov-2026 14:31:00",
+  "data": [
+    {
+      "priority": 1, "symbol": "SECURITIES IN F&O", "identifier": "SECURITIES IN F&O",
+      "open": 24310.5, "dayHigh": 24398.2, "dayLow": 24270.1, "lastPrice": 24380.4, "previousClose": 24290.0,
+      "change": 90.4, "pChange": 0.37, "totalTradedVolume": 812345678, "totalTradedValue": 1.9e11,
+      "lastUpdateTime": "02-Nov-2026 14:30:59", "yearHigh": 26277.35, "yearLow": 21281.75
+    },
+    {
+      "priority": 0, "symbol": "RELIANCE", "identifier": "RELIANCEEQN", "series": "EQ",
+      "open": 1251.0, "dayHigh": 1286.5, "dayLow": 1249.0, "lastPrice": 1284.2, "previousClose": 1248.6,
+      "change": 35.6, "pChange": 2.85, "totalTradedVolume": 11250000, "totalTradedValue": 1.4e10,
+      "lastUpdateTime": "02-Nov-2026 14:30:58", "yearHigh": 1608.95, "yearLow": 1114.85, "ffmc": 7.1e12,
+      "meta": {"symbol": "RELIANCE", "companyName": "Reliance Industries Limited", "industry": "Refineries", "isFNOSec": true}
+    },
+    {
+      "priority": 0, "symbol": "TCS", "identifier": "TCSEQN", "series": "EQ",
+      "open": "0", "dayHigh": "-", "dayLow": null, "lastPrice": "4,102.50", "previousClose": "4,090.00",
+      "change": 12.5, "pChange": 0.31, "totalTradedVolume": "1,250,000", "totalTradedValue": 5.1e9,
+      "lastUpdateTime": "02-Nov-2026 14:29:40", "yearHigh": 4592.25, "yearLow": 3056.05
+    },
+    {
+      "priority": 0, "symbol": "M&M", "identifier": "M&MEQN", "series": "EQ",
+      "open": 3012.0, "dayHigh": 3040.0, "dayLow": 2988.0, "lastPrice": 3001.0, "previousClose": 3010.0,
+      "pChange": -0.3, "totalTradedVolume": 2100000, "totalTradedValue": 6.3e9,
+      "lastUpdateTime": "01-Nov-2026 15:30:00"
+    },
+    {
+      "priority": 0, "symbol": "NOQUOTE", "identifier": "NOQUOTEEQN", "series": "EQ",
+      "open": 10.0, "dayHigh": 11.0, "dayLow": 9.0, "lastPrice": null, "previousClose": 10.0
+    },
+    {
+      "priority": 0, "symbol": "NOPREV", "identifier": "NOPREVEQN", "series": "EQ",
+      "open": 10.0, "dayHigh": 11.0, "dayLow": 9.0, "lastPrice": 10.5, "previousClose": 0
+    },
+    {"symbol": ""},
+    "not a row",
+    {
+      "priority": 0, "symbol": "INFY", "identifier": "INFYEQN", "series": "EQ",
+      "open": 1500.0, "dayHigh": 1512.0, "dayLow": 1490.0, "lastPrice": 1508.0, "previousClose": 1496.0,
+      "totalTradedVolume": 3400000, "totalTradedValue": 5.1e9
+    }
+  ],
+  "metadata": {"indexName": "SECURITIES IN F&O", "open": 24310.5, "high": 24398.2, "low": 24270.1, "last": 24380.4},
+  "marketStatus": {"market": "Capital Market", "marketStatus": "Open", "tradeDate": "02-Nov-2026 14:31"}
+}

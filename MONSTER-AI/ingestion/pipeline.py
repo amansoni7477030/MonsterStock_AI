@@ -22,7 +22,7 @@ from app.errors import CircuitOpen, DataUnavailable
 from app.logging_setup import redact
 from database.store import Store
 from ingestion.fno import aggregate_stock_fno
-from ingestion.nse import NseApi, NseArchive, PreopenSnapshot
+from ingestion.nse import LiveEquities, NseApi, NseArchive, PreopenSnapshot
 from ingestion.series import NSE_EQUITY_SPEC, SERIES, SERIES_BY_KEY, SeriesSpec
 from ingestion.validation import overlap_consistent, validate_bars
 from ingestion.yahoo import SymbolNotFound, YahooClient
@@ -510,6 +510,48 @@ def collect_gift(store: Store, nse: NseApi, *, deadline: float | None = None) ->
 
 
 LIVE_CONTEXT = ("^N225", "^HSI", "^KS11", "000001.SS", "ES=F", "NQ=F", "CL=F", "BZ=F", "USDINR=X")
+
+
+def collect_live_equities(store: Store, nse: NseApi, lists: Sequence[str], symbols: Iterable[str], *,
+                          deadline: float | None = None) -> LiveEquities | None:
+    """Today's running figures of ``symbols`` from the stock lists ``lists`` (one call each; the first list that has a symbol
+    wins). ``None`` when no list answered. A list that fails is logged and skipped, so a broad second list never costs the
+    answer of the first. The outcome is recorded in ``source_health`` as ``nse_live_quotes``."""
+    wanted = set(symbols)
+    merged: dict[str, dict[str, Any]] = {}
+    stamps: list[str] = []
+    index: dict[str, Any] | None = None
+    answered = False
+    for name in lists:
+        try:
+            snapshot = nse.live_equities(name, wanted, deadline=deadline)
+        except DataUnavailable as exc:
+            store.record_source_result("nse_live_quotes", False, error=redact(str(exc)))
+            log.warning("live quotes of %s failed: %s", name, redact(str(exc)))
+            continue
+        answered = True
+        for row in snapshot.rows:
+            merged.setdefault(row["symbol"], row)
+        if snapshot.source_ts:
+            stamps.append(snapshot.source_ts)
+        index = index or snapshot.index
+    if not answered:
+        return None
+    latest = max(stamps) if stamps else None
+    store.record_source_result("nse_live_quotes", bool(merged), data_ts=latest, error=None if merged else "no stock rows")
+    return LiveEquities(latest, list(merged.values()), index)
+
+
+def collect_live_indices(store: Store, nse: NseApi, *, deadline: float | None = None) -> dict[str, dict[str, Any]]:
+    """Nifty 50, India VIX and the other indices live; ``{}`` when NSE does not answer (the scan then reads the market from the
+    stocks themselves)."""
+    try:
+        indices = nse.all_indices(deadline=deadline)
+    except DataUnavailable as exc:
+        store.record_source_result("nse_live_quotes", False, error=redact(str(exc)))
+        log.warning("live indices failed: %s", redact(str(exc)))
+        return {}
+    return indices
 
 
 def collect_live_context(store: Store, yahoo: YahooClient, keys: Sequence[str] = LIVE_CONTEXT,

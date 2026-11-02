@@ -62,6 +62,9 @@ def test_the_samples_show_every_feature_of_the_design(built):
     assert all(token in final for token in ("🥇", "🥈", "🥉", "🔥", "⚡", "👀", "<code>██████░░░░</code>", "🚩", "🔎", "🟢", "🟡"))
     assert "🧪 <b>SHADOW MODE" in texts["prelim"] and "<b>PRELIMINARY</b>" in texts["prelim"] and "👀 <b>WATCH</b>" in texts["prelim"]
     assert "🛑 <b>NO HIGH-CONVICTION SETUP today</b>" in texts["no-setup"]
+    ideas = texts["ideas"]
+    assert all(token in ideas for token in ("BTST", "Swing", "Bearish setups", "intraday watchlist", "Buy above", "Sell below", "📚 Live record"))
+    assert "record passes the gate" in ideas and "not validated" in ideas and "NOT a probability" in ideas
     assert "📚" in texts["evening"] and "✅" in texts["evening"] and "❌" in texts["evening"]
     assert all(icon in texts["alert"] for icon in ("🔴", "🟠", "🟡", "🎉")) and "🛠" in texts["alert"]
     assert "🔔 <b>MONSTER AI</b> · 3 alerts" in texts["digest"]

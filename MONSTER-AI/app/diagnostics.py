@@ -76,8 +76,9 @@ def database_state(store: Any) -> str:
             store, "SELECT alert_id, created_at, level, code, delivered, message FROM alerts ORDER BY alert_id DESC LIMIT ?",
             (RECENT_ROWS,)))),
         _section("source health", _table(_rows(store, "SELECT * FROM source_health ORDER BY source_id"))),
-        _section("ai services (counters, cooldowns and the latest news run)", _table(_rows(
-            store, f"SELECT key, value, updated_at FROM kv WHERE key IN ({', '.join('?' * len(AI_STATE_KEYS))}) ORDER BY key",
+        _section("ai services (counters, cooldowns, answers per model and the latest news run)", _table(_rows(
+            store, f"SELECT key, value, updated_at FROM kv WHERE key IN ({', '.join('?' * len(AI_STATE_KEYS))}) "
+                   "OR key LIKE 'llm.model:%' ORDER BY key",
             AI_STATE_KEYS))),
         _section("models", _table(_rows(
             store, "SELECT model_version, stage, status, is_active, created_at, train_end, notes FROM model_registry "

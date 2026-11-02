@@ -21,13 +21,17 @@ from app.errors import ConfigError
 HOME_DEFAULT = Path(__file__).resolve().parent.parent
 
 # Groq (OpenAI-compatible). gpt-oss-120b is Groq's production model with strict JSON-schema outputs; Groq's rate limits are
-# per model, so gpt-oss-20b (also production, faster and cheaper) is both the fallback and extra headroom.
+# per model, so gpt-oss-20b (also production, faster and cheaper) is both the fallback and extra headroom. Every further model
+# in the chain brings its own token and request allowance: qwen3.8-27b also takes strict JSON-schema outputs and has the same
+# free-tier limits per model as the gpt-oss pair (console.groq.com/docs/rate-limits and /docs/structured-outputs, read 2026-11-02).
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
+GROQ_EXTRA_FALLBACK_MODELS = ("qwen/qwen3.8-27b",)
 # Groq's built-in browser_search tool (a server-side web search) is offered by the gpt-oss models only, and Groq documents it as
 # incompatible with structured outputs (console.groq.com/docs/tool-use/built-in-tools and /browser-search, read 2026-11-02).
 GROQ_WEB_MODEL_PREFIX = "openai/gpt-oss"
+CLOSING_SCAN_START = "14:30:00"  # IST: when the scheduler starts the closing-hour scan (automation.schedule)
 _GROQ_URL = re.compile(r"https://api\.groq\.com(?::443)?(?:/[A-Za-z0-9._~/-]*)?", re.IGNORECASE)
 _URL_UNSAFE = re.compile(r"[\\@\s]")  # credentials, backslashes and spaces: what different URL parsers read differently
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -91,6 +95,30 @@ def _strs(value: str) -> tuple[str, ...]:
 
 def _path(value: str) -> Path:
     return Path(value.strip()).expanduser()
+
+
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,99}")
+
+
+def _models(value: str) -> tuple[str, ...] | None:
+    """Model names separated by commas or spaces, in the order they are tried. Empty = not set (the provider's default list
+    applies); ``none`` = no further models at all."""
+    text = value.strip()
+    if not text:
+        return None
+    if text.lower() in {"none", "off", "-"}:
+        return ()
+    names: list[str] = []
+    for name in re.split(r"[,\s]+", text):
+        if not name:
+            continue
+        if not _MODEL_NAME.fullmatch(name):
+            raise ValueError(f"not a model name: {name!r}")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("expected model names separated by commas, or 'none'")
+    return tuple(names)
 
 
 def _choice(*options: str) -> Callable[[str], str]:
@@ -192,6 +220,27 @@ VARS: tuple[Var, ...] = (
     Var("report_cutoff_time", "REPORT_CUTOFF_TIME", "09:12:00", _hhmm, "Point-in-time cutoff of the final snapshot (IST).", "Schedule"),
     Var("report_deadline_time", "REPORT_DEADLINE_TIME", "09:14:30", _hhmm,
         "Hard deadline: the report is never sent after this time (IST).", "Schedule"),
+    # -- closing-hour trade ideas (BTST, swing, bearish F&O, next-day intraday watchlist) -------------------------------
+    Var("ideas_enabled", "IDEAS_ENABLED", "true", _bool,
+        "Run the closing-hour scan at 14:30 IST: BTST (buy before the close, sell next session), swing (hold 2-5 sessions), "
+        "bearish F&O ideas and tomorrow's intraday watchlist, from NSE live quotes and the stored daily history. Research "
+        "output in shadow mode: the system never places an order.", "Ideas"),
+    Var("send_ideas_report", "SEND_IDEAS_REPORT", "true", _bool,
+        "Send the closing-hour report to Telegram (false = compute, freeze and evaluate the ideas silently).", "Ideas"),
+    Var("ideas_report_deadline_time", "IDEAS_REPORT_DEADLINE_TIME", "15:05", _hhmm,
+        "Hard deadline of the closing-hour report (IST): it is never sent after this time (a manual run with --force may), "
+        "so a late report cannot be mistaken for a call to enter. Between 14:31 and IDEAS_ENTRY_BY_TIME.", "Ideas"),
+    Var("ideas_entry_by_time", "IDEAS_ENTRY_BY_TIME", "15:15", _hhmm,
+        "The time (IST) the report tells you to have entered by; after it the closing auction window is near and the shown "
+        "levels are stale. Before 15:30.", "Ideas"),
+    Var("ideas_top_n", "IDEAS_TOP_N", "5", _int, "Ideas listed per category (BTST, swing, bearish, watchlist).", "Ideas"),
+    Var("ideas_min_score", "IDEAS_MIN_SCORE", "60", _float,
+        "Lowest setup score (0-100, a ranking aid and not a probability) an idea needs to be listed.", "Ideas"),
+    Var("ideas_max_risk_pct", "IDEAS_MAX_RISK_PCT", "4", _float,
+        "An idea whose stop is further than this many percent from its entry is not listed.", "Ideas"),
+    Var("ideas_include_shorts", "IDEAS_INCLUDE_SHORTS", "true", _bool,
+        "Include bearish ideas (F&O names only: short futures or buy puts; the cash market cannot be held short overnight) "
+        "and the sell triggers of the watchlist.", "Ideas"),
     # -- providers -----------------------------------------------------------------------------------------
     Var("yahoo_min_interval_sec", "YAHOO_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between Yahoo requests.", "Providers"),
     Var("nse_min_interval_sec", "NSE_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between NSE requests.", "Providers"),
@@ -222,6 +271,12 @@ VARS: tuple[Var, ...] = (
     Var("llm_fallback_model", "LLM_FALLBACK_MODEL", "", _opt_str,
         "Optional: model used when the primary one is rate-limited or unavailable (default on Groq: openai/gpt-oss-20b; "
         "Groq's limits are per model, so it also adds headroom).", "LLM"),
+    Var("llm_fallback_models", "LLM_FALLBACK_MODELS", "", _models,
+        "Optional: further models, comma separated, tried in this order after LLM_FALLBACK_MODEL when the ones before them are "
+        "rate-limited or unavailable. Groq limits tokens and requests per model, so every model in the chain adds its own "
+        "allowance (default on Groq: qwen/qwen3.8-27b, which takes the same strict JSON-schema request; "
+        "meta-models/muse-spark-open is a limited preview that Groq must enable for the account first). A model the key cannot "
+        "use is skipped for the run. 'none' = no further models.", "LLM"),
     Var("llm_reasoning_effort", "LLM_REASONING_EFFORT", "low", _choice("", "low", "medium", "high"),
         "Reasoning effort for reasoning models such as gpt-oss (low = fast and cheap, enough for extraction). Empty = not sent.",
         "LLM"),
@@ -351,6 +406,14 @@ class Settings:
     final_scan_time: str = "09:08:45"
     report_cutoff_time: str = "09:12:00"
     report_deadline_time: str = "09:14:30"
+    ideas_enabled: bool = True
+    send_ideas_report: bool = True
+    ideas_report_deadline_time: str = "15:05:00"
+    ideas_entry_by_time: str = "15:15:00"
+    ideas_top_n: int = 5
+    ideas_min_score: float = 60.0
+    ideas_max_risk_pct: float = 4.0
+    ideas_include_shorts: bool = True
     yahoo_min_interval_sec: float = 1.0
     nse_min_interval_sec: float = 1.0
     nse_enabled: bool = True
@@ -368,6 +431,7 @@ class Settings:
     llm_api_key: str | None = None
     llm_model: str | None = None
     llm_fallback_model: str | None = None
+    llm_fallback_models: tuple[str, ...] | None = None
     llm_reasoning_effort: str = "low"
     llm_timeout_sec: float = 40.0
     llm_max_articles_per_run: int = 60
@@ -462,16 +526,36 @@ class Settings:
         return chosen if chosen and chosen != self.llm_model_name else None
 
     @property
+    def llm_extra_fallback_names(self) -> tuple[str, ...]:
+        """The models after the primary and the first fallback, in the order they are tried (never a repeat). Groq gets its
+        default extras unless ``LLM_FALLBACK_MODELS`` says otherwise; any other provider only the ones it is told about."""
+        chosen = self.llm_fallback_models
+        if chosen is None:
+            chosen = GROQ_EXTRA_FALLBACK_MODELS if self.llm_provider == "groq" else ()
+        taken = {self.llm_model_name, self.llm_fallback_name}
+        out: list[str] = []
+        for name in chosen:
+            if name not in taken and name not in out:
+                out.append(name)
+        return tuple(out)
+
+    @property
+    def llm_model_chain(self) -> list[str]:
+        """Every model the LLM may use in the order they are tried: the primary, the fallback, then the further ones. Groq's
+        limits are per model, so each name in the chain adds its own allowance."""
+        names = (self.llm_model_name, self.llm_fallback_name, *self.llm_extra_fallback_names)
+        return [name for name in names if name]
+
+    @property
     def llm_configured(self) -> bool:
         return bool(self.llm_base_url and self.llm_model_name and (self.llm_provider != "groq" or self.llm_key))
 
     @property
     def llm_web_models(self) -> list[str]:
-        """The configured Groq models that offer built-in web search (the primary first); empty for any other provider."""
+        """The models of the chain that offer built-in web search (the primary first); empty for any other provider."""
         if self.llm_provider != "groq":
             return []
-        names = (self.llm_model_name, self.llm_fallback_name)
-        return [name for name in names if name and name.startswith(GROQ_WEB_MODEL_PREFIX)]
+        return [name for name in self.llm_model_chain if name.startswith(GROQ_WEB_MODEL_PREFIX)]
 
     @property
     def llm_web_configured(self) -> bool:
@@ -621,6 +705,15 @@ def validate(s: Settings) -> list[str]:
         problems.append("schedule must satisfy PRELIM < FINAL < CUTOFF < DEADLINE < 09:15 (IST)")
     if s.report_deadline_time >= "09:15:00":
         problems.append("REPORT_DEADLINE_TIME must be before the 09:15 IST regular session")
+    if not (CLOSING_SCAN_START < s.ideas_report_deadline_time <= s.ideas_entry_by_time < "15:30:00"):
+        problems.append("IDEAS_REPORT_DEADLINE_TIME must lie after the 14:30 scan and not after IDEAS_ENTRY_BY_TIME, "
+                        "which must be before the 15:30 close (IST)")
+    if not 1 <= s.ideas_top_n <= 10:
+        problems.append("IDEAS_TOP_N must be between 1 and 10")
+    if not 0.0 <= s.ideas_min_score <= 100.0:
+        problems.append("IDEAS_MIN_SCORE must be between 0 and 100")
+    if not 0.0 < s.ideas_max_risk_pct <= 15.0:
+        problems.append("IDEAS_MAX_RISK_PCT must be above 0 and at most 15")
     if s.dashboard_enabled and s.dashboard_host not in {"127.0.0.1", "::1", "localhost"} and not s.dashboard_token:
         problems.append("DASHBOARD_TOKEN is required when the dashboard is not bound to loopback")
     if s.dashboard_token and len(s.dashboard_token) < 16:

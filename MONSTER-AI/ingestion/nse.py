@@ -28,6 +28,10 @@ HOME = "https://www.nseindia.com/"
 API = "https://www.nseindia.com/api/"
 UDIFF_START = date(2024, 7, 8)
 MAX_ZIP_UNCOMPRESSED = 120 * 1024 * 1024
+# The stock lists the live-quote endpoint serves for each universe policy: ``SECURITIES IN F&O`` is the whole F&O segment in one
+# request; the broad index lists cover the larger universes.
+LIVE_LISTS = {"fno_nifty100": ("SECURITIES IN F&O",), "nifty200": ("SECURITIES IN F&O", "NIFTY 200"),
+              "nifty500": ("SECURITIES IN F&O", "NIFTY 500"), "custom": ("SECURITIES IN F&O", "NIFTY 500")}
 
 BROWSER_HEADERS = {
     "User-Agent": USER_AGENT_BROWSER,
@@ -234,6 +238,15 @@ class PreopenSnapshot:
     rows: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class LiveEquities:
+    """One ``equity-stockIndices`` answer: today's running figures of every stock of a list, and the list's own index row."""
+
+    source_ts: str | None
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    index: dict[str, Any] | None = None
+
+
 class NseApi:
     """Public JSON endpoints behind www.nseindia.com. A cookie handshake is required; on 401/403 the session is
     reset and re-warmed automatically (bounded by the HTTP client's attempts and circuit breaker)."""
@@ -298,6 +311,17 @@ class NseApi:
         data = self._get("corporate-announcements", params, timeout=(10.0, 120.0))
         return parse_announcements(data, symbols)
 
+    def live_equities(self, index: str = "SECURITIES IN F&O", symbols: Iterable[str] | None = None, *,
+                      deadline: float | None = None) -> LiveEquities:
+        """Today's running open / high / low / last price / volume of every stock of ``index`` in ONE call. ``deadline`` (a
+        ``clock.monotonic()`` instant) bounds every attempt, so a slow NSE cannot push the closing scan past its report deadline."""
+        data = self._get("equity-stockIndices", {"index": index}, timeout=(10.0, 60.0), deadline=deadline)
+        return parse_live_equities(data, set(symbols) if symbols is not None else None)
+
+    def all_indices(self, *, deadline: float | None = None) -> dict[str, dict[str, Any]]:
+        """Every NSE index live (Nifty 50, India VIX and the sector indices) keyed by its name, in one call."""
+        return parse_all_indices(self._get("allIndices", timeout=(10.0, 60.0), deadline=deadline))
+
     def event_calendar(self, start: date, end: date, symbols: set[str] | None = None) -> list[dict[str, Any]]:
         params = {"index": "equities", "from_date": f"{start:%d-%m-%Y}", "to_date": f"{end:%d-%m-%Y}"}
         data = self._get("event-calendar", params, timeout=(10.0, 120.0))
@@ -354,6 +378,79 @@ def parse_preopen(data: Any, wanted: set[str] | None = None) -> PreopenSnapshot:
             }
         )
     return PreopenSnapshot(iso(latest_ts) if latest_ts else None, rows)
+
+
+def _positive(value: Any) -> float | None:
+    """A finite number above zero, or ``None``: a live open of 0 is the state before the session opens, not a price."""
+    out = num(value)
+    return out if out is not None and out > 0 else None
+
+
+def _change_pct(last: float | None, prev: float | None) -> float | None:
+    return (last / prev - 1.0) * 100.0 if last is not None and prev is not None else None
+
+
+def parse_live_equities(data: Any, wanted: set[str] | None = None) -> LiveEquities:
+    """Normalise ``equity-stockIndices``. The first row of a list is the list's own index (its symbol is the list's name, for
+    instance ``SECURITIES IN F&O``): it is kept apart, never mixed with the stocks (NSE stock symbols never contain a space). A
+    stock row needs a last price and a previous close; every other figure that is absent stays ``None``."""
+    if not isinstance(data, Mapping):
+        return LiveEquities(None, [])
+    top_ts = parse_ts(data.get("timestamp"), assume_tz=IST)
+    metadata = data.get("metadata")
+    list_name = str(data.get("name") or (metadata.get("indexName") if isinstance(metadata, Mapping) else "") or "").strip().upper()
+    rows: list[dict[str, Any]] = []
+    index_row: dict[str, Any] | None = None
+    latest = top_ts
+    for item in data.get("data") or []:
+        if not isinstance(item, Mapping):
+            continue
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        last, prev = _positive(item.get("lastPrice")), _positive(item.get("previousClose"))
+        row_ts = parse_ts(item.get("lastUpdateTime"), assume_tz=IST) or top_ts
+        if " " in symbol or symbol.upper() == list_name:
+            if index_row is None and last is not None:
+                index_row = {"name": symbol, "last": last, "prev_close": prev, "change_pct": _change_pct(last, prev),
+                             "row_ts": iso(row_ts) if row_ts else None}
+            continue
+        if last is None or prev is None or (wanted is not None and symbol not in wanted):
+            continue
+        if row_ts and (latest is None or row_ts > latest):
+            latest = row_ts
+        rows.append(
+            {
+                "symbol": symbol, "open": _positive(item.get("open")), "high": _positive(item.get("dayHigh")),
+                "low": _positive(item.get("dayLow")), "last": last, "prev_close": prev, "change_pct": _change_pct(last, prev),
+                "volume": num(item.get("totalTradedVolume")), "turnover": num(item.get("totalTradedValue")),
+                "year_high": _positive(item.get("yearHigh")), "year_low": _positive(item.get("yearLow")),
+                "row_ts": iso(row_ts) if row_ts else None,
+            }
+        )
+    return LiveEquities(iso(latest) if latest else None, rows, index_row)
+
+
+def parse_all_indices(data: Any) -> dict[str, dict[str, Any]]:
+    """Normalise ``allIndices`` to ``{"NIFTY 50": {...}, "INDIA VIX": {...}, ...}`` (names upper-cased); rows without a last
+    value are dropped."""
+    if not isinstance(data, Mapping):
+        return {}
+    stamp = parse_ts(data.get("timestamp"), assume_tz=IST)
+    out: dict[str, dict[str, Any]] = {}
+    for item in data.get("data") or []:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("index") or item.get("indexSymbol") or "").strip()
+        last, prev = _positive(item.get("last")), _positive(item.get("previousClose"))
+        if not name or last is None:
+            continue
+        out[name.upper()] = {
+            "name": name, "last": last, "prev_close": prev, "open": _positive(item.get("open")),
+            "high": _positive(item.get("high")), "low": _positive(item.get("low")),
+            "change_pct": _change_pct(last, prev), "row_ts": iso(stamp) if stamp else None,
+        }
+    return out
 
 
 def parse_announcements(data: Any, symbols: set[str] | None = None) -> list[dict[str, Any]]:

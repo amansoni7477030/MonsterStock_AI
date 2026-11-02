@@ -95,6 +95,7 @@ def seeded(store: Store) -> Store:
                   (instrument, d(age), ts(0)))
         c.execute("INSERT INTO fno_daily (symbol, trade_date, received_at) VALUES ('AAA', ?, ?)", (d(age), ts(0)))
     for key, updated in (("evaluation:2019-01-01", ts(2000)), ("evaluation:2026-10-30", ts(3)),
+                         ("ideas:run:2019-01-01", ts(2000)), ("ideas:out:2019-01-01", ts(2000)), ("ideas:run:2026-10-30", ts(3)),
                          ("yahoo:fetched:GONE", ts(60)), ("yahoo:fetched:AAA", ts(1)), ("bootstrap.state", ts(900))):
         c.execute("INSERT INTO kv (key, value, updated_at) VALUES (?, 'v', ?)", (key, updated))
     return store
@@ -119,7 +120,8 @@ def test_expired_rows_go_and_recent_rows_stay(seeded, settings, clock):
     assert [r["trade_date"] for r in seeded.conn.execute("SELECT trade_date FROM fno_daily ORDER BY 1")] == [d(3000), d(1)]
     keys = {r["key"] for r in seeded.conn.execute("SELECT key FROM kv")}
     assert "evaluation:2019-01-01" not in keys and "yahoo:fetched:GONE" not in keys
-    assert {"evaluation:2026-10-30", "yahoo:fetched:AAA", "bootstrap.state"} <= keys  # state is never pruned by age
+    assert not {"ideas:run:2019-01-01", "ideas:out:2019-01-01"} & keys  # expired trade-idea records (frozen and judged) go together
+    assert {"evaluation:2026-10-30", "ideas:run:2026-10-30", "yahoo:fetched:AAA", "bootstrap.state"} <= keys  # state is never pruned by age
     assert report.total_rows > 0 and not report.notes
 
 

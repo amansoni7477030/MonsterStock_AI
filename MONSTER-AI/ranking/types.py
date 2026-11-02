@@ -109,6 +109,91 @@ class ReportContext:
         return cls(**payload)
 
 
+# ------------------------------------------------------------------------------------------ trade ideas
+HORIZONS = ("BTST", "SWING", "WATCH")  # buy before the close and sell next session | hold a few sessions | levels for tomorrow's intraday
+SIDES = ("LONG", "SHORT", "BOTH")
+GRADES = ("A", "B", "C")
+
+
+@dataclass
+class TradeIdea:
+    """One closing-hour trade idea: a setup, its mechanical ATR levels and the figures it was built on. ``score`` is a ranking aid
+    of the setup (0-100), never a probability."""
+
+    symbol: str
+    rank: int
+    horizon: str  # BTST | SWING | WATCH
+    side: str  # LONG | SHORT | BOTH (a WATCH idea has a trigger on each side)
+    setup: str  # the pattern in words, e.g. "strong close on volume"
+    score: float
+    grade: str  # A | B | C: bands of the score
+    ltp: float
+    name: str | None = None
+    sector: str | None = None
+    is_fno: bool = False
+    change_pct: float | None = None  # today's move so far, %
+    entry: float | None = None  # reference entry: the last price at the scan
+    max_entry: float | None = None  # do not chase beyond this (above for a long, below for a short)
+    stop: float | None = None
+    target1: float | None = None
+    target2: float | None = None
+    trigger_long: float | None = None  # WATCH: buy above this
+    trigger_short: float | None = None  # WATCH: sell below this
+    risk_pct: float | None = None  # entry to stop, % of the entry
+    reward1_pct: float | None = None
+    reward2_pct: float | None = None
+    rr1: float | None = None
+    rr2: float | None = None
+    hold: str = ""
+    reasons: list[str] = field(default_factory=list)
+    cautions: list[str] = field(default_factory=list)
+    catalysts: list[Catalyst] = field(default_factory=list)
+    turnover_cr: float | None = None
+    est_cost_pct: float | None = None  # all-in round trip, delivery-style, % of the position
+    metrics: dict[str, float] = field(default_factory=dict)  # the figures behind the idea, frozen with it
+
+    @property
+    def key(self) -> str:
+        """Identity inside one run: the same stock can appear under two horizons or sides."""
+        return f"{self.horizon}:{self.side}:{self.symbol}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TradeIdea:
+        payload = _filter_fields(cls, data)
+        payload["catalysts"] = [Catalyst.from_dict(c) if isinstance(c, dict) else c for c in payload.get("catalysts", [])]
+        return cls(**payload)
+
+
+@dataclass
+class IdeasReport:
+    """The frozen closing-hour report: what was seen at the scan, the ideas, and the live record that stands behind them."""
+
+    trade_date: str
+    snapshot_ist: str  # display string, e.g. "2026-11-02 14:31:00 IST"
+    entry_by: str  # IST wall clock after which the report says the entry window is over, e.g. "15:15"
+    source: str = ""  # where the live prices came from, and how many names they covered
+    ideas: list[TradeIdea] = field(default_factory=list)
+    market: dict[str, Any] = field(default_factory=dict)  # nifty_chg, vix, vix_chg, advancers, decliners, regime
+    record: dict[str, dict[str, Any]] = field(default_factory=dict)  # horizon -> live-record summary (see backtesting.ideas)
+    notes: list[str] = field(default_factory=list)
+    mode: str = "shadow"
+    universe_size: int = 0
+    n_eligible: int = 0
+    late: bool = False  # built after the report deadline: too little of the entry window is left to act (a very late retry, a manual run)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> IdeasReport:
+        payload = _filter_fields(cls, data)
+        payload["ideas"] = [TradeIdea.from_dict(i) if isinstance(i, dict) else i for i in payload.get("ideas", [])]
+        return cls(**payload)
+
+
 @dataclass
 class EveningRow:
     symbol: str

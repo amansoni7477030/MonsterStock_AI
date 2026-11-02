@@ -68,7 +68,7 @@ def test_doctor_reports_the_ai_services_as_optional_and_names_the_ones_that_are_
     report = doctor.DoctorReport()
     doctor._ai_config(report, load_settings())
     detail = report.checks[0].detail
-    assert "LLM via groq (openai/gpt-oss-120b, openai/gpt-oss-20b)" in detail and "Jev (jev-1.14.0)" in detail
+    assert "LLM via groq (openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)" in detail and "Jev (jev-1.14.0)" in detail
     assert "gsk_test" not in detail and "ts_test" not in detail
 
 
@@ -155,7 +155,7 @@ def test_main_reports_configuration_errors_with_exit_2(cli_env, monkeypatch, cap
 def test_jobs_lists_the_timetable(cli_env, capsys):
     assert run(["jobs"]) == 0
     out = capsys.readouterr().out
-    for name in ("collect_global", "prelim_scan", "final_scan", "ingest_eod", "backup", "train"):
+    for name in ("collect_global", "prelim_scan", "final_scan", "closing_scan", "ingest_eod", "evaluate_ideas", "backup", "train"):
         assert name in out
 
 
@@ -206,6 +206,37 @@ def test_scan_dry_run_prints_the_report_and_freezes_nothing(cli_env, monkeypatch
     assert run(["scan", "--stage", "pre", "--date", "2026-11-02", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "ABC" in out and "pre scan 2026-11-02: success" in out
+
+
+def test_ideas_dry_run_prints_the_report_and_freezes_nothing(cli_env, monkeypatch, capsys):
+    from automation import ideas
+    from automation.context import JobResult
+    from ranking.types import IdeasReport, TradeIdea
+
+    idea = TradeIdea(symbol="ABC", rank=1, horizon="BTST", side="LONG", setup="strong close on volume", score=71.0, grade="B",
+                     ltp=100.0, entry=100.0, stop=97.0, target1=104.0)
+    report = IdeasReport(trade_date="2026-11-02", snapshot_ist="2026-11-02 14:31:00 IST", entry_by="15:15", ideas=[idea]).to_dict()
+    seen = {}
+    monkeypatch.setattr(ideas, "run_closing_scan", lambda ctx: seen.update(dry=ctx.dry_run, key=ctx.run_key)
+                        or JobResult("success", "dry run", {"report": report}))
+    assert run(["ideas", "--date", "2026-11-02", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "ABC" in out and "Closing-hour trade ideas" in out and "closing scan 2026-11-02: success" in out
+    assert seen == {"dry": True, "key": "2026-11-02"}
+
+
+def test_ideas_runs_the_scheduler_job_and_reports_its_outcome(cli_env, monkeypatch, capsys):
+    from automation import jobs
+    from automation.context import JobResult
+
+    seen = {}
+    monkeypatch.setitem(jobs.FUNCTIONS, "closing_scan", lambda ctx: seen.update(force=ctx.force, key=ctx.run_key)
+                        or JobResult("success", "report sent"))
+    assert run(["ideas", "--date", "2026-11-02", "--force"]) == 0
+    assert seen == {"force": True, "key": "2026-11-02"} and "closing scan 2026-11-02: success - report sent" in capsys.readouterr().out
+    assert run(["ideas", "--date", "2026-11-02"]) == 0 and seen["force"] is False
+    monkeypatch.setitem(jobs.FUNCTIONS, "closing_scan", lambda ctx: JobResult("failed", "NSE live quotes unavailable"))
+    assert run(["ideas", "--date", "2026-11-02"]) == 1 and "failed - NSE live quotes unavailable" in capsys.readouterr().out
 
 
 def test_telegram_setup_discovers_and_writes_the_chat_id(cli_env, monkeypatch, capsys):
@@ -344,7 +375,7 @@ def _preview_env(monkeypatch, *, alert_chat="77"):
 def test_telegram_preview_lists_the_kinds_without_needing_telegram(cli_env, capsys):
     assert run(["telegram-preview", "--list"]) == 0
     out = capsys.readouterr().out
-    for kind in ("final", "prelim", "no-setup", "evening", "alert", "digest", "failure", "unit", "online"):
+    for kind in ("final", "prelim", "no-setup", "ideas", "evening", "alert", "digest", "failure", "unit", "online"):
         assert any(line.startswith(kind) for line in out.splitlines()), kind
 
 

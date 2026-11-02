@@ -106,6 +106,7 @@ def test_an_unsafe_job_suffix_is_never_echoed_into_a_command(suffix):
 def test_a_scan_hint_names_the_job_of_that_stage():
     assert style.scan_hint("pre") == "sudo monster-ai logs --job prelim_scan"
     assert style.scan_hint(" FINAL ") == "sudo monster-ai logs --job final_scan"
+    assert style.scan_hint("closing") == "sudo monster-ai logs --job closing_scan"
     assert style.scan_hint("weird") == style.scan_hint(None) == "sudo monster-ai jobs"
 
 
@@ -133,5 +134,5 @@ def test_no_suggested_command_changes_anything():
 
 def _all_suggested_commands() -> set[str]:
     commands = {command.replace("{rest}", "collect_india") for _, command in style._HINTS}
-    return commands | {style.scan_hint("pre"), style.scan_hint("final"), style.scan_hint(None), "sudo monster-ai logs",
-                       "sudo monster-ai health"}
+    return commands | {style.scan_hint("pre"), style.scan_hint("final"), style.scan_hint("closing"), style.scan_hint(None),
+                       "sudo monster-ai logs", "sudo monster-ai health"}

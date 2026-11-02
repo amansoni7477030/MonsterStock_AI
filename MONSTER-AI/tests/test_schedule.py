@@ -141,9 +141,70 @@ def test_slots_get_independent_run_keys(engine):
 
 def test_no_trading_jobs_on_weekend_but_backup_still_runs(engine, store):
     engine.clock.set(ist(*SAT, 6, 0))
-    pipeline = {"collect_global", "collect_news", "collect_india", "prelim_scan", "final_scan", "ingest_eod", "evaluate"}
+    pipeline = {"collect_global", "collect_news", "collect_india", "prelim_scan", "final_scan", "closing_scan", "ingest_eod", "evaluate",
+                "evaluate_ideas"}
     assert not pipeline & {d.entry.job for d in engine.due(ist(*SAT, 9, 10))}
+    assert not pipeline & {d.entry.job for d in engine.due(ist(*SAT, 14, 40))}
     assert "backup" in labels(engine.due(ist(*SAT, 23, 31)))
+
+
+# ------------------------------------------------------------------------------- the closing hour
+def test_the_closing_hour_is_scheduled_with_fresh_news_first_and_no_catch_up():
+    entries = {e.label: e for e in SCHEDULE}
+    scan, news = entries["closing_scan"], entries["collect_news#midday"]
+    assert (scan.at, scan.until, scan.days, scan.catch_up, scan.after) == ("14:30", "15:00", "trading", False, ())
+    assert news.until < scan.at  # the midday news pass is over before the scan reads the catalysts
+    assert JOBS["closing_scan"].critical and not JOBS["evaluate_ideas"].critical
+    assert scan.until < "15:05"  # the last retry still has room before the report deadline
+
+
+def test_the_closing_scan_opens_at_14_30_retries_every_minute_and_is_missed_after_15_00(engine, store):
+    assert "closing_scan" not in labels(engine.due(ist(*MON, 14, 29)))
+    first = [d for d in engine.due(ist(*MON, 14, 30, 1)) if d.entry.job == "closing_scan"]
+    assert len(first) == 1 and first[0].run_key == "2026-11-02" and first[0].critical and first[0].attempt == 1
+
+    engine.clock.set(ist(*MON, 14, 30, 5))
+    store.job_record("closing_scan", "2026-11-02", "failed", message="NSE live quotes unavailable")
+    assert "closing_scan" not in labels(engine.due(ist(*MON, 14, 30, 40)))  # the 60 s retry delay has not passed
+    second = [d for d in engine.due(ist(*MON, 14, 31, 10)) if d.entry.job == "closing_scan"]
+    assert len(second) == 1 and second[0].attempt == 2 and not second[0].last_attempt
+
+    assert "closing_scan" not in labels(engine.due(ist(*MON, 15, 1)))  # past its window: not retried
+    assert store.job_runs_for("closing_scan", "2026-11-02")[-1]["status"] == "missed"
+    alert = next(a for a in store.pending_alerts(50) if a["code"] == "job_missed_closing_scan")
+    assert alert["level"] == "error"
+
+
+def test_the_last_closing_scan_attempt_is_flagged(engine, store):
+    engine.clock.set(ist(*MON, 14, 30, 5))
+    for _ in range(4):
+        store.job_record("closing_scan", "2026-11-02", "failed", message="NSE live quotes unavailable")
+    engine.clock.set(ist(*MON, 14, 40))
+    (last,) = [d for d in engine.due() if d.entry.job == "closing_scan"]
+    assert last.attempt == 5 and last.last_attempt  # the failure notice goes out on this one
+
+
+def test_the_midday_news_pass_has_its_own_run_key(engine):
+    midday = next(e for e in SCHEDULE if e.label == "collect_news#midday")
+    assert run_key_for(midday, ist(*MON, 13, 40).date()) == "2026-11-02:midday"
+    assert "collect_news#midday" in labels(engine.due(ist(*MON, 13, 41)))
+
+
+def test_the_ideas_are_evaluated_only_after_the_official_end_of_day_data_is_in(engine, store):
+    now = ist(*MON, 18, 40)
+    assert "evaluate_ideas" not in labels(engine.due(now))  # ingest_eod has not run
+    store.job_record("ingest_eod", "2026-11-02", "success")
+    assert "evaluate_ideas" in labels(engine.due(now))
+
+
+def test_a_missed_ideas_evaluation_is_caught_up_the_next_morning(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    fake_clock.set(ist(2026, 11, 2, 5, 0))
+    eng = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)
+    store.kv_set("daemon.first_start", "2026-10-25T00:00:00Z")
+    store.job_record("ingest_eod", "2026-11-02", "success")
+    pairs = [(d.entry.job, d.run_key) for d in eng.due(ist(2026, 11, 3, 7, 0))]
+    assert ("evaluate_ideas", "2026-11-02") in pairs and ("closing_scan", "2026-11-02") not in pairs
 
 
 def test_catch_up_runs_yesterdays_eod_chain_in_order(store, settings, fake_clock):

@@ -9,10 +9,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from app.clock import iso, ist_date
+from app.clock import IST, iso, ist_date
+from notifications import ideas as idea_messages
 from notifications import report
 from notifications.telegram import MAX_MESSAGE_CHARS, split_message
-from ranking.types import Candidate, Catalyst, EveningRow, EveningSummary, ReportContext
+from ranking.ideas import BTST_PLAN, SWING_PLAN, WATCH_PLAN
+from ranking.types import (
+    Candidate,
+    Catalyst,
+    EveningRow,
+    EveningSummary,
+    IdeasReport,
+    ReportContext,
+    TradeIdea,
+)
 
 PREVIEW_BANNER = "🧪 <b>SAMPLE PREVIEW</b> - made-up data, not a market signal"
 
@@ -21,6 +31,7 @@ KINDS = {
     "final": "the 09:12 report with a validated model",
     "prelim": "the optional 08:45 preliminary report (shadow model: tiers capped at WATCH)",
     "no-setup": "the report on a morning without a high-conviction setup",
+    "ideas": "the 14:30 closing-hour trade ideas (BTST, swing, bearish F&O, tomorrow's intraday watchlist) with their live record",
     "evening": "the after-close evaluation with the live record",
     "alert": "one operational alert of each severity",
     "digest": "several queued alerts in one message",
@@ -115,6 +126,61 @@ def _alerts() -> list[tuple[str, str, str]]:
     ]
 
 
+def _ideas_report(today: str, now: datetime) -> IdeasReport:
+    """A closing-hour report with every kind of list, an unvalidated record and a validated one."""
+    cut = now.astimezone(IST)
+    btst = TradeIdea(
+        symbol="DEMOONE", rank=1, horizon="BTST", side="LONG", setup="closing strength with a breakout", score=82.4, grade="A",
+        ltp=842.1, name="Demo One Motors Ltd", sector="Automobile", is_fno=True, change_pct=2.9, entry=842.1, max_entry=845.4,
+        stop=831.6, target1=852.0, target2=861.5, risk_pct=1.25, reward1_pct=1.18, reward2_pct=2.30, rr1=0.94, rr2=1.84,
+        hold=BTST_PLAN.hold,
+        reasons=["closing near the day's high (position in the day's range 0.93)", "volume 2.1x its 20-day average (projected for the full day)",
+                 "trading beyond its prior 20-day high", "sector peers +1.1% today"],
+        cautions=["RSI 71: already stretched"],
+        catalysts=[Catalyst(headline="Demo order win of Rs 900 crore", source="Demo Wire", url="https://example.com/demo-order",
+                            source_class="exchange_filing", polarity=0.7, severity=0.6, confidence=0.8)],
+        turnover_cr=412.5, est_cost_pct=0.31,
+    )
+    swing = TradeIdea(
+        symbol="DEMOTWO", rank=1, horizon="SWING", side="LONG", setup="pullback to the 20-day average in an uptrend", score=71.2,
+        grade="B", ltp=1530.4, name="Demo Two Bank Ltd", sector="Financial Services", is_fno=True, change_pct=0.8, entry=1530.4,
+        max_entry=1537.0, stop=1488.0, target1=1590.0, target2=1648.0, risk_pct=2.77, reward1_pct=3.89, reward2_pct=7.69, rr1=1.4,
+        rr2=2.78, hold=SWING_PLAN.hold,
+        reasons=["trend aligned: above its 20 and 50-day averages", "pullback to the 20-day average in an uptrend"],
+        cautions=["results / board meeting in 3 sessions: gap risk"], turnover_cr=188.0, est_cost_pct=0.33,
+    )
+    short = TradeIdea(
+        symbol="DEMOTRE", rank=1, horizon="BTST", side="SHORT", setup="weak close on volume", score=66.0, grade="C", ltp=310.2,
+        name="Demo Three Metals Ltd", sector="Metals & Mining", is_fno=True, change_pct=-2.4, entry=310.2, max_entry=309.6, stop=315.0,
+        target1=305.6, target2=301.4, risk_pct=1.55, reward1_pct=1.48, reward2_pct=2.84, rr1=0.96, rr2=1.84,
+        hold=BTST_PLAN.hold,
+        reasons=["closing near the day's low (position in the day's range 0.08)"], cautions=["market regime is bullish: this side is discounted"],
+        turnover_cr=96.0, est_cost_pct=0.36,
+    )
+    watch = TradeIdea(
+        symbol="DEMOFOR", rank=1, horizon="WATCH", side="BOTH", setup="tight range below the 20-day high", score=74.0, grade="B",
+        ltp=2204.0, name="Demo Four Pharma Ltd", sector="Healthcare", is_fno=False, change_pct=0.2, trigger_long=2216.5, trigger_short=2181.0,
+        hold=WATCH_PLAN.hold,
+        reasons=["typical daily range 2.1% (ATR): room to move", "last 5 sessions' range 0.71x the 20-day average: coiled"],
+        cautions=["a gap at the open can jump past the level: do not chase it"], turnover_cr=64.0,
+        metrics={"long_stop": 2193.6, "long_target1": 2229.8, "long_target2": 2250.2,
+                 "short_stop": 2203.4, "short_target1": 2168.0, "short_target2": 2147.0},
+    )
+    return IdeasReport(
+        trade_date=today, snapshot_ist=f"{cut:%Y-%m-%d %H:%M:%S} IST", entry_by="15:15", source="NSE (SECURITIES IN F&O): 196 of 201 names with a complete live row",
+        ideas=[btst, swing, short, watch],
+        market={"nifty_chg": 0.37, "vix": 13.2, "vix_chg": -2.9, "advancers": 133, "decliners": 61, "regime": "bullish"},
+        record={
+            "BTST": {"group": "BTST", "n": 64, "days": 22, "pending": 0, "validated": True, "win_rate": 0.58, "win_ci": [0.51, 0.65],
+                     "mean_net_pct": 0.21, "mean_net_ci": [0.04, 0.38], "t1_rate": 0.44, "stop_rate": 0.31, "mean_gap_pct": 0.18},
+            "SWING": {"group": "SWING", "n": 12, "days": 8, "pending": 3, "validated": False, "win_rate": 0.5, "win_ci": [0.3, 0.7],
+                      "mean_net_pct": 0.4, "mean_net_ci": [-0.8, 1.6], "t1_rate": 0.33, "stop_rate": 0.25, "mean_gap_pct": 0.1},
+        },
+        notes=["sample preview: nothing in this message is real", "volume is projected to a full day: 79% of a session's volume is normally traded by now (an estimate)"],
+        universe_size=201, n_eligible=164,
+    )
+
+
 def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
     """``[(kind, messages)]`` in sending order; ``now`` (aware) supplies the date and the alert times."""
     today = ist_date(now).isoformat()
@@ -131,6 +197,7 @@ def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
         ("no-setup", report.render_final_report(_context(
             today, stage="final", status="validated", model="demo-model-0.1", candidates=[], no_setup=True,
             no_setup_reason="the top probability is only 33% and no name cleared the conviction gates"))),
+        ("ideas", idea_messages.render_ideas_report(_ideas_report(today, now))),
         ("evening", report.render_evening_report(_evening(today))),
         ("alert", [report.render_alert(level, code, message, created_at=stamp) for level, code, message in alerts]),
         ("digest", report.render_alert_digest(digest)),

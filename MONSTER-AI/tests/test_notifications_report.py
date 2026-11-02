@@ -773,6 +773,17 @@ def test_failure_notice_states_reason_and_never_implies_no_setups():
     assert note.startswith("💡 <b>No candidate list was published for this date.</b>") and "not a market signal" in note
 
 
+def test_failure_notice_of_the_closing_scan_speaks_of_trade_ideas_not_of_large_move_candidates():
+    messages = render_failure_notice("2026-11-02", "closing", "NSE live quotes unavailable")
+    assert_telegram_safe(messages)
+    got = lines(messages)
+    assert "🎯 <b>CLOSING-HOUR IDEAS</b> · 📅 Mon 02 Nov 2026" in got
+    assert "🛠 <b>Next step:</b> <code>sudo monster-ai logs --job closing_scan</code>" in got
+    note = next(ln for ln in got if ln.startswith("💡"))
+    assert note.startswith("💡 <b>No trade ideas were published for this date.</b>") and "not a market signal" in note
+    assert "there is nothing to trade" in note and "large-move" not in note
+
+
 @pytest.mark.parametrize(
     "details, expected",
     [

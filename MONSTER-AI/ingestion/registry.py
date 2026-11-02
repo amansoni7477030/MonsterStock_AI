@@ -94,6 +94,18 @@ SOURCES: tuple[dict[str, Any], ...] = (
         failure_behavior="Coverage gap flagged; scheduled-results features default to 0", backup_source="rss_news", criticality="important",
     ),
     dict(
+        source_id="nse_live_quotes", provider="NSE public JSON API (equity-stockIndices, allIndices)",
+        endpoint="https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O ; /api/allIndices",
+        coverage="Every F&O stock (or a broader index list) in ONE call: today's open, high, low, last price, previous close, volume and traded value so far, plus the 52-week range; Nifty 50, India VIX and the sector indices live",
+        timestamp_meaning="lastUpdateTime per stock, exchange time in IST (parsed with an explicit IST assumption)",
+        update_frequency="Live during the session (seconds to a minute behind); the final values after the close",
+        history_depth="Live only (not point-in-time reconstructable): every trade idea freezes the figures it was based on",
+        rate_limits="Same session as nse_api_market: cookie handshake, ~1 request/second; the closing-hour scan makes two calls; frequent 401/403 from datacentre IPs",
+        license_notes=EXCHANGE_PUBLIC + " Endpoints are undocumented and may change without notice.",
+        failure_behavior="The closing-hour scan fails visibly and retries inside its window (nothing is guessed from older data, and a snapshot that is not from today is refused); the morning scans do not use it",
+        backup_source=None, criticality="optional",
+    ),
+    dict(
         source_id="rss_news", provider="Publisher RSS/Atom feeds (data/seeds/feeds.json)",
         endpoint="Per feed", coverage="Indian and global business, markets, geopolitics, central banks, regulators",
         timestamp_meaning="Publisher timestamp when present; first_seen_at is always recorded separately",
@@ -114,7 +126,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         coverage="Structured event extraction from news text: event type, entities with their direction, severity, horizon, event time and a verbatim evidence quote",
         timestamp_meaning="n/a", update_frequency="On demand (cost-capped: per-run call and time budgets, 14-day result cache)",
         history_depth="n/a",
-        rate_limits="Groq free tier (measured live): 8,000 tokens per minute, 200,000 tokens per day and 1,000 requests per day for each model, about 2,000 tokens per extraction, so roughly 4 extractions per minute and about 100 a day per model; a rate-limited model hands over to the fallback model at once, a short Retry-After is waited out, a long one starts a cooldown that survives between runs",
+        rate_limits="Groq free tier (measured live): 8,000 tokens per minute, 200,000 tokens per day and 1,000 requests per day for each model, about 2,000 tokens per extraction, so roughly 4 extractions per minute and about 100 a day per model; every model of the chain (gpt-oss-120b, gpt-oss-20b, qwen3.8-27b by default, `LLM_FALLBACK_MODELS` adds more) has its own allowance, a rate-limited model hands over to the next one at once and is used again once its limit has reset, a short Retry-After is waited out when every model is limited, a long one starts a cooldown that survives between runs",
         license_notes="Governed by the chosen provider's terms; only public news text is sent - never keys, positions or other data.",
         failure_behavior="Deterministic rule-based extraction; report states reduced coverage; repeated failures appear in source health",
         backup_source="rules", criticality="optional",
@@ -153,7 +165,7 @@ def register_all(store: Any) -> int:
 def _fetch_strategy() -> dict[str, str]:
     """How each source is requested (transport, spacing, batching), phrased from the code's own constants (lazy imports keep this
     module light for the callers that only need ``tracked``)."""
-    from app.config import GROQ_FALLBACK_MODEL, GROQ_MODEL
+    from app.config import GROQ_EXTRA_FALLBACK_MODELS, GROQ_FALLBACK_MODEL, GROQ_MODEL
     from ingestion.news_sources import FEED_DISABLE_AFTER, FEED_DISABLE_HOURS, FEED_FULL_REFRESH_HOURS
     from ingestion.pipeline import PROBE_MAX_AGE
     from ingestion.yahoo import SPARK_MAX_SYMBOLS
@@ -185,6 +197,11 @@ def _fetch_strategy() -> dict[str, str]:
             "every 20 minutes. One pre-open call returns the whole book (polled every 15 s until final prices are published or "
             "the report cutoff, each call bounded by that deadline); GIFT Nifty comes from the market-status call; the holiday "
             "list is one call a day."),
+        "nse_live_quotes": (
+            "client `nse_api` (same session and cookie handshake as the pre-open book): ONE `equity-stockIndices` call returns the "
+            "running figures of the whole F&O segment (a second list is requested only for a larger universe) and ONE `allIndices` "
+            "call the indices; both are bounded by the report deadline of the closing-hour scan. Rows whose stamp is not today's "
+            "date are not today's session and are refused."),
         "nse_announcements": (
             "client `nse_api` (same session): one call per date window for all symbols (filtered locally); the board-meeting "
             "calendar likewise."),
@@ -195,8 +212,11 @@ def _fetch_strategy() -> dict[str, str]:
         "gdelt": "client `gdelt`: one request per configured query, 6 s apart, back-off on 429.",
         "llm_extraction": (
             "not scraped: the provider's own API through a `requests` session. `GROQ_API_KEY` selects Groq "
-            f"(`{GROQ_MODEL}`, then `{GROQ_FALLBACK_MODEL}` when the first is rate-limited or retired; strict JSON-schema output with "
-            "a per-model capability ladder); `LLM_API_BASE` + `LLM_MODEL` select any other OpenAI-compatible provider. Per-run call "
+            f"(`{GROQ_MODEL}`, then `{GROQ_FALLBACK_MODEL}`, then {', '.join(f'`{name}`' for name in GROQ_EXTRA_FALLBACK_MODELS)}; "
+            "`LLM_FALLBACK_MODELS` adds or replaces the later ones: Groq limits tokens and requests per model, so each model of the "
+            "chain brings its own allowance. A rate-limited model hands over to the next at once and is asked again once its limit has "
+            "reset; a retired or not enabled model is skipped for the run; strict JSON-schema output with a per-model capability "
+            "ladder); `LLM_API_BASE` + `LLM_MODEL` select any other OpenAI-compatible provider. Per-run call "
             f"and time budgets, a 14-day result cache keyed by the article text, bounded retries that honour `Retry-After` (up to "
             f"{int(RETRY_AFTER_CAP_SEC)} s; a longer wait is a quota and starts a cooldown of at most {int(COOLDOWN_MAX_SEC // 3600)} h "
             "that survives between runs)."),

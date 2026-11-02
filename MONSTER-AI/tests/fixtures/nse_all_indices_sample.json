@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "key": "BROAD MARKET INDICES", "index": "NIFTY 50", "indexSymbol": "NIFTY 50",
+      "last": 24380.4, "variation": 90.4, "percentChange": 0.37, "open": 24310.5, "high": 24398.2, "low": 24270.1,
+      "previousClose": 24290.0, "yearHigh": 26277.35, "yearLow": 21281.75, "advances": "33", "declines": "16"
+    },
+    {
+      "key": "SECTORAL INDICES", "index": "NIFTY BANK", "indexSymbol": "NIFTY BANK",
+      "last": 52140.0, "variation": -120.0, "percentChange": -0.23, "open": 52300.0, "high": 52410.0, "low": 52010.0,
+      "previousClose": 52260.0
+    },
+    {
+      "key": "OTHERS", "index": "INDIA VIX", "indexSymbol": "INDIA VIX",
+      "last": 13.2, "variation": -0.4, "percentChange": -2.94, "open": 13.5, "high": 13.6, "low": 13.1, "previousClose": 13.6
+    },
+    {"index": "NIFTY NOLAST", "last": null, "previousClose": 10},
+    {"index": "", "last": 10},
+    "not a row"
+  ],
+  "timestamp": "02-Nov-2026 14:31",
+  "marketStatus": {"market": "Capital Market", "marketStatus": "Open"}
+}

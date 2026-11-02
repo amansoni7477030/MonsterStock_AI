@@ -254,6 +254,16 @@ def test_the_bundle_carries_the_ai_counter_values_and_nothing_else_from_the_cach
     assert "cached article text" not in database_state(store)  # the cached answers are never dumped
 
 
+def test_the_bundle_shows_how_many_answers_each_model_of_the_chain_gave(store):
+    from app.diagnostics import database_state
+
+    store.kv_set("llm.model:openai/gpt-oss-120b", "31")
+    store.kv_set("llm.model:qwen/qwen3.8-27b", "9")
+    section = database_state(store).split("==== ai services")[1].split("====")[1]
+    assert '"key": "llm.model:openai/gpt-oss-120b", "value": "31"' in section
+    assert '"key": "llm.model:qwen/qwen3.8-27b", "value": "9"' in section
+
+
 def test_diag_bundles_are_pruned_to_the_newest_few(tmp_path):
     from automation.retention import DIAG_KEEP, prune_diag_bundles
 

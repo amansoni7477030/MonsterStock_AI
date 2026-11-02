@@ -19,9 +19,10 @@ from app import jsonutil
 from app.clock import Clock, at_ist, get_clock, iso, parse_date
 from app.errors import DataUnavailable
 from app.logging_setup import exception_site, redact, register_secret
+from notifications import ideas as idea_messages
 from notifications import report
 from notifications.telegram import MAX_MESSAGE_CHARS, DeadlineExceeded, TelegramClient, split_message
-from ranking.types import EveningSummary, ReportContext
+from ranking.types import EveningSummary, IdeasReport, ReportContext
 
 log = logging.getLogger(__name__)
 
@@ -147,6 +148,46 @@ class NotificationService:
         except Exception as exc:
             return self._render_failed(kind, key, trade_date, exc)
         return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date)
+
+    def ideas_delivered(self, trade_date: str) -> bool:
+        """Whether the closing-hour report of ``trade_date`` was sent (what was said is then the record of that day)."""
+        return self._duplicate(f"ideas:{trade_date}") is not None
+
+    def send_ideas(self, ideas_report: IdeasReport, *, force: bool = False) -> DeliveryResult:
+        """Send the closing-hour trade-idea report once per trade date. It is time-critical: a report that would go out after
+        ``ideas_report_deadline_time`` is withheld (the entry window is nearly over) unless ``force`` is set, which a manual run
+        uses; the report then says itself that it is late."""
+        trade_date = str(getattr(ideas_report, "trade_date", "") or "").strip()
+        try:
+            parse_date(trade_date)
+        except (TypeError, ValueError):
+            return self._reject(f"invalid trade_date {trade_date!r}")
+        kind, key = "ideas_report", f"ideas:{trade_date}"
+        duplicate = self._duplicate(key)
+        if duplicate:
+            return duplicate
+        if not self.settings.send_ideas_report:
+            return self._withhold(kind, key, trade_date, "ideas_disabled")
+        chat_id = self.settings.telegram_chat_id
+        if not self._can_send(chat_id):
+            return self._withhold(kind, key, trade_date, "telegram_not_configured", warn=True)
+        deadline = at_ist(trade_date, self.settings.ideas_report_deadline_time)
+        if self.clock.now() > deadline and not force:
+            withheld = self._withhold(kind, key, trade_date, "deadline_missed", warn=True)
+            self.alert(  # queued only: the scheduler's flush delivers it
+                "warning",
+                "ideas_deadline_missed",
+                f"the closing-hour ideas for {trade_date} were withheld: the send attempt came after the "
+                f"{self.settings.ideas_report_deadline_time} IST deadline",
+                dedupe_key=f"delivery:{key}",
+                deliver_now=False,
+            )
+            return withheld
+        try:
+            messages = idea_messages.render_ideas_report(ideas_report)
+        except Exception as exc:
+            return self._render_failed(kind, key, trade_date, exc)
+        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline)
 
     def send_failure_notice(
         self, trade_date: str, stage: str, reason: str, details: Any = None

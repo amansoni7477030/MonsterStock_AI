@@ -23,7 +23,7 @@ from tests.test_news_support import (
 
 GROQ_KEY = "gsk_test_groq_key_1234567890"
 JEV_KEY = "ts_test_typesafe_key_1234567890"
-PRIMARY, FALLBACK = "openai/gpt-oss-120b", "openai/gpt-oss-20b"
+PRIMARY, FALLBACK, THIRD = "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"
 QUOTE = "received a Rs 5,000 crore order from NTPC"
 
 
@@ -35,7 +35,7 @@ def reply(**over) -> str:
 
 
 def groq_models(*names):
-    return FakeResponse(200, {"object": "list", "data": [{"id": name} for name in (names or (PRIMARY, FALLBACK))]})
+    return FakeResponse(200, {"object": "list", "data": [{"id": name} for name in (names or (PRIMARY, FALLBACK, THIRD))]})
 
 
 def jev_models(*names):
@@ -112,7 +112,14 @@ def test_an_unreachable_service_fails_with_the_exception_type_only(groq, fake_cl
 
 def test_a_configured_model_missing_from_the_listing_is_a_warning_not_a_failure(groq, fake_clock):
     check = check_llm(groq, session=FakeSession(ok(reply()), gets=[groq_models(FALLBACK)]), clock=fake_clock)
-    assert check.status == "warn" and check.usable and f"not listed for this key: {PRIMARY}" in check.detail
+    assert check.status == "warn" and check.usable and f"not listed for this key: {PRIMARY}, {THIRD}" in check.detail
+
+
+def test_every_model_of_the_chain_is_checked_against_the_listing(groq, fake_clock):
+    only_first_two = check_llm(groq, deep=False, session=FakeSession(ok(reply()), gets=[groq_models(PRIMARY, FALLBACK)]), clock=fake_clock)
+    assert only_first_two.status == "warn" and f"not listed for this key: {THIRD}" in only_first_two.detail
+    pair = dataclasses.replace(groq, llm_fallback_models=())
+    assert check_llm(pair, deep=False, session=FakeSession(ok(reply()), gets=[groq_models(PRIMARY, FALLBACK)]), clock=fake_clock).status == "ok"
 
 
 def test_a_provider_without_a_model_list_is_still_checked_with_a_real_request(groq, fake_clock):

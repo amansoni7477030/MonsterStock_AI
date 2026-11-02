@@ -200,6 +200,35 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return EXIT_OK if result.status in {"success", "skipped"} else EXIT_FAIL
 
 
+def cmd_ideas(args: argparse.Namespace) -> int:
+    """The closing-hour trade-idea scan (BTST, swing, bearish F&O, next-day watchlist) now: ``--dry-run`` prints the report and freezes
+    and sends nothing; without it the scheduler's own job runs (frozen once per day, Telegram report)."""
+    from automation import ideas
+    from automation.context import JobContext
+    from automation.runner import execute_job
+    from notifications import ideas as renderer
+    from notifications.telegram import to_plain_text
+    from ranking.types import IdeasReport
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    day = _parse_day(args.date).isoformat()
+    if not args.dry_run:
+        result = execute_job(settings, "closing_scan", day, force=args.force, install_signal=True)
+    else:
+        store = _open_store(settings)
+        try:
+            ctx = JobContext.create(settings, store, run_key=day, dry_run=True, force=args.force)
+            result = ideas.run_closing_scan(ctx)
+        finally:
+            store.close()
+        report = result.metrics.get("report")
+        if report:
+            print("\n\n".join(to_plain_text(part) for part in renderer.render_ideas_report(IdeasReport.from_dict(report))))
+    print(f"closing scan {day}: {result.status} - {result.message}")
+    return EXIT_OK if result.status in {"success", "skipped"} else EXIT_FAIL
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from automation.runner import execute_job
 
@@ -650,6 +679,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date")
     p.add_argument("--dry-run", action="store_true", help="print the report; freeze and send nothing")
     p.add_argument("--force", action="store_true")
+    p = add("ideas", cmd_ideas, "run the closing-hour trade-idea scan now (BTST, swing, bearish F&O, next-day watchlist)")
+    p.add_argument("--date")
+    p.add_argument("--dry-run", action="store_true", help="print the report; freeze and send nothing")
+    p.add_argument("--force", action="store_true", help="scan again if today's frozen report was never delivered; send even after the deadline")
     p = add("evaluate", cmd_evaluate, "evaluate a day's predictions")
     p.add_argument("--date")
     p = add("train", cmd_train, "train the models now")

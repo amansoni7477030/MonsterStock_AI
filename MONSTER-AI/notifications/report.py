@@ -37,7 +37,10 @@ VALIDATED_LABEL = "VALIDATED: official exchange data"
 
 _MODEL_BADGES = {"validated": ("✅", "VALIDATED"), "baseline": ("📏", "BASELINE (no trained model)")}
 _SHADOW_BADGE = ("🧪", "SHADOW - unvalidated")
-_STAGE_LABELS = {"pre": "PRELIMINARY", "final": "FINAL"}
+_STAGE_LABELS = {"pre": "PRELIMINARY", "final": "FINAL", "closing": "CLOSING-HOUR IDEAS"}
+# what a failure notice says was not published, and what its absence must not be read as, per stage
+_NOT_PUBLISHED = {"closing": ("No trade ideas were published for this date.", "there is nothing to trade")}
+_NOT_PUBLISHED_DEFAULT = ("No candidate list was published for this date.", "there are no large-move setups")
 _CAPPED_TIERS = frozenset({"STRONG", "MODERATE"})
 
 _HIT_KEY = re.compile(r"^hit_(\d+)(?:[._](\d+))?$")
@@ -717,10 +720,11 @@ def render_failure_notice(trade_date: Any, stage: Any, reason: Any, details: Any
     detail_text = _details_text(details)
     if detail_text:
         lines.append(f"🔎 <b>Details:</b> {_fit(detail_text, 700)}")
+    published, nothing = _NOT_PUBLISHED.get(_clean(stage).lower(), _NOT_PUBLISHED_DEFAULT)
     lines += [
         style.RULE,
-        "💡 <b>No candidate list was published for this date.</b> This is a health notice, not a market signal: "
-        "it does not mean there are no large-move setups, only that the scan could not be completed safely "
+        f"💡 <b>{published}</b> This is a health notice, not a market signal: "
+        f"it does not mean {nothing}, only that the scan could not be completed safely "
         "and on time.",
         f"🛠 <b>Next step:</b> <code>{style.scan_hint(stage)}</code>",
     ]
