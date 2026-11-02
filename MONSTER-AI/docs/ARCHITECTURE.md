@@ -18,24 +18,25 @@ Companion documents: [README](../README.md) (overview and quick start), [OPERATI
 3. [Data flow](#data-flow)
 4. [Daily timeline](#daily-timeline)
 5. [The scan, step by step](#the-scan-step-by-step)
-6. [News intelligence and the optional AI services](#news-intelligence-and-the-optional-ai-services)
-7. [Packages](#packages)
-8. [Point-in-time correctness](#point-in-time-correctness)
-9. [Models and governance](#models-and-governance)
-10. [Honesty rules](#honesty-rules)
-11. [Scheduling and self-healing](#scheduling-and-self-healing)
-12. [Network layer: curl_cffi, bulk fetching, rate limits](#network-layer-curl_cffi-bulk-fetching-rate-limits)
-13. [Exchange calendar for any month and year](#exchange-calendar-for-any-month-and-year)
-14. [Time zones](#time-zones)
-15. [Storage and bounded retention](#storage-and-bounded-retention)
-16. [Logging and diagnostics](#logging-and-diagnostics)
-17. [Degradation matrix](#degradation-matrix)
-18. [External training and off-box storage](#external-training-and-off-box-storage)
-19. [Deployment topology](#deployment-topology)
-20. [Security](#security)
-21. [Resource budget](#resource-budget)
-22. [Design decisions](#design-decisions)
-23. [Deviations from the blueprint](#deviations-from-the-blueprint)
+6. [The closing-hour trade ideas](#the-closing-hour-trade-ideas)
+7. [News intelligence and the optional AI services](#news-intelligence-and-the-optional-ai-services)
+8. [Packages](#packages)
+9. [Point-in-time correctness](#point-in-time-correctness)
+10. [Models and governance](#models-and-governance)
+11. [Honesty rules](#honesty-rules)
+12. [Scheduling and self-healing](#scheduling-and-self-healing)
+13. [Network layer: curl_cffi, bulk fetching, rate limits](#network-layer-curl_cffi-bulk-fetching-rate-limits)
+14. [Exchange calendar for any month and year](#exchange-calendar-for-any-month-and-year)
+15. [Time zones](#time-zones)
+16. [Storage and bounded retention](#storage-and-bounded-retention)
+17. [Logging and diagnostics](#logging-and-diagnostics)
+18. [Degradation matrix](#degradation-matrix)
+19. [External training and off-box storage](#external-training-and-off-box-storage)
+20. [Deployment topology](#deployment-topology)
+21. [Security](#security)
+22. [Resource budget](#resource-budget)
+23. [Design decisions](#design-decisions)
+24. [Deviations from the blueprint](#deviations-from-the-blueprint)
 
 ## System context
 
@@ -184,28 +185,35 @@ flowchart TB
         M6 --> M7["09:00:30 refresh_preopen"]
         M7 --> M8["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
     end
+    subgraph MID["Closing hour"]
+        direction TB
+        C1["13:40 collect_news (midday)"] --> C2["14:30 closing_scan<br/>report by 15:05, enter before 15:15"]
+    end
     subgraph EVE["After the close"]
         direction TB
         E1["17:45 ingest_eod"] --> E2["18:15 evaluate"]
-        E2 --> E3["20:00 health_check"]
+        E2 --> E2B["18:30 evaluate_ideas"]
+        E2B --> E3["20:00 health_check"]
         E3 --> E4["23:30 backup"]
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
-    class M6,M7,M8 critical
+    class M6,M7,M8,C2 critical
 ```
 
 | Time | Job | Purpose |
 |------|-----|---------|
 | 06:00 | `collect_global` | global closes, live context, GIFT Nifty (retried until 08:30) |
-| 06:30 / 08:10 | `collect_news` | RSS (conditional GET), GDELT, filings, board meetings, event extraction |
+| 06:30 / 08:10 / 13:40 | `collect_news` | RSS (conditional GET), GDELT, filings, board meetings, event extraction; the 13:40 pass gives the closing scan fresh catalysts |
 | 07:50 | `health_check` | operational alerts (also 20:00) |
 | 08:00 | `collect_india` | previous session completeness: official file first, Yahoo as repair |
 | 08:45 | `prelim_scan` | preliminary report (**critical**); first repairs the previous session when `collect_india` left it below 90 % coverage |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (**critical**) |
 | 09:08:45 | `final_scan` | final report with pre-open gaps, delivered by 09:12 (**critical**, hard deadline 09:14:30) |
+| 14:30 | `closing_scan` | closing-hour trade ideas from NSE's live quotes, delivered by 15:05 (**critical**, retried every minute until 15:00) |
 | 17:45 | `ingest_eod` | official end-of-day files |
 | 18:15 | `evaluate` | outcomes, metrics, evening report |
+| 18:30 | `evaluate_ideas` | the earlier trade ideas judged on the official bars, outcomes stored apart from the frozen reports |
 | 23:30 / 23:50 | `backup`, `housekeeping` | verified online backup (+ off-box copy); retention, official-bar upgrade, basis repair, DB maintenance |
 | Sat 02:00 | `train` | walk-forward retraining (skipped in external mode) |
 | Sun 04:00 | `refresh_universe` | index / F&O membership, history for new names, event-graph re-seeding and weekly re-estimation of its edge sensitivities |
@@ -247,6 +255,68 @@ sequenceDiagram
 Key properties: the snapshot is frozen **before** delivery, so a Telegram outage can never lose or change a report; a
 retry re-sends the frozen report; a report that would arrive after the deadline is withheld and an alert is queued; the
 pre-open wait is bounded by the same deadline, so a slow provider cannot push the report past its cutoff.
+
+## The closing-hour trade ideas
+
+A second daily report, built around 14:30 IST from the same kinds of parts: the stored daily history, a live feed, a frozen
+report, an idempotent delivery and an after-the-close evaluation. It is **not** the calibrated model: the setups are heuristics with
+mechanical levels, and the system says so until a list's live record passes its own gate (`backtesting/ideas.py`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SCH as Scheduler
+    participant RUN as closing_scan job
+    participant NSE as NSE API
+    participant DB as SQLite
+    participant NEWS as news pipeline
+    participant TG as Telegram
+
+    SCH->>RUN: start at 14:30
+    RUN->>DB: trading day? report frozen and delivered?
+    alt a frozen report exists
+        RUN->>TG: re-send it, no new scan
+    else first run of the day
+        RUN->>NSE: live quotes of the F&O segment, then the indices
+        NSE-->>RUN: rows stamped by the answer, or nothing
+        Note over RUN: refuse: not from today, too few complete rows, a gap in the stored history
+        alt refused
+            RUN->>DB: alert ideas_scan_failed, retry in a minute
+        else usable
+            Note over RUN: swing features, setups, gates, mechanical levels
+            RUN->>NEWS: catalysts of the shortlist
+            NEWS-->>RUN: confirmed bad news vetoes an idea
+            RUN->>DB: freeze the report under ideas:run:date
+            RUN->>TG: deliver via ledger, deadline 15:05
+        end
+    end
+    Note over DB: evening: evaluate_ideas on the official bars, outcomes kept apart under ideas:out:date
+```
+
+How it is built:
+
+- **Live feed** (`ingestion/nse.py`, `ingestion/pipeline.py`): one request returns every F&O stock's running open, high, low, last price,
+  previous close and volume, one more the indices. NSE renamed the list endpoint in 2026, so the client tries the current names first
+  (`equity-stockIndex` for the F&O segment, `equity-stock-indices` for an index list, the retired `equity-stockIndices` last), moves on
+  only on a 404 and remembers the name that answered. The answer's own timestamp stamps every row (the per-stock `lastUpdateTime` is a
+  placeholder) and a snapshot that is not from today is refused.
+- **Features** (`features/swing.py`): the live row is laid over the stored history as the session in progress and the features are
+  computed as of that session (unshifted, unlike the morning model's, which only ever sees the previous one). Volume is projected to a
+  full day with a U-shaped intraday profile (an approximation the report states) and the ATR comes from the previous close.
+  A name whose live previous close differs from the stored one by more than 2 % (an ex-date) is left out.
+- **Setups, gates and levels** (`ranking/ideas.py`): fixed, documented components become a 0-100 score per setup (BTST long and short,
+  swing long and short, watchlist); gates cover liquidity, price, history, event dates, regime and a Nifty crash; stops and targets are
+  multiples of the previous ATR with a structural stop and a minimum reward to risk; the estimated delivery cost must be small
+  against the first target (`ranking/costs.py`); confirmed news can veto or discount an idea, a rumour is only mentioned.
+- **Freeze once, never edit** (`automation/ideas.py`): the report is stored under `ideas:run:<date>` before delivery and re-sent
+  unchanged by a retry. A forced scan may replace a frozen report only when nobody received it. `evaluate_ideas` judges the ideas
+  on the official bars (`backtesting/ideas.py`: the first of the stop, the first target and the end of the horizon, a gap through the
+  stop exits at the open, the stop wins a day that touches both) and stores the outcomes under `ideas:out:<date>`; the live record
+  of the next report is built from them, per list, with sample sizes and day-block bootstrap intervals, and a list passes its gate
+  only with at least 60 judged ideas over 20 days and both intervals clear of no-edge.
+- **Rendering and delivery** (`notifications/ideas.py`, `NotificationService.send_ideas`): the same guarantees as the other reports
+  (escaping, `n/a` for a missing figure, messages of at most 3,900 characters, an idempotent ledger) plus a score that is never drawn
+  as a probability and a report withheld after 15:05 unless forced (then marked late and kept out of the record).
 
 ## News intelligence and the optional AI services
 
@@ -316,8 +386,8 @@ sequenceDiagram
             S-->>P: nothing, the rules decide
         else admitted
             S->>API: POST with bearer key and timeout
-            opt Groq: 429 on the first model
-                S->>API: same request to the fallback model
+            opt Groq: 429 on a model
+                S->>API: same request to the next model of the chain
             end
             alt valid answer
                 API-->>S: JSON
@@ -346,7 +416,7 @@ sequenceDiagram
 
 | | Groq LLM (`llm_extraction`) | Web check (`llm_web`) | Jev (`jev_judgment`) |
 |---|---|---|---|
-| Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (Groq's production open-weight models: the larger for accuracy, the smaller as headroom because Groq's rate limits are per model) | the same models, when they offer the `browser_search` tool (the gpt-oss family only) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
+| Model | a chain: `openai/gpt-oss-120b`, then `openai/gpt-oss-20b`, then `qwen/qwen3.8-27b` (Groq's open-weight models: the largest for accuracy, the others as headroom because Groq's rate limits are per model, so every model adds its own allowance; `LLM_MODEL`, `LLM_FALLBACK_MODEL` and `LLM_FALLBACK_MODELS` set it). A rate-limited model cools down until its own limit resets and the best free model is used again as soon as it can be; a model that is gone or blocked for the account (404 / 403) is dropped for the run; Qwen runs in its plain mode and `<think>` blocks are stripped | the same chain, restricted to the models that offer the `browser_search` tool (the gpt-oss family only) | `jev-1.14.0`, pinned (the `jev-latest` alias moves without notice) |
 | What it is | a text model: reads the article and returns structured JSON | Groq's built-in, server-side web search (powered by Exa) driven by a gpt-oss model. A request of its own, because Groq documents that browser search cannot be combined with structured outputs | a decision model: reads the article as a typed state and returns calibrated probabilities. It is not a price forecaster and not a chat model |
 | Asked | event type, entities with a direction, severity, horizon, event time, a verbatim evidence quote | do independent outlets report the same facts, did anyone deny or correct them, was the event already public; up to three facts and the hosts relied on | event type (27-way choice), rumour, denial, severity (5 levels), direction for the company in focus |
 | Trusted when | the evidence quote is found word for word in the text and every entity resolves to a known instrument; an unverified answer is capped at confidence 0.4 and cannot change the type, severity, horizon, time or any direction (it can only add companies the text really names) | every field is validated (allowed words, bounded integers, real booleans, link-free single-line facts, plausible host names); acted on alone only for a **sourced denial** (it names a reputable publisher of the source registry: an exchange, an official body, a wire or a business newspaper) whose facts are not confirmed | probability and confidence reach `JEV_MIN_CONFIDENCE` (0.5); a rumour or denial flag needs p >= 0.5 + `JEV_MIN_CONFIDENCE` / 2 |
@@ -370,7 +440,7 @@ results) is single-line, length-capped and stripped of control characters and of
 The web check searches the public web; nothing of yours is sent with the request. Its time share is a hard bound: every request of
 every service is given at most what is left of the run's wall-clock budget (and is not started when almost nothing is left), so a
 slow provider cannot overrun it. The web check and the extraction share Groq's per-model token quota; when it is spent the
-extraction hands over to its fallback model and the web check backs off. A search is by far the most expensive call (about
+extraction hands over to the next model of its chain and the web check (which only has the gpt-oss models) backs off. A search is by far the most expensive call (about
 7 000 tokens, measured: the pages it reads count as input tokens, charged to the per-minute and to the per-day limit, so about 28
 of them use up a free-tier model's 200 000 tokens a day), hence a daily cap besides the per-job one (`LLM_WEB_MAX_PER_DAY`, counted per
 IST day in `kv`): retries and manual runs cannot add up to a day of tokens that the extraction needs.
@@ -389,13 +459,13 @@ the batches of a drained backlog) are in `news.last_run`, and what the web check
 | [app/](../app) | configuration (single typed catalogue in `config.py`, generates `.env.example`), injectable clock (UTC instants, IST market logic, display zone), logging (daily files, secret redaction, crash hooks) with the `logs` / `diag` tools, code fingerprint (`release.py`), file locks, resource guards (RSS watchdog, disk, RAM), CLI, `doctor`, error hierarchy |
 | [ingestion/](../ingestion) | the curl_cffi HTTP transport (`http.py`: browser impersonation, adaptive per-source rate limit, retries, circuit breaker, deadlines), Yahoo (chart + bulk `spark` probe), NSE archive and API clients, validation, universe building, freshness / data-quality gate, split-adjusted reads (`adjust.py`) and basis-break repair (`basis.py`), news collectors (RSS conditional GET), source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
 | [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups with a size budget (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
-| [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader |
+| [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader; `swing.py`, the as-of-session features of the closing-hour trade ideas (volume projected to a full day) |
 | [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, then the optional Groq LLM `llm.py`, its web check `web.py` and Jev `jev.py` behind the shared safety rails of `remote.py`; `context.py` holds the facts both readers receive; `ai_check.py` is the live self-check behind `ai-test`), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
-| [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates, abstention, baselines |
-| [notifications/](../notifications) | Telegram client, report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`), idempotent delivery with a ledger and deadline guard |
-| [automation/](../automation) | the scan, all jobs, the schedule engine, the daemon, the job runner, bootstrap, health, the exchange calendar, bounded-storage retention |
-| [backtesting/](../backtesting) | outcome evaluation (provisional -> official), metrics with day-block bootstrap intervals, the live range-forecast record and its slices, walk-forward backtest |
+| [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates (intraday and delivery-style), abstention, baselines; `ideas.py`, the closing-hour trade ideas: setups, gates, mechanical ATR levels, news veto, market regime |
+| [notifications/](../notifications) | Telegram client, report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`, `ideas.py` the closing-hour report), idempotent delivery with a ledger and deadline guard |
+| [automation/](../automation) | the scan, the closing-hour ideas scan and evaluation (`ideas.py`), all jobs, the schedule engine, the daemon, the job runner, bootstrap, health, the exchange calendar, bounded-storage retention |
+| [backtesting/](../backtesting) | outcome evaluation (provisional -> official), metrics with day-block bootstrap intervals, the live range-forecast record and its slices, walk-forward backtest; `ideas.py`, the outcome rules and the live-record gate of the trade ideas |
 | [dashboard/](../dashboard) | optional read-only FastAPI dashboard (loopback by default) |
 | [deployment/](../deployment) | installer, systemd units, remote deploy scripts - see [deployment/README.md](../deployment/README.md) |
 | [scripts/](../scripts) | `generate_docs.py`: regenerates `.env.example` and `docs/DATA_SOURCES.md` from the code (tests fail when they drift) |
@@ -759,6 +829,7 @@ foreign-key-safe transactions that never starve the scheduler's heartbeat of the
 | pre-open and live quotes | 400 days; every pre-open poll is kept 14 days, then only the last one per symbol and day | `QUOTE_RETENTION_DAYS` |
 | daily bars, F&O rows | `HISTORY_YEARS` + 1 years (the oldest data ever read) | `HISTORY_YEARS` |
 | snapshots, predictions, outcomes, metrics, graph edge history | 1825 days (immutable: pruned explicitly, children before parents) | `RECORD_RETENTION_DAYS` |
+| trade-idea reports and their outcomes (`ideas:run:`, `ideas:out:` in `kv`) | 1825 days after their last update | `RECORD_RETENTION_DAYS` |
 | job runs, deliveries, alerts | 180 days (delivered alerts: half) | `OPS_RETENTION_DAYS` |
 | backups | 7 daily + 4 weekly **and** a total size budget | `BACKUP_KEEP_*`, `BACKUP_MAX_MB` |
 | logs | 30 days within a 150 MB budget; today's files are never removed | `LOG_RETENTION_DAYS`, `LOG_MAX_MB` |
@@ -777,7 +848,7 @@ flowchart TB
     HK["housekeeping job, 23:50 IST daily"] --> RET["run_retention"]
     RET --> PR["disk pressure from free space<br/>ok x1, warn x0.5, critical x0.25<br/>(over the data budget: x0.5)"]
     PR --> TB["table policies, children first<br/>outcomes, predictions, snapshots, quotes, news events,<br/>alerts, deliveries, job runs, metrics, F&O, bars,<br/>graph edge history"]
-    PR --> KV["kv rules: evaluation summaries,<br/>fetch markers, a stale prune flag"]
+    PR --> KV["kv rules: evaluation summaries,<br/>trade-idea records, fetch markers,<br/>a stale prune flag"]
     PR --> FS["file sweeps: cache, tmp, backup leftovers,<br/>quarantine, diagnostic bundles, logs"]
     PR --> BK["backups: 7 daily + 4 weekly<br/>within the total size budget"]
     TB --> DBM["maintain_database<br/>WAL checkpoint, PRAGMA optimize,<br/>VACUUM when due, worthwhile and safe"]
@@ -833,6 +904,11 @@ flowchart TB
 | Failure | Behaviour |
 |---------|-----------|
 | NSE API blocked / pre-open empty | final scan uses the `pre` model for names without a pre-open price and says so; if the book never arrives the report is still sent, marked |
+| NSE live quotes blocked, not from today, or too few complete rows (14:30 scan) | the closing-hour scan **fails visibly** (`ideas_scan_failed`, a notice on the last attempt), retries every minute until 15:00 and sends no ideas: nothing is guessed from older prices |
+| NSE renames its live-quote endpoint again | the client tries the known names, moves on only on a 404 and names them in the error; until the code is updated the scan fails visibly as above |
+| Stored history incomplete before the closing scan | the scan stops and says which session is missing (`run collect_india`); a special session such as Muhurat trading is tolerated |
+| Closing-hour report ready after 15:05 | frozen and withheld (`ideas_deadline_missed`); `ideas --force` sends it marked late, and it never counts toward the live record |
+| Nifty or VIX quotes missing at 14:30 | the scan goes on without them and the report's notes say that Nifty and VIX are not shown and relative strength to Nifty is not used |
 | Yahoo down or rate limited | official bhavcopy first; global block is withheld only when >= 6 critical series are stale, otherwise degraded with warnings; the client slows that source down and a circuit breaker stops hammering it |
 | curl_cffi unusable (missing wheel, rejected profile) | automatic fallback to `requests`, logged once; some providers may then block the client |
 | Previous session incomplete | repair from the official file; if coverage stays low the data-quality gate **blocks** the scan, alerts and (on the last attempt of the final scan) tells you why |
@@ -840,7 +916,7 @@ flowchart TB
 | Split / bonus with an ex-date today | the name is scored without its meaningless opening gap; the vendor is asked until the split is recorded, the operator is told after six sessions |
 | Holiday list of a new year not published | rule-based holidays plus the live pre-open confirmation; `holiday_inferred` alert and no report on a closed day |
 | RSS feeds failing | news catalysts reduce to "coverage reduced" in the report; scoring continues; a failing feed is parked for 24 h |
-| Groq LLM or Jev unavailable, unconfigured, rate-limited or rejected | the rules alone; the circuit opens for the run (at once on a rejected key), a quota starts a cooldown that survives between runs, the report's coverage note names the service, `source_health` warns after repeated failures |
+| Groq LLM or Jev unavailable, unconfigured, rate-limited or rejected | the rules alone; a rate-limited Groq model hands over to the next one of the chain and only when all are limited does the run wait (at most 30 s) or stop; the circuit opens for the run (at once on a rejected key), a quota starts a cooldown that survives between runs, the report's coverage note names the service, `source_health` warns after repeated failures |
 | Web check unavailable (plan or model refuses the tool, slow or failing search) | the item is extracted and judged without it; the web check has its own circuit and a 6 h back-off, so the extraction is untouched; `source_health` (`llm_web`) warns after repeated failures |
 | No active model, corrupt artifact, wrong feature version | automatic rollback, then heuristic baseline with the honest label |
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |

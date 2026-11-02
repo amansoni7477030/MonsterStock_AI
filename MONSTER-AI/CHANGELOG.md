@@ -5,6 +5,71 @@ follow [Semantic Versioning](https://semver.org/). Database migrations are forwa
 *Removed*), so every release below can be installed over the previous one (`deployment/install.sh` is idempotent and rolls back
 by itself).
 
+## [Unreleased]
+
+Closing-hour trade ideas (BTST, swing, bearish F&O and a next-day intraday watchlist) and a longer Groq model chain. No database
+migration; the new records live in the key-value store under `ideas:` and are pruned with the other records.
+
+### Upgrade notes
+
+- **New jobs and schedule entries** (picked up when the scheduler restarts): `collect_news` at 13:40 (slot `midday`), `closing_scan`
+  at 14:30 (retried every minute until 15:00) and `evaluate_ideas` after `ingest_eod`. Run `sudo monster-ai jobs` to see them.
+- **New settings** (safe defaults, see `.env.example`): `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true), `IDEAS_REPORT_DEADLINE_TIME`
+  (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS`
+  (true) and `LLM_FALLBACK_MODELS`. The afternoon report goes to the same Telegram chat as the morning one; `SEND_IDEAS_REPORT=false`
+  keeps the ideas computing, freezing and evaluating without sending, `IDEAS_ENABLED=false` switches the feature off.
+- **With a Groq key the news layer now has three models**, not two: `qwen/qwen3.8-27b` follows `openai/gpt-oss-20b`. Set
+  `LLM_FALLBACK_MODELS=none` to keep the old pair, or list your own further models. Run `sudo monster-ai ai-test --list-only`: it
+  warns about a model of the chain that the key cannot see.
+
+### Added
+
+- **Closing-hour trade ideas** (`automation/ideas.py`, `ranking/ideas.py`, `features/swing.py`, `backtesting/ideas.py`,
+  `notifications/ideas.py`; CLI `monster-ai ideas [--dry-run] [--force]`): at 14:30 IST NSE's live quotes for the whole F&O segment (one
+  request) are laid over the stored daily history as the session in progress, with volume projected to a full day by a typical
+  intraday profile. Four lists come out, five names each by default: **BTST** (buy before the close, sell in the next session),
+  **swing** (hold up to five sessions), **bearish** setups (BTST and swing mirrors, F&O names only) and a **watchlist** of buy / sell
+  levels for the next day's intraday trading. Every idea has an entry reference with a "do not chase" price, a stop, two targets (all
+  mechanical multiples of the previous ATR, the stop at the nearer of that multiple and the day's or week's extreme), the reward to
+  risk, the estimated delivery cost, reasons and cautions. Gates: liquidity, price, history length, a stop within `IDEAS_MAX_RISK_PCT`,
+  a reward of at least 1.5 times the risk, a cost of at most a quarter of the first target, no BTST into a results announcement due
+  today or tomorrow, no overnight trade against a Nifty move of 2 % or more, and a veto for confirmed bad news (rumours are only
+  mentioned). The news pipeline adds the catalysts of the shortlist (the new 13:40 news pass keeps them fresh).
+- **Honest by construction.** A score is a weighted mean of fixed, documented components and is called a score, never a probability.
+  Each list shows its own live record with sample sizes and 95 % intervals and is only called validated after 60 judged ideas over 20
+  days with intervals that clear no-edge. The report is frozen once per day (`ideas:run:<date>`), re-sent unchanged after a failed
+  delivery, and never replaced once it was delivered; `evaluate_ideas` judges the ideas on the official bars (the first of the stop, the
+  first target and the end of the horizon, a gap through the stop exits at the open, a stop touched on the day of a target wins) and
+  keeps the outcomes apart (`ideas:out:<date>`); outcomes on provisional bars wait for the official file; a report built after the
+  15:05 deadline is withheld unless forced, marked *late* and left out of the record.
+- **It refuses to guess.** No live quotes, quotes that are not from today, a gap in the stored history (special sessions such as
+  Muhurat trading are tolerated), a history without the previous closes or too few names with a complete row fail the scan with the
+  alert `ideas_scan_failed` and, on the last attempt, a notice; a name whose price basis differs from the stored history is left out.
+- **`telegram-preview --only ideas`** sends a sample of the report with made-up data.
+- **Groq model chain** (`news_intelligence/llm.py`, `app/config.py`): the extractor walks `openai/gpt-oss-120b` ->
+  `openai/gpt-oss-20b` -> `qwen/qwen3.8-27b`; Groq's limits are per model, so the free tier's throughput roughly triples (about 12
+  extractions a minute and 300 a day). A rate-limited model is parked until its own limit resets and the best model is used again as
+  soon as it is free (before, the last model that answered 429 decided how long a job gave up); a model that is gone, retired or
+  blocked for the account (404 / 403) is dropped for the run; only when all are gone is the service stopped. Qwen runs in its plain
+  mode (`reasoning_effort` none) and `<think>` blocks are stripped from any reply. Per-model counters (`llm.model:<name>`) are in
+  `monster-ai diag`, `doctor` and `ai-test` show the chain.
+
+### Changed
+
+- The failure notice names the closing-hour scan as such (`CLOSING-HOUR IDEAS`, "no trade ideas were published", its own log hint)
+  instead of the large-move wording of the morning notices.
+- The retention table lists the trade-idea records (`ideas:` prefix, `RECORD_RETENTION_DAYS`).
+
+### Found against live services (2026-11-02) and fixed
+
+- **NSE retired `equity-stockIndices`** (HTTP 404 for every list, also for Nifty 50). The F&O segment is now served by
+  `equity-stockIndex` and the index lists by `equity-stock-indices`; the client tries the current names first, the retired one last,
+  moves on only on a 404 and remembers the name that answered. `allIndices` was unchanged.
+- **The per-stock `lastUpdateTime` of the F&O list is not a trade time** (144 of 218 rows carried the placeholder `31-DEC-2999`, the
+  others the date of some old update) and its prices come as text; a first version that required today's date on every row would
+  have refused the whole answer. Every row now carries the answer's own timestamp, and a stamp on a row is not trusted.
+- `ai-test --list-only` confirmed that the project's Groq key lists all three models of the chain.
+
 ## [1.0.0] - 2026-11-01
 
 First complete release: a shadow-mode NSE large-move intelligence engine that runs unattended on a 1 GB / 8 GB Ubuntu

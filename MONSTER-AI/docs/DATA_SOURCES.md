@@ -11,7 +11,7 @@ Generated from `ingestion/registry.py` (run `python scripts/generate_docs.py`). 
 | `nse_lists` | important | NSE archives (index constituents, F&O lot sizes) | seed_universe |
 | `nse_api_market` | important | NSE public JSON API (marketStatus, pre-open, holidays) | yahoo_quote |
 | `nse_announcements` | important | NSE corporate announcements API | rss_news |
-| `nse_live_quotes` | optional | NSE public JSON API (equity-stockIndices, allIndices) | - |
+| `nse_live_quotes` | optional | NSE public JSON API (equity-stockIndex / equity-stock-indices, allIndices) | - |
 | `rss_news` | important | Publisher RSS/Atom feeds (data/seeds/feeds.json) | gdelt |
 | `gdelt` | optional | GDELT Project DOC 2.0 API | rss_news |
 | `llm_extraction` | optional | Groq (open-weight gpt-oss models) or any OpenAI-compatible LLM API | rules |
@@ -120,16 +120,16 @@ Every scraped or public source is reached through one client, `ingestion.http.Ht
 - **Failure behaviour:** Coverage gap flagged; scheduled-results features default to 0
 - **Backup source:** rss_news
 
-## `nse_live_quotes` - NSE public JSON API (equity-stockIndices, allIndices)
+## `nse_live_quotes` - NSE public JSON API (equity-stockIndex / equity-stock-indices, allIndices)
 
-- **Endpoint:** `https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O ; /api/allIndices`
-- **Coverage:** Every F&O stock (or a broader index list) in ONE call: today's open, high, low, last price, previous close, volume and traded value so far, plus the 52-week range; Nifty 50, India VIX and the sector indices live
-- **Timestamp meaning:** lastUpdateTime per stock, exchange time in IST (parsed with an explicit IST assumption)
+- **Endpoint:** `https://www.nseindia.com/api/equity-stockIndex?index=SECURITIES%20IN%20F%26O ; /api/equity-stock-indices?index=NIFTY%20500 ; /api/allIndices`
+- **Coverage:** Every F&O stock (or a broader index list) in ONE call: today's open, high, low, last price, previous close, volume so far, plus the 52-week range; Nifty 50, India VIX and the sector indices live
+- **Timestamp meaning:** the answer's own `timestamp`, exchange time in IST (parsed with an explicit IST assumption) and the stamp of every row; the per-stock `lastUpdateTime` is a placeholder (31-DEC-2999) or the date of an old update and is NOT read
 - **Update frequency:** Live during the session (seconds to a minute behind); the final values after the close
 - **History depth:** Live only (not point-in-time reconstructable): every trade idea freezes the figures it was based on
 - **Rate limits:** Same session as nse_api_market: cookie handshake, ~1 request/second; the closing-hour scan makes two calls; frequent 401/403 from datacentre IPs
-- **Transport and request strategy:** client `nse_api` (same session and cookie handshake as the pre-open book): ONE `equity-stockIndices` call returns the running figures of the whole F&O segment (a second list is requested only for a larger universe) and ONE `allIndices` call the indices; both are bounded by the report deadline of the closing-hour scan. Rows whose stamp is not today's date are not today's session and are refused.
-- **Licensing:** Published by NSE for public download/consumption; automated bulk use is subject to NSE terms - confirm entitlement for production; a licensed NSE data feed or broker API is the supported route. Endpoints are undocumented and may change without notice.
+- **Transport and request strategy:** client `nse_api` (same session and cookie handshake as the pre-open book): ONE `equity-stockIndex` call returns the running figures of the whole F&O segment (a larger universe adds one `equity-stock-indices` call per index list; the retired `equity-stockIndices` is tried last, and only a 404 moves on to the next name) and ONE `allIndices` call the indices; both are bounded by the report deadline of the closing-hour scan. The answer's own timestamp is the stamp of every row, and one that is not today's date is not today's session and is refused.
+- **Licensing:** Published by NSE for public download/consumption; automated bulk use is subject to NSE terms - confirm entitlement for production; a licensed NSE data feed or broker API is the supported route. Endpoints are undocumented and may change without notice (NSE retired `equity-stockIndices` in 2026).
 - **Failure behaviour:** The closing-hour scan fails visibly and retries inside its window (nothing is guessed from older data, and a snapshot that is not from today is refused); the morning scans do not use it
 - **Backup source:** none
 

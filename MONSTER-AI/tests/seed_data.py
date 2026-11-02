@@ -149,7 +149,7 @@ LIVE_STAMP = "2026-11-02T09:00:00Z"  # 14:30 IST on the FakeClock day
 def live_rows(panel: Panel, *, moves: dict[str, float] | None = None, strength: dict[str, float] | None = None,
               volume: dict[str, float] | None = None, fraction: float = 0.79, stamp: str = LIVE_STAMP, default_move: float = 0.1,
               ) -> list[dict[str, Any]]:
-    """The live ``equity-stockIndices`` rows (as ``parse_live_equities`` returns them) of today's session in progress for every
+    """The live stock-list rows (as ``parse_live_equities`` returns them) of today's session in progress for every
     symbol of ``panel``, which ends on the previous session. ``moves`` is the change in % (default a flat day), ``strength`` the
     position of the last price in the day's range (0 = at the low, 1 = at the high) and ``volume`` today's projected-day volume
     relative to the 20-day average (default 1.0); ``fraction`` is the share of that volume done by the stamp."""

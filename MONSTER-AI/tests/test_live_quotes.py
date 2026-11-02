@@ -1,4 +1,5 @@
-"""NSE live quotes: the ``equity-stockIndices`` / ``allIndices`` parsers, the two client calls and the collection helpers."""
+"""NSE live quotes: the stock-list and ``allIndices`` parsers, the client calls (and the endpoint NSE renamed) and the collection helpers.
+The fixtures keep the shape of NSE's answers as they were read from the live site in November 2026, with made-up figures."""
 
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ from ingestion.nse import LiveEquities
 from ingestion.registry import SOURCES
 from tests.helpers import FakeResponse, FakeSession, fixture_json
 
+STAMP = "2026-11-02T09:01:00Z"  # 14:31:00 IST: the answer's own timestamp
+
 
 def row(symbol: str, **over):
     base = {"symbol": symbol, "open": 100.0, "high": 103.0, "low": 99.0, "last": 102.0, "prev_close": 100.0, "change_pct": 2.0,
@@ -21,17 +24,24 @@ def row(symbol: str, **over):
 
 
 # ------------------------------------------------------------------------------------------ parsers
-def test_live_equities_are_normalised_and_the_lists_own_index_row_is_kept_apart():
+def test_the_f_and_o_answer_is_normalised_and_every_row_carries_the_answers_own_stamp():
     snapshot = nse.parse_live_equities(fixture_json("nse_live_equities_sample.json"))
-    assert [r["symbol"] for r in snapshot.rows] == ["RELIANCE", "TCS", "M&M", "INFY"]  # the index row, junk and unusable rows are out
+    assert [r["symbol"] for r in snapshot.rows] == ["RELIANCE", "TCS", "M&M", "INFY"]  # the junk and the unusable rows are out
     reliance = snapshot.rows[0]
     assert (reliance["open"], reliance["high"], reliance["low"], reliance["last"], reliance["prev_close"]) == (1251.0, 1286.5, 1249.0, 1284.2, 1248.6)
-    assert reliance["volume"] == 11250000 and reliance["turnover"] == 1.4e10 and reliance["year_high"] == 1608.95
+    assert reliance["volume"] == 11250000 and reliance["turnover"] is None and reliance["year_high"] == 1608.95  # prices come as text
     assert reliance["change_pct"] == pytest.approx((1284.2 / 1248.6 - 1) * 100)
-    assert reliance["row_ts"] == "2026-11-02T09:00:58Z"  # 14:30:58 IST
-    assert snapshot.index == {"name": "SECURITIES IN F&O", "last": 24380.4, "prev_close": 24290.0,
-                              "change_pct": pytest.approx((24380.4 / 24290.0 - 1) * 100), "row_ts": "2026-11-02T09:00:59Z"}
-    assert snapshot.source_ts == "2026-11-02T09:01:00Z"  # the newest stamp of the answer (14:31:00 IST)
+    assert snapshot.index is None and snapshot.source_ts == STAMP  # the F&O list has no row of its own index
+    # the per-row lastUpdateTime is a placeholder (31-DEC-2999) or the date of an old update: never read as the time of a trade
+    assert {r["row_ts"] for r in snapshot.rows} == {STAMP}
+
+
+def test_an_index_list_starts_with_the_index_itself_which_has_no_symbol_and_is_kept_apart():
+    snapshot = nse.parse_live_equities(fixture_json("nse_live_index_list_sample.json"))
+    assert [r["symbol"] for r in snapshot.rows] == ["RELIANCE", "BAJAJ-AUTO"]
+    assert snapshot.index == {"name": "NIFTY 500", "last": 22090.0, "prev_close": 21900.0,
+                              "change_pct": pytest.approx((22090.0 / 21900.0 - 1) * 100), "row_ts": STAMP}
+    assert snapshot.rows[0]["volume"] == 11250000 and snapshot.source_ts == STAMP
 
 
 def test_numbers_written_as_text_with_thousands_separators_dashes_and_zeros_are_read_defensively():
@@ -44,7 +54,14 @@ def test_numbers_written_as_text_with_thousands_separators_dashes_and_zeros_are_
 def test_a_stock_needs_a_last_price_and_a_previous_close_and_the_wanted_symbols_filter():
     snapshot = nse.parse_live_equities(fixture_json("nse_live_equities_sample.json"), {"INFY", "NOQUOTE", "NOPREV", "OTHER"})
     assert [r["symbol"] for r in snapshot.rows] == ["INFY"]
-    assert snapshot.rows[0]["year_high"] is None and snapshot.rows[0]["row_ts"] == "2026-11-02T09:01:00Z"  # no own stamp: the answer's
+    assert snapshot.rows[0]["year_high"] is None and snapshot.rows[0]["row_ts"] == STAMP
+
+
+def test_an_answer_without_its_own_timestamp_gives_rows_without_a_stamp_so_none_can_pass_as_todays():
+    data = {"data": [{"symbol": "INFY", "lastPrice": "1508", "previousClose": "1496", "open": "1500", "dayHigh": "1512",
+                      "dayLow": "1490", "totalTradedVolume": 100, "lastUpdateTime": "02-Nov-2026 14:30:00"}]}
+    snapshot = nse.parse_live_equities(data)
+    assert snapshot.source_ts is None and snapshot.rows[0]["row_ts"] is None  # a stamp on the row itself is not trusted
 
 
 def test_a_stock_symbol_with_an_ampersand_is_a_stock_but_a_name_with_a_space_is_an_index():
@@ -56,6 +73,12 @@ def test_a_stock_symbol_with_an_ampersand_is_a_stock_but_a_name_with_a_space_is_
     ]}
     snapshot = nse.parse_live_equities(data)
     assert [r["symbol"] for r in snapshot.rows] == ["M&M", "BAJAJ-AUTO"] and snapshot.index["name"] == "NIFTY 500"
+
+
+def test_a_stocks_identifier_is_never_taken_for_its_symbol():
+    data = {"timestamp": "02-Nov-2026 14:31:00", "data": [{"identifier": "RELIANCEEQN", "lastPrice": 1284.2, "previousClose": 1248.6}]}
+    snapshot = nse.parse_live_equities(data)
+    assert snapshot.rows == [] and snapshot.index is None  # no space in it: not an index either
 
 
 @pytest.mark.parametrize("garbage", [None, [], "text", 42, {}, {"data": None}, {"data": "x"}])
@@ -75,18 +98,24 @@ def test_all_indices_are_keyed_by_upper_case_name_and_unusable_rows_are_dropped(
 
 
 # ------------------------------------------------------------------------------------------- client
-def api_for(settings, fake_clock, calls):
+def api_for(settings, fake_clock, calls, *, answers=None):
+    """An ``NseApi`` over scripted responses: ``answers`` maps an endpoint name to its response (default: the real shapes)."""
+    served = {"equity-stockIndex": FakeResponse(200, fixture_json("nse_live_equities_sample.json")),
+              "equity-stock-indices": FakeResponse(200, fixture_json("nse_live_index_list_sample.json")),
+              "allIndices": FakeResponse(200, fixture_json("nse_all_indices_sample.json")),
+              "equity-stockIndices": FakeResponse(404, b"<title>Resource not found</title>"), **(answers or {})}
+
     def handler(url, kwargs):
         calls.append((url, kwargs.get("params")))
         if url == nse.HOME:
             return FakeResponse(200, b"<html/>")
-        if "equity-stockIndices" in url:
-            return FakeResponse(200, fixture_json("nse_live_equities_sample.json"))
-        if "allIndices" in url:
-            return FakeResponse(200, fixture_json("nse_all_indices_sample.json"))
-        raise AssertionError(url)
+        return served[url.rsplit("/", 1)[-1]]
 
     return nse.NseApi(settings, http=HttpClient("nse", session=FakeSession(handler), clock=fake_clock))
+
+
+def asked(calls):
+    return [(url.rsplit("/", 1)[-1], params) for url, params in calls if url != nse.HOME]
 
 
 def test_the_client_asks_for_one_list_and_one_index_call(settings, fake_clock):
@@ -95,14 +124,64 @@ def test_the_client_asks_for_one_list_and_one_index_call(settings, fake_clock):
     snapshot = api.live_equities("SECURITIES IN F&O", ["RELIANCE", "INFY"])
     assert [r["symbol"] for r in snapshot.rows] == ["RELIANCE", "INFY"]
     assert api.all_indices()["INDIA VIX"]["last"] == 13.2
-    assert [(url.rsplit("/", 1)[-1], params) for url, params in calls if url != nse.HOME] == [
-        ("equity-stockIndices", {"index": "SECURITIES IN F&O"}), ("allIndices", None)]
+    assert asked(calls) == [("equity-stockIndex", {"index": "SECURITIES IN F&O"}), ("allIndices", None)]
+
+
+def test_an_index_list_is_asked_from_its_own_endpoint_and_the_name_is_normalised(settings, fake_clock):
+    calls: list = []
+    snapshot = api_for(settings, fake_clock, calls).live_equities(" nifty 500 ", ["BAJAJ-AUTO"])
+    assert [r["symbol"] for r in snapshot.rows] == ["BAJAJ-AUTO"] and snapshot.index["name"] == "NIFTY 500"
+    assert asked(calls) == [("equity-stock-indices", {"index": "NIFTY 500"})]
+
+
+def test_a_renamed_endpoint_is_skipped_and_the_one_that_answers_is_remembered(settings, fake_clock):
+    calls: list = []
+    old = FakeResponse(200, fixture_json("nse_live_equities_sample.json"))
+    api = api_for(settings, fake_clock, calls, answers={"equity-stockIndex": FakeResponse(404, b"gone"),
+                                                          "equity-stock-indices": FakeResponse(404, b"gone"), "equity-stockIndices": old})
+    assert [r["symbol"] for r in api.live_equities("SECURITIES IN F&O", ["INFY"]).rows] == ["INFY"]
+    assert [name for name, _ in asked(calls)] == ["equity-stockIndex", "equity-stock-indices", "equity-stockIndices"]
+    calls.clear()
+    api.live_equities("SECURITIES IN F&O", ["INFY"])
+    assert [name for name, _ in asked(calls)] == ["equity-stockIndices"]  # straight to the one that worked
+
+
+def test_a_list_no_endpoint_knows_is_a_clear_error_that_is_not_retried(settings, fake_clock):
+    calls: list = []
+    gone = FakeResponse(404, b"gone")
+    api = api_for(settings, fake_clock, calls, answers={"equity-stockIndex": gone, "equity-stock-indices": gone, "equity-stockIndices": gone})
+    with pytest.raises(DataUnavailable) as err:
+        api.live_equities("SECURITIES IN F&O")
+    assert err.value.retryable is False and "no live-quote endpoint knows SECURITIES IN F&O" in str(err.value)
+    assert "equity-stockIndex" in str(err.value) and "did NSE change its API" in str(err.value)
+
+
+def test_only_a_404_moves_on_to_the_next_endpoint(settings, fake_clock):
+    calls: list = []
+    api = api_for(settings, fake_clock, calls, answers={"equity-stockIndex": FakeResponse(403, b"Access Denied")})
+    with pytest.raises(DataUnavailable) as err:
+        api.live_equities("SECURITIES IN F&O")
+    assert "403" in str(err.value)
+    assert {name for name, _ in asked(calls)} == {"equity-stockIndex"}  # a block is not a missing endpoint: no time wasted on others
+
+
+def test_the_other_endpoints_still_fail_loudly_on_a_404(settings, fake_clock):
+    calls: list = []
+    api = api_for(settings, fake_clock, calls, answers={"allIndices": FakeResponse(404, b"gone")})
+    with pytest.raises(DataUnavailable, match="404"):
+        api.all_indices()
 
 
 def test_the_lists_follow_the_universe_policy():
     assert nse.LIVE_LISTS["fno_nifty100"] == ("SECURITIES IN F&O",)
     assert all(lists[0] == "SECURITIES IN F&O" for lists in nse.LIVE_LISTS.values())
     assert set(nse.LIVE_LISTS) == {"fno_nifty100", "nifty200", "nifty500", "custom"}
+
+
+def test_the_endpoint_order_puts_the_current_names_first_and_the_retired_one_last():
+    assert nse.LIVE_SEGMENT_ENDPOINTS == ("equity-stockIndex", "equity-stock-indices", "equity-stockIndices")
+    assert nse.LIVE_INDEX_ENDPOINTS == ("equity-stock-indices", "equity-stockIndices")
+    assert nse.LIVE_SEGMENT_LISTS == {"SECURITIES IN F&O", "PERMITTED TO TRADE"}
 
 
 # ---------------------------------------------------------------------------------- collection helpers
@@ -186,4 +265,5 @@ def test_live_indices_come_back_or_an_empty_dict(store):
 
 def test_the_source_is_in_the_catalogue_as_an_optional_one():
     entry = next(s for s in SOURCES if s["source_id"] == "nse_live_quotes")
-    assert entry["criticality"] == "optional" and "equity-stockIndices" in entry["endpoint"] and "allIndices" in entry["endpoint"]
+    assert entry["criticality"] == "optional" and "equity-stockIndex" in entry["endpoint"] and "allIndices" in entry["endpoint"]
+    assert "lastUpdateTime" in entry["timestamp_meaning"] and "answer" in entry["timestamp_meaning"]

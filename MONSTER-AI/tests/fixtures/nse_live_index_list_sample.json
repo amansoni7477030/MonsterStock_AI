@@ -1,0 +1,24 @@
+{
+  "timestamp": "02-Nov-2026 14:31:00",
+  "data": [
+    {
+      "priority": 1, "identifier": "NIFTY 500", "series": null, "marketType": null,
+      "open": 22010.0, "dayHigh": 22100.0, "dayLow": 21980.0, "lastPrice": 22090.0, "previousClose": 21900.0,
+      "change": 190.0, "pChange": 0.87, "totalTradedVolume": 0, "totalTradedValue": 0, "ffmc": null,
+      "lastUpdateTime": "2026-11-02 14:30:55", "yearHigh": 23500.0, "yearLow": 19000.0
+    },
+    {
+      "priority": 0, "symbol": "RELIANCE", "identifier": "RELIANCEEQN", "series": "EQ", "marketType": "N",
+      "open": 1251.0, "dayHigh": 1286.5, "dayLow": 1249.0, "lastPrice": 1284.2, "previousClose": 1248.6,
+      "change": 35.6, "pChange": 2.85, "totalTradedVolume": 11250000, "totalTradedValue": 1.4e10, "ffmc": 7.1e12,
+      "lastUpdateTime": "2026-11-02 14:30:58", "yearHigh": 1608.95, "yearLow": 1114.85
+    },
+    {
+      "priority": 0, "symbol": "BAJAJ-AUTO", "identifier": "BAJAJ-AUTOEQN", "series": "EQ", "marketType": "N",
+      "open": 9000.0, "dayHigh": 9050.0, "dayLow": 8960.0, "lastPrice": 9020.0, "previousClose": 8990.0,
+      "change": 30.0, "pChange": 0.33, "totalTradedVolume": 420000, "totalTradedValue": 3.8e9, "ffmc": 2.4e12,
+      "lastUpdateTime": "2026-11-02 14:30:20", "yearHigh": 10200.0, "yearLow": 7600.0
+    }
+  ],
+  "marketStatus": {"market": "Capital Market", "marketStatus": "Open", "tradeDate": "02-Nov-2026 14:31"}
+}

@@ -32,6 +32,12 @@ MAX_ZIP_UNCOMPRESSED = 120 * 1024 * 1024
 # request; the broad index lists cover the larger universes.
 LIVE_LISTS = {"fno_nifty100": ("SECURITIES IN F&O",), "nifty200": ("SECURITIES IN F&O", "NIFTY 200"),
               "nifty500": ("SECURITIES IN F&O", "NIFTY 500"), "custom": ("SECURITIES IN F&O", "NIFTY 500")}
+# NSE retired ``equity-stockIndices`` in 2026. An index list is now served by ``equity-stock-indices``, the F&O segment (and the
+# "permitted to trade" list) by ``equity-stockIndex``. The retired name stays last in line: it costs one 404 when it is gone and
+# keeps working where it is still served. The endpoint that answered is remembered for the next call.
+LIVE_INDEX_ENDPOINTS = ("equity-stock-indices", "equity-stockIndices")
+LIVE_SEGMENT_ENDPOINTS = ("equity-stockIndex", *LIVE_INDEX_ENDPOINTS)
+LIVE_SEGMENT_LISTS = frozenset({"SECURITIES IN F&O", "PERMITTED TO TRADE"})
 
 BROWSER_HEADERS = {
     "User-Agent": USER_AGENT_BROWSER,
@@ -240,7 +246,7 @@ class PreopenSnapshot:
 
 @dataclass
 class LiveEquities:
-    """One ``equity-stockIndices`` answer: today's running figures of every stock of a list, and the list's own index row."""
+    """One live stock-list answer: today's running figures of every stock of a list and the list's own index row (if it has one)."""
 
     source_ts: str | None
     rows: list[dict[str, Any]] = field(default_factory=list)
@@ -254,6 +260,7 @@ class NseApi:
     def __init__(self, settings: Settings, *, http: HttpClient | None = None, clock: Clock | None = None) -> None:
         self.clock = clock
         self._warm_mark: float | None = None
+        self._live_endpoint: dict[str, str] = {}  # list name -> the live-quote endpoint that answered for it
         self.http = http or HttpClient.from_settings(
             "nse_api", settings, headers=BROWSER_HEADERS, min_interval=settings.nse_min_interval_sec,
             max_attempts=min(settings.http_max_attempts, 3), clock=clock,
@@ -279,15 +286,17 @@ class NseApi:
         self._warm(self._deadline)
 
     def _get(self, path: str, params: Mapping[str, str] | None = None, *, timeout: tuple[float, float] | None = None,
-             deadline: float | None = None) -> Any:
+             deadline: float | None = None, soft_statuses: tuple[int, ...] = ()) -> Any:
+        """The JSON answer of one endpoint; ``None`` when it answers with one of ``soft_statuses`` (a 404 the caller expects)."""
         self._deadline = deadline  # also bounds the re-handshake the HTTP client triggers on a 401 / 403
         try:
             if self._warm_mark is None or self._now_mono() - self._warm_mark > 20 * 60:
                 self._warm(deadline)
-            response = self.http.get(API + path, params=params, headers=API_HEADERS, timeout=timeout, deadline=deadline)
+            response = self.http.get(API + path, params=params, headers=API_HEADERS, timeout=timeout, deadline=deadline,
+                                     soft_statuses=soft_statuses)
         finally:
             self._deadline = None
-        return response.json()
+        return response.json() if response.ok else None
 
     # --------------------------------------------------------------------------------------- endpoints
     def market_status(self, *, deadline: float | None = None) -> Mapping[str, Any]:
@@ -314,9 +323,20 @@ class NseApi:
     def live_equities(self, index: str = "SECURITIES IN F&O", symbols: Iterable[str] | None = None, *,
                       deadline: float | None = None) -> LiveEquities:
         """Today's running open / high / low / last price / volume of every stock of ``index`` in ONE call. ``deadline`` (a
-        ``clock.monotonic()`` instant) bounds every attempt, so a slow NSE cannot push the closing scan past its report deadline."""
-        data = self._get("equity-stockIndices", {"index": index}, timeout=(10.0, 60.0), deadline=deadline)
-        return parse_live_equities(data, set(symbols) if symbols is not None else None)
+        ``clock.monotonic()`` instant) bounds every attempt, so a slow NSE cannot push the closing scan past its report deadline.
+        The endpoints are tried in order (see ``LIVE_SEGMENT_ENDPOINTS``): only a 404 moves on to the next, any other failure is
+        raised at once; a list that no endpoint knows is an error that says so."""
+        name = index.strip().upper()
+        endpoints = LIVE_SEGMENT_ENDPOINTS if name in LIVE_SEGMENT_LISTS else LIVE_INDEX_ENDPOINTS
+        known = self._live_endpoint.get(name)
+        order = [known, *(e for e in endpoints if e != known)] if known else list(endpoints)
+        for endpoint in order:
+            data = self._get(endpoint, {"index": name}, timeout=(10.0, 60.0), deadline=deadline, soft_statuses=(404,))
+            if data is not None:
+                self._live_endpoint[name] = endpoint
+                return parse_live_equities(data, set(symbols) if symbols is not None else None)
+        raise DataUnavailable("nse_api", f"no live-quote endpoint knows {name} (HTTP 404 from {', '.join(order)}): did NSE change its API?",
+                              retryable=False)
 
     def all_indices(self, *, deadline: float | None = None) -> dict[str, dict[str, Any]]:
         """Every NSE index live (Nifty 50, India VIX and the sector indices) keyed by its name, in one call."""
@@ -391,44 +411,48 @@ def _change_pct(last: float | None, prev: float | None) -> float | None:
 
 
 def parse_live_equities(data: Any, wanted: set[str] | None = None) -> LiveEquities:
-    """Normalise ``equity-stockIndices``. The first row of a list is the list's own index (its symbol is the list's name, for
-    instance ``SECURITIES IN F&O``): it is kept apart, never mixed with the stocks (NSE stock symbols never contain a space). A
-    stock row needs a last price and a previous close; every other figure that is absent stays ``None``."""
+    """Normalise the stock lists of NSE's live market page (``equity-stockIndex`` for the F&O segment, ``equity-stock-indices`` for
+    an index list). The answer's own ``timestamp`` is the stamp of every row: the per-row ``lastUpdateTime`` is a placeholder
+    (``31-DEC-2999``) or the date of some old update for most stocks, never the time of a trade, and is not read. An index list
+    starts with the index itself, a row without a ``symbol`` whose ``identifier`` is the index name: it is kept apart, never mixed
+    with the stocks (NSE stock symbols never contain a space). A stock row needs a last price and a previous close; every other
+    figure that is absent stays ``None``. NSE writes the prices of the F&O list as text, hence the defensive number reading."""
     if not isinstance(data, Mapping):
         return LiveEquities(None, [])
-    top_ts = parse_ts(data.get("timestamp"), assume_tz=IST)
+    stamp = parse_ts(data.get("timestamp"), assume_tz=IST)
+    stamp_text = iso(stamp) if stamp else None
     metadata = data.get("metadata")
     list_name = str(data.get("name") or (metadata.get("indexName") if isinstance(metadata, Mapping) else "") or "").strip().upper()
     rows: list[dict[str, Any]] = []
     index_row: dict[str, Any] | None = None
-    latest = top_ts
     for item in data.get("data") or []:
         if not isinstance(item, Mapping):
             continue
         symbol = str(item.get("symbol") or "").strip()
-        if not symbol:
-            continue
         last, prev = _positive(item.get("lastPrice")), _positive(item.get("previousClose"))
-        row_ts = parse_ts(item.get("lastUpdateTime"), assume_tz=IST) or top_ts
+        if not symbol:
+            identifier = str(item.get("identifier") or "").strip()
+            if " " in identifier and index_row is None and last is not None:
+                index_row = {"name": identifier, "last": last, "prev_close": prev, "change_pct": _change_pct(last, prev),
+                             "row_ts": stamp_text}
+            continue
         if " " in symbol or symbol.upper() == list_name:
             if index_row is None and last is not None:
                 index_row = {"name": symbol, "last": last, "prev_close": prev, "change_pct": _change_pct(last, prev),
-                             "row_ts": iso(row_ts) if row_ts else None}
+                             "row_ts": stamp_text}
             continue
         if last is None or prev is None or (wanted is not None and symbol not in wanted):
             continue
-        if row_ts and (latest is None or row_ts > latest):
-            latest = row_ts
         rows.append(
             {
                 "symbol": symbol, "open": _positive(item.get("open")), "high": _positive(item.get("dayHigh")),
                 "low": _positive(item.get("dayLow")), "last": last, "prev_close": prev, "change_pct": _change_pct(last, prev),
                 "volume": num(item.get("totalTradedVolume")), "turnover": num(item.get("totalTradedValue")),
                 "year_high": _positive(item.get("yearHigh")), "year_low": _positive(item.get("yearLow")),
-                "row_ts": iso(row_ts) if row_ts else None,
+                "row_ts": stamp_text,
             }
         )
-    return LiveEquities(iso(latest) if latest else None, rows, index_row)
+    return LiveEquities(stamp_text, rows, index_row)
 
 
 def parse_all_indices(data: Any) -> dict[str, dict[str, Any]]:

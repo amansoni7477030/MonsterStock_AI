@@ -6,10 +6,16 @@ calibrated probability of an unusually large intraday range** (default: range > 
 "no high-conviction setup" when nothing qualifies. After the close it evaluates what it predicted against simple baselines and
 retrains weekly under fixed validation gates.
 
+Every trading afternoon at about 14:31 IST it also sends a **closing-hour trade-idea report**: BTST ideas (buy before the close, sell
+in the next session), swing ideas (hold a few sessions), bearish F&O setups and a watchlist of intraday levels for the next day, each
+with a mechanical entry, stop and targets, the estimated cost and the reasons, built from NSE's live quotes and the stored history
+(see [Closing-hour trade ideas](#closing-hour-trade-ideas)). Its scores rank setups; they are not probabilities.
+
 > **Status: shadow mode.** The system never places orders. A model is only labelled `VALIDATED` when its out-of-sample
 > calibration, skill versus the base rate and ranking edge over simple baselines pass fixed gates; until then every list is
-> labelled SHADOW/BASELINE and tiers are capped at WATCH. A wide intraday range is not a trade signal, and nothing here is
-> investment advice. See [Limitations](#limitations).
+> labelled SHADOW/BASELINE and tiers are capped at WATCH. The trade ideas are heuristic setups and say so until a list's live record
+> passes its own gate. A wide intraday range is not a trade signal, and nothing here is investment advice. See
+> [Limitations](#limitations).
 
 ## Contents
 
@@ -20,13 +26,14 @@ retrains weekly under fixed validation gates.
 5. [Quick start (development machine)](#quick-start-development-machine)
 6. [Server deployment](#server-deployment)
 7. [Daily timetable](#daily-timetable-asiakolkata-trading-days)
-8. [Commands](#commands)
-9. [Configuration](#configuration)
-10. [Reliability guarantees](#reliability-guarantees)
-11. [Quality gates and CI/CD](#quality-gates-and-cicd)
-12. [Project layout](#project-layout)
-13. [Documentation map](#documentation-map)
-14. [Limitations](#limitations)
+8. [Closing-hour trade ideas](#closing-hour-trade-ideas)
+9. [Commands](#commands)
+10. [Configuration](#configuration)
+11. [Reliability guarantees](#reliability-guarantees)
+12. [Quality gates and CI/CD](#quality-gates-and-cicd)
+13. [Project layout](#project-layout)
+14. [Documentation map](#documentation-map)
+15. [Limitations](#limitations)
 
 ## At a glance
 
@@ -40,7 +47,8 @@ retrains weekly under fixed validation gates.
 | **Traceability** | daily log files per process role plus a shared errors file, millisecond stamps with offset, per-job tags, crash hooks, secret redaction, `monster-ai logs` / `diag`, and every frozen report stamped with the exact code that made it |
 | **Self-healing** | resumable bootstrap, ledger-based scheduler (nothing runs twice, missed work is visible), RSS watchdog, systemd restart + watchdog + independent health timer, heartbeat file, queued alerts, automatic model rollback to a labelled baseline, verified backups |
 | **Honesty** | calibrated probabilities, fixed gates, tier caps, sample sizes and 95 % intervals on every live statistic, explicit "no setup" |
-| **Optional AI** | **Groq** (open-weight `openai/gpt-oss-120b`, fallback `gpt-oss-20b`) reads news for structure and can **check unconfirmed company news on the web** (its built-in browser search); **Jev** (TypeSafe AI) judges event type, rumour, denial, severity and direction with calibrated confidence. Both are given the facts a human reader would use (when, by whom, which company and sector), are off until you add a key, are cached, budgeted and rate-limit aware, fall back to the rules on any failure and never change the calibrated forecast ([details](#optional-ai-groq-and-jev)) |
+| **Closing-hour ideas** | at 14:30 IST NSE's live quotes, laid over the stored daily history, become BTST, swing, bearish F&O and next-day intraday ideas with mechanical levels, costs and reasons; the report is frozen once, sent by 15:05 and judged against the official bars the same evening; every list shows its own live record and is only called validated after a fixed gate ([details](#closing-hour-trade-ideas)) |
+| **Optional AI** | **Groq** (open-weight `openai/gpt-oss-120b`, with `gpt-oss-20b` and `qwen/qwen3.8-27b` behind it, each model with its own rate limits) reads news for structure and can **check unconfirmed company news on the web** (its built-in browser search); **Jev** (TypeSafe AI) judges event type, rumour, denial, severity and direction with calibrated confidence. Both are given the facts a human reader would use (when, by whom, which company and sector), are off until you add a key, are cached, budgeted and rate-limit aware, fall back to the rules on any failure and never change the calibrated forecast ([details](#optional-ai-groq-and-jev)) |
 
 ## What you have to do
 
@@ -189,33 +197,87 @@ flowchart TB
         M6 --> M7["09:00:30 refresh_preopen"]
         M7 --> M8["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
     end
+    subgraph MID["Closing hour"]
+        direction TB
+        C1["13:40 collect_news (midday)"] --> C2["14:30 closing_scan<br/>report by 15:05, enter before 15:15"]
+    end
     subgraph EVE["After the close"]
         direction TB
         E1["17:45 ingest_eod"] --> E2["18:15 evaluate"]
-        E2 --> E3["20:00 health_check"]
+        E2 --> E2B["18:30 evaluate_ideas"]
+        E2B --> E3["20:00 health_check"]
         E3 --> E4["23:30 backup"]
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
-    class M6,M7,M8 critical
+    class M6,M7,M8,C2 critical
 ```
 
 | Time | Job | Purpose |
 |---|---|---|
 | 06:00-08:30 | `collect_global` | US/Europe/Asia closes, FX, commodities, rates, VIX, GIFT Nifty (retries) |
-| 06:30, 08:10 | `collect_news` | RSS (conditional GET) + GDELT + NSE filings, entity/event extraction, market-reaction check |
+| 06:30, 08:10, 13:40 | `collect_news` | RSS (conditional GET) + GDELT + NSE filings, entity/event extraction, market-reaction check; the 13:40 pass gives the closing scan fresh catalysts |
 | 08:00 | `collect_india` | previous-session completeness (official bhavcopy first), results calendar |
 | 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (indicative/final equilibrium prices) |
 | 09:08:45 | `final_scan` | final scan with the opening gap, frozen snapshot, **Telegram report by 09:12-09:14:30** |
+| 14:30-15:00 | `closing_scan` | NSE live quotes over the stored history: BTST, swing, bearish F&O and next-day intraday ideas, frozen once, **Telegram report by 15:05** (enter before 15:15); retried every minute inside its window |
 | 17:45+ | `ingest_eod` | official end-of-day data (retries until 23:30) |
 | 18:15+ | `evaluate` | outcomes vs baselines, evening report with the live record |
+| 18:30+ | `evaluate_ideas` | the earlier trade ideas judged on the official bars; outcomes are kept apart from the frozen reports and make up each list's live record |
 | 23:30 / 23:50 | `backup`, `housekeeping` | verified online DB backup (+ off-box copy when S3 is configured); retention, official-bar upgrade, basis repair, DB maintenance |
 | Sat 02:00 | `train` | walk-forward retraining, champion/challenger governance (`TRAINING_MODE=local-light`) |
 
 Also every day at 05:30: `refresh_calendar` (NSE holidays) and `model_sync` (external training mode: pull and verify signed models).
 Weekly: `refresh_universe` (Sun). Every 5 minutes an independent systemd timer runs `health --notify`. A ledger (`job_runs`) makes
 every job restart-safe: missed windows are recorded and alerted, catch-up jobs run after a reboot, and nothing runs twice.
+
+## Closing-hour trade ideas
+
+Around 14:30 IST the market still has an hour to run and the day's story is mostly written, which is when a BTST (buy today, sell
+tomorrow) or a swing trade is decided. `closing_scan` reads NSE's live quotes for the whole F&O segment in one request, lays them over
+the stored daily history as the session in progress (open, high, low, last, volume projected to a full day), and sends one report by
+15:05 with four lists, five names each by default:
+
+| List | What it is | Exit rule the report states and the record judges |
+|------|------------|-----------------------------------------------|
+| **BTST** (long) | a strong close near the day's high on heavy volume, usually through the 20-day high in an uptrend | the first of the stop, the first target and the next close |
+| **Swing** (long) | a pullback to the 20-day average, a base breakout or a tight range under the 20-day high inside a trend | the first of the stop, the first target and the 5th close |
+| **Bearish** | the mirror images (BTST and swing); **F&O names only**, because the cash market cannot be held short overnight: short the future or buy a put | as above |
+| **Watchlist** | names coiled at a key level, with a buy level above today's high and a sell level below today's low | intraday only: act on a break with volume, square off by 15:15 |
+
+Every idea carries an entry reference with a "do not chase beyond" price, a stop, two targets and the reward to risk, all
+**mechanical multiples of the previous ATR** (the stop sits at the nearer of the ATR multiple and the day's or week's extreme), the
+estimated round-trip delivery cost and the reasons and cautions that moved its score. What the lists leave out on purpose: a name that
+fails the liquidity, price or data gates, a stop wider than `IDEAS_MAX_RISK_PCT`, a reward to the second target smaller than 1.5 times
+the risk, a cost above a quarter of the first target's reward, a BTST into a results announcement due today or tomorrow (a swing
+into one is discounted), a BTST against a Nifty move of 2 % or more (no overnight long on a crash day, no overnight short on a surge
+day) and a name with **confirmed bad news** for that side (rumours are only mentioned). Nothing is forced: on a day without a setup
+the list says so.
+
+**Honesty rules.**
+
+- The **score ranks setups; it is not a probability** and is never drawn as one. It is a weighted mean of fixed, documented
+  components; nothing is fitted.
+- Each list shows its own **live record**: how the earlier ideas of that list did after costs (positive share, mean, first target and
+  stop rates), with the number of ideas and days and a 95 % interval. A list is called validated only when it has at least 60 judged
+  ideas over 20 days and both the win-rate and the mean-return intervals clear their no-edge level; until then every list says
+  *not validated* and what it still needs.
+- The report is **frozen once** per trading day (`ideas:run:<date>` in the key-value store) and re-sent unchanged after a failed
+  delivery. Outcomes are judged by `evaluate_ideas` on the official end-of-day bars and stored apart (`ideas:out:<date>`): what was
+  said is never edited, what happened is attached. A report built after the 15:05 deadline is withheld unless forced, is marked *late*
+  at its top and never counts toward the record.
+- It **fails visibly**: no live quotes, quotes that are not from today, a gap in the stored history or too few names with a complete
+  row stop the scan with an alert (and a notice on the last attempt); nothing is guessed from older prices. A name whose price basis
+  differs from the stored history (an ex-date today) is left out.
+- Volume at 14:30 is a **projection** with a typical intraday profile, and the report says so. Stops, targets and costs are
+  estimates; the system never places orders.
+
+Commands: `sudo monster-ai ideas --dry-run` prints today's report and freezes and sends nothing; `sudo monster-ai ideas` runs the
+scheduled job now; `--force` scans again only while the frozen report was never delivered and also sends after the deadline;
+`sudo monster-ai telegram-preview --only ideas` shows a sample of the message with made-up data. The settings are `IDEAS_*`
+(see [Configuration](#configuration)); `IDEAS_ENABLED=false` switches the whole feature off and `SEND_IDEAS_REPORT=false` keeps it
+computing, freezing and evaluating silently.
 
 ## Commands
 
@@ -229,6 +291,7 @@ every job restart-safe: missed windows are recorded and alerted, catch-up jobs r
 | `daemon` | run the scheduler (systemd does this) |
 | `run-job NAME [--key K] [--force] [--dry-run] [--opt K=V]`, `jobs` | run one job now; show the timetable and recent runs |
 | `scan --stage pre\|final [--date D] [--dry-run] [--force]` | run a scan now (`--dry-run` prints the report, freezes and sends nothing) |
+| `ideas [--date D] [--dry-run] [--force]` | run the closing-hour trade-idea scan now (`--dry-run` prints the report, freezes and sends nothing; `--force` scans again only while the frozen report was never delivered, and sends after the 15:05 deadline) |
 | `evaluate [--date D]` | evaluate a day's predictions |
 | `train [--stage pre\|final\|both] [--publish]` | train now (`--publish`: CI worker mode) |
 | `backtest [--stage S] [--years N] [--out FILE]` | walk-forward evaluation against the baselines |
@@ -254,13 +317,14 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Mode and universe | `MONSTER_MODE` (shadow), `UNIVERSE_MODE` (fno_nifty100), `HISTORY_YEARS` (10) |
 | Prediction | `PRIMARY_THRESHOLD` (3.0), `TOP_N` (5), `RANGE_THRESHOLDS`, `UNUSUAL_K`, tier probabilities (`TIER_*_P`) |
 | Schedule | `PRELIM_SCAN_TIME`, `FINAL_SCAN_TIME`, `REPORT_CUTOFF_TIME`, `REPORT_DEADLINE_TIME` |
+| Closing-hour ideas | `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true), `IDEAS_REPORT_DEADLINE_TIME` (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5 per list), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS` (true) |
 | Network | `HTTP_TRANSPORT` (auto: curl_cffi, falls back to requests), `HTTP_IMPERSONATE` (chrome), `HTTP_TIMEOUT_SEC` (30), `HTTP_MAX_ATTEMPTS` (4), `HTTP_MAX_RESPONSE_MB` (40), `YAHOO_MIN_INTERVAL_SEC` (1.0), `NSE_MIN_INTERVAL_SEC` (1.0), `NSE_ENABLED`, `GDELT_ENABLED` |
 | Time | `MONSTER_TIMEZONE` (Asia/Kolkata) - the zone of **log stamps only**; market logic is always IST and the process zone is UTC |
 | Retention and storage | `DATA_MAX_MB` (4000), `NEWS_RETENTION_DAYS` (45), `EVENT_RETENTION_DAYS` (1100), `QUOTE_RETENTION_DAYS` (400), `RECORD_RETENTION_DAYS` (1825), `OPS_RETENTION_DAYS` (180), `BACKUP_KEEP_DAILY` (7), `BACKUP_KEEP_WEEKLY` (4), `BACKUP_MAX_MB` (1500) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
 | Resources | `MIN_FREE_DISK_MB_WARN` / `_CRIT`, `JOB_MAX_RSS_MB` (720) |
 | Training | `TRAINING_MODE` (`local-light`, `external` signed models, or `disabled`), `MODEL_SIGNING_KEY`, S3 storage for off-box backups and model bundles |
-| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` / `LLM_WEB_MAX_PER_DAY` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
+| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it, including the model chain `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODELS`, or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` / `LLM_WEB_MAX_PER_DAY` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
 
 ### Optional AI: Groq and Jev
 
@@ -269,7 +333,7 @@ Both are **off until you add a key**; with no key the deterministic rules do eve
 | | Groq LLM | Jev (TypeSafe AI) |
 |---|---|---|
 | Key | `GROQ_API_KEY` ([console.groq.com](https://console.groq.com)) | `TYPESAFE_API_KEY` ([typesafe.ai](https://typesafe.ai)) |
-| Model | `openai/gpt-oss-120b`, falling back to `openai/gpt-oss-20b` (`LLM_MODEL`, `LLM_FALLBACK_MODEL` override) | `jev-1.14.0`, pinned (`JEV_MODEL`) |
+| Model | `openai/gpt-oss-120b`, then `openai/gpt-oss-20b`, then `qwen/qwen3.8-27b` when the ones before it are rate-limited (`LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODELS` override; see [the model chain](#the-model-chain-and-throughput-on-groqs-free-tier)) | `jev-1.14.0`, pinned (`JEV_MODEL`) |
 | What it does | reads an article and returns event type, companies with a direction, severity, horizon, event time and a **verbatim evidence quote** | answers five typed questions about an article in one request: event type, rumour, denial, severity and direction for the company in focus, each with calibrated probabilities |
 | What it is given | the whole stored text (up to 6,000 characters), the definition of every event type and a **context block** (see below) | the same text and the same facts as typed fields of its state |
 | Web access | Groq's built-in `browser_search` for non-first-hand company news that matters (`LLM_WEB_SEARCH`, `LLM_WEB_MAX_PER_RUN`, `LLM_WEB_MAX_PER_DAY`), see [the web check](#the-web-check) | none: it judges what it is shown, including the web check's result |
@@ -300,7 +364,7 @@ How to think about them:
   word, a choice must be an allowed option, a confidence must pass its threshold) and the rules remain the fallback.
 - **They can never block or corrupt a report.** Results are cached for 14 days by text and context; each news job has a call and a time budget (a
   backlog drained in several batches shares it); a
-  provider's `Retry-After` is honoured, a rate-limited Groq model hands over to the fallback model, an exhausted quota starts a
+  provider's `Retry-After` is honoured, a rate-limited Groq model hands over to the next model of the chain, an exhausted quota starts a
   cooldown that survives between runs, and a rejected key stops the service for the run. Any failure falls back to the rules, the
   report's coverage note names the degraded service, and `monster-ai health` warns after repeated failures.
 - **Only public news text leaves the server** (headline, the article text, the context facts above and a company name): never keys,
@@ -359,14 +423,30 @@ detector is deliberately narrow so that ordinary regulatory news ("the court ove
 second line of defence the prompt tells the model to treat such text as an attack, every answer is validated, and Jev only ever
 sees the text as data in a typed field.
 
-#### Throughput on Groq's free tier
+#### The model chain and throughput on Groq's free tier
 
-Measured: 8,000 tokens per minute and 200,000 tokens per day for each model, about 2,000 tokens per extraction (the prompt carries the
-definition of every event type), so roughly four extractions per minute and about a hundred a day per model, and twice that with the
-fallback model. A news job of 60 articles therefore needs about seven minutes on the free tier; the 240-second time box
-(`LLM_MAX_SECONDS_PER_RUN`) stops it after about thirty and the rest are read by the rules and Jev, which has its own limits. A web
-check costs as many tokens as three or four extractions, which is why it has a daily cap. Groq's paid Developer tier raises these
-limits; nothing else changes.
+Groq applies its rate limits **per model**, so a chain of models multiplies what the free tier allows. The extractor walks the chain
+`openai/gpt-oss-120b` -> `openai/gpt-oss-20b` -> `qwen/qwen3.8-27b` (the first two are the configured model and its fallback; the third is
+the default further fallback): a model that answers 429 is parked until its own limit resets and the next model takes the item, the
+best available model is used again as soon as it is free, and a model that does not exist for the account, was retired or is blocked
+for it (HTTP 404 / 403) is dropped for the run without stopping the others. Only when every model is limited does a news job wait, and
+only for the first one to recover (at most 30 seconds); otherwise it stops and the rest of the batch is read by the rules and Jev, as
+before. Qwen is run in its plain (non-thinking) mode and any `<think>` block is stripped; the web check stays on the `gpt-oss` models,
+the only ones with Groq's browser tool.
+
+Measured: 8,000 tokens per minute and 200,000 tokens per day for each of these models, about 2,000 tokens per extraction (the prompt
+carries the definition of every event type), so roughly four extractions per minute and about a hundred a day per model, and three
+times that with the whole chain: about twelve a minute and three hundred a day. A news job of 60 articles needed about seven minutes
+with two models and needs about five with three; the 240-second time box (`LLM_MAX_SECONDS_PER_RUN`) now reaches about 48 articles
+instead of about 32, and whatever it does not reach is read by the rules and Jev, which has its own limits. A web check costs as many
+tokens as three or four extractions, which is why it has a daily cap. Groq's paid Developer tier raises these limits; nothing else
+changes.
+
+`LLM_FALLBACK_MODELS` sets the further models (comma or space separated, tried in order after `LLM_FALLBACK_MODEL`; `none` keeps the
+chain to the first two). Add any other model your key can use, for instance a limited-preview model your account has been given
+access to; `monster-ai ai-test --list-only` shows which models of the chain the key can see (a model it does not list is a warning,
+not an error: the extractor skips it when Groq refuses it). Another provider (`LLM_API_BASE` + `LLM_MODEL`) gets only the models it is
+told about.
 
 ## Reliability guarantees
 
@@ -411,13 +491,13 @@ signed model bundle (`TRAINING_MODE=external`) for servers too small to train lo
 app/            configuration, clock, logging (redaction, daily files), log viewer, diagnostics, locks, resources, CLI, doctor
 database/       SQLite (WAL) schema + migrations, repository (Store), backup/restore, object store
 ingestion/      curl_cffi HTTP client, Yahoo, NSE, F&O, universe, news, freshness gate, split-basis repair
-features/       point-in-time feature engines + builder + loader
+features/       point-in-time feature engines + builder + loader, and the closing-hour swing features
 models/         training, calibration, inference, registry, artifacts, signing
-ranking/        eligibility, costs, tiers, abstention, evidence
-automation/     calendar, scan, jobs, scheduler, schedule engine, health, bootstrap, retention
+ranking/        eligibility, costs, tiers, abstention, evidence, and the closing-hour trade ideas
+automation/     calendar, scan, closing-hour ideas, jobs, scheduler, schedule engine, health, bootstrap, retention
 notifications/  Telegram client, report renderers and their emoji style, sample previews, idempotent delivery
 news_intelligence/, event_graph/   event extraction (rules + optional Groq / Jev), entity resolution, causal-graph propagation
-backtesting/    metrics, walk-forward report, live evaluation and live record
+backtesting/    metrics, walk-forward report, live evaluation and live record, trade-idea outcomes
 dashboard/      optional read-only web UI (loopback)
 deployment/     installer, systemd units, logrotate / journald config, remote deploy
 scripts/        documentation generator
@@ -446,6 +526,16 @@ tests/          hermetic tests built on real captured provider responses
 - The universe is today's F&O + Nifty 100 membership plus the delisted or quarantined names the database holds; names it never
   ingested stay absent (residual survivorship bias). Vendor-adjusted prices precede the official-file period.
 - Calibrated probabilities describe *range*, not direction or profit. Costs are modelled estimates.
+- The closing-hour trade ideas are **heuristics**, not a model: their scores rank setups, their stops and targets are mechanical ATR
+  multiples, and nothing says yet that they make money. The live record in each report starts empty; a list is only called
+  validated after 60 judged ideas over 20 days with intervals that clear no-edge. At 14:30 volume is a projection, an overnight (BTST)
+  position carries gap risk that a stop does not cover, a bearish idea needs an F&O position, and a trade on a thin day can be filled
+  away from the reference entry. The report is research output, not advice.
+- NSE's live-quote endpoints are unofficial and changed in 2026 (the old `equity-stockIndices` is gone; the F&O list now comes from
+  `equity-stockIndex`, index lists from `equity-stock-indices`, and the client tries the names in that order). The parser was run on a
+  live NSE answer of 2 Nov 2026 (218 F&O rows, every field present) **after** the session, and `allIndices` on the live site too; the
+  14:30-15:05 window itself has not run live. The per-stock `lastUpdateTime` of those answers is a placeholder, so freshness rests on the
+  answer's own timestamp.
 - News features reach the report (catalysts, chains, "priced in") but are not model inputs, and VWAP is a daily proxy: see the
   deviations in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#deviations-from-the-blueprint). The optional Groq and Jev services
   make that news evidence more accurate; they do not change the calibrated forecast. They were verified against live Groq and Jev keys
