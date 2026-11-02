@@ -70,3 +70,37 @@ def test_the_samples_show_every_feature_of_the_design(built):
     assert "🔔 <b>MONSTER AI</b> · 3 alerts" in texts["digest"]
     assert "REPORT WITHHELD" in texts["failure"] and "🚨 <b>Service failed</b>" in texts["unit"]
     assert "MONSTER AI online" in texts["online"]
+    assert "At a glance" in final and "At a glance" in ideas and "Tomorrow's levels" in ideas and "<pre>" in texts["evening"]
+
+
+# ------------------------------------------------------------------------------------------- the images
+@pytest.fixture(scope="module")
+def pictures():
+    pytest.importorskip("PIL")  # only the image tests need Pillow
+    return samples.build_sample_charts(NOW)
+
+
+def test_the_kinds_with_images_are_the_report_kinds_and_every_image_is_marked_as_a_sample(pictures):
+    from notifications import charts
+
+    assert list(pictures) == ["final", "prelim", "ideas", "evening"] and set(pictures) <= set(samples.KINDS)
+    assert [len(items) for items in pictures.values()] == [1, 1, 2, 1]
+    for kind, items in pictures.items():
+        for chart in items:
+            assert charts._SAMPLE_TEXT in chart.labels, (kind, chart.name)
+            assert chart.png.startswith(b"\x89PNG")
+
+
+def test_a_marked_caption_is_short_valid_html_that_starts_with_the_banner(pictures):
+    for items in pictures.values():
+        for chart in items:
+            caption = samples.marked_caption(chart.caption)
+            assert caption.startswith(samples.PREVIEW_BANNER) and len(caption) <= 1024
+            assert_telegram_safe([caption])
+    assert len(samples.marked_caption("x" * 5000)) == 1024
+
+
+def test_the_sample_images_use_the_same_made_up_data_as_the_sample_texts(pictures):
+    labels = " ".join(label for items in pictures.values() for chart in items for label in chart.labels)
+    assert {"DEMOONE", "DEMOTWO", "DEMOTRE", "DEMOFOR"} <= set(re.findall(r"\bDEMO[A-Z]+\b", labels))
+    assert "\u20b9" not in labels  # the font of the images has no rupee sign

@@ -33,9 +33,9 @@ All messages arrive in the Telegram chat that was linked at install time (alerts
 | When (IST, trading days) | Message |
 |--------------------------|---------|
 | ~08:45 | preliminary report (only if `SEND_PRELIM_REPORT=true`; off by default) |
-| **~09:09-09:12** | **final report**: the top-5 names, calibrated probabilities, expected range, catalysts (with how far each can be trusted), regime including GIFT Nifty, data freshness |
-| **~14:31-15:05** | **closing-hour trade ideas** (`SEND_IDEAS_REPORT`): BTST, swing, bearish F&O and next-day intraday watchlist, each idea with its entry reference, stop, targets, cost and reasons; heuristic setups with their own live record per list (see [reading the ideas report](#the-closing-hour-ideas-report)) |
-| after 18:15 | evening summary: what happened to this morning's picks, and the **live record** of the last 20 days, 60 days and all days (hit rate, range-forecast error, interval coverage, direction accuracy, realised range against the baselines, ranking quality), every number with its sample size and 95 % interval (`SEND_EVENING_REPORT`) |
+| **~09:09-09:12** | **final report**: the top-5 names, calibrated probabilities, expected range, catalysts (with how far each can be trusted), regime including GIFT Nifty, data freshness; an at-a-glance table at the top and a chart of the expected ranges after it |
+| **~14:31-15:05** | **closing-hour trade ideas** (`SEND_IDEAS_REPORT`): BTST, swing, bearish F&O and next-day intraday watchlist, each idea with its entry reference, stop, targets, cost and reasons; heuristic setups with their own live record per list (see [reading the ideas report](#the-closing-hour-ideas-report)); tables of the levels at the top, then two charts (the board and the trade plan) |
+| after 18:15 | evening summary: what happened to this morning's picks, and the **live record** of the last 20 days, 60 days and all days (hit rate, range-forecast error, interval coverage, direction accuracy, realised range against the baselines, ranking quality), every number with its sample size and 95 % interval (`SEND_EVENING_REPORT`); a chart of the day's hits and misses follows
 | any time | alerts (de-duplicated; queued while Telegram is unreachable) |
 
 A morning with nothing worth reporting produces a short **"no setup"** message that says why. A final report that
@@ -67,6 +67,14 @@ each message is marked *SAMPLE PREVIEW*) so you can see them before the first re
 A note under the regime names stocks with an **ex-date today** (split or bonus), which are scored without their opening gap;
 `🌅 GIFT Nifty: +0.40%` in the market-regime line is GIFT Nifty's change, shown only while its quote is fresh.
 
+**Tables and pictures.** The 09:12 and the closing-hour messages start with an **At a glance** table in monospace (candidates with their
+tier, probability and range; ideas with entry, stop and first target; tomorrow's buy-above / sell-below levels). After the text come
+**chart images**: they show the same numbers as the text, never more. In the ideas pictures a score is a score and is never drawn as a
+probability, the trade plan draws the loss at the stop (red) and the gain at the two targets (green) of each idea in % of the entry price,
+and the morning chart shows a probability only for a model that is not the heuristic baseline. A day without a setup and a late report
+get no picture. `SEND_CHARTS=false` (or a missing Pillow package: `sudo monster-ai doctor` has a `charts` row) leaves the text alone; a
+picture that cannot be drawn or sent is logged (`chart images stopped`) and never withholds or repeats the report.
+
 ## First day
 
 1. The installer ends with the bootstrap (10-60 minutes, in the background). You get *"installation complete"* on
@@ -89,7 +97,8 @@ calibrated"* and caps every name at WATCH.
 |---------|-----|
 | `health [--json]` | exit 0 ok / 1 warnings / 2 critical; every problem with its explanation |
 | `jobs` | the timetable and the last runs of every job |
-| `doctor` | full preflight: configuration, permissions, disk, RAM, clock, reachability of every data feed |
+| `doctor` | full preflight: configuration, permissions, disk, RAM, clock, reachability of every data feed, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
+| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read **every** data endpoint (NSE API, NSE archive files, Yahoo, the 44 feeds, GDELT) through the production clients and say which still answer, with the reason of each failure (exit 1 when one fails); run it after an NSE or Yahoo change and when a report is missing data, see [Checking an endpoint by hand](#checking-an-endpoint-by-hand-curl) |
 | `logs [...]` | read, filter and follow the logs, see [Logs and diagnostics](#logs-and-diagnostics) |
 | `diag` | write a redacted diagnostics bundle for a bug report |
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
@@ -103,7 +112,7 @@ calibrated"* and caps every name at WATCH.
 | `backup`, `backup --verify`, `backup --restore-latest [--remote]` | backups, see [below](#backups-and-recovery) |
 | `run-job NAME [--force] [--dry-run] [--opt K=V]` | run one scheduled job by hand (for example `refresh_calendar`) |
 | `telegram-test`, `telegram-setup` | test message; discover the chat id |
-| `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message (made-up data, each marked *SAMPLE PREVIEW*) |
+| `telegram-preview [--only KIND ...] [--list]` | one sample of every kind of Telegram message with its tables and chart images (made-up data, each marked *SAMPLE PREVIEW*) |
 | `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the optional Groq / Jev keys: one made-up news item through the real code (and one real web search when the web check is on), `OK` or exactly why not (`--list-only` spends no tokens and makes no search), see [the AI services](#the-ai-services-groq-and-jev) |
 | `bootstrap --resume` | continue a first-run setup that stopped |
 | `version` | the version and the **code fingerprint** (`1.0.0+3fa9c1d2`) that is stamped on every frozen report and model |
@@ -259,6 +268,7 @@ the attempts and accept the reduced data (and `IDEAS_ENABLED=false` to stop the 
    scans again: a frozen report is the record of the day and is not replaced (only when nothing is frozen does `--force` scan first).
 5. NSE renamed its live-quote endpoint once already (2026): `ideas_scan_failed` with `no live-quote endpoint knows SECURITIES IN F&O
    (HTTP 404 ...)` means all the known names are gone. The scan then needs a code update; nothing is guessed meanwhile.
+   `sudo monster-ai sources-check --only nse` shows which NSE endpoints still answer.
 
 ### Telegram problems
 
@@ -514,6 +524,41 @@ Yahoo `spark` request per 20 global series, conditional GET (`ETag` / 304) for R
 - If the server's IP range is blocked by one provider (NSE blocks some data centres), see the playbook above.
 - If curl_cffi cannot be loaded on a platform, the client falls back to `requests` and logs it once (`http transport: ...`
   at start); `HTTP_TRANSPORT=requests` forces that, `HTTP_IMPERSONATE=` (empty) disables the browser profile.
+
+### Checking an endpoint by hand (curl)
+
+**`sudo monster-ai sources-check`** reads every endpoint the system uses, through the same clients (curl_cffi) the jobs use, and prints
+`[ ok ]`, `[warn]` or `[FAIL]` for each with the reason: the NSE JSON API (market status, GIFT Nifty, the pre-open book, all indices, the
+live-quote lists of your universe, announcements, board meetings, holidays), the NSE archive files (bhavcopy, the UDiFF F&O file, the
+four index lists, lot sizes), Yahoo (the bulk `spark` probe for all 33 series, the charts, the live-context quotes), every RSS feed and
+GDELT. It exits 1 when something the system needs does not answer; GDELT and a single feed are only warnings. `--only nse yahoo` limits
+it to some sections. It changes nothing. `sudo monster-ai doctor` proves the main ones in a few seconds and
+`sudo monster-ai ideas --dry-run` proves the whole live-quote path. To see an endpoint with your own eyes, use `curl`. These commands
+were run against the live services on 2026-11-02 and answered `200` with data:
+
+```bash
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+# NSE JSON API: the home page sets the cookies the API needs (the page itself may answer 403, the cookies still arrive)
+curl -sS -c /tmp/nse.jar -A "$UA" -o /dev/null https://www.nseindia.com/
+curl -sS -b /tmp/nse.jar -A "$UA" -H 'Referer: https://www.nseindia.com/' \
+  'https://www.nseindia.com/api/equity-stockIndex?index=SECURITIES%20IN%20F%26O' | head -c 300
+#   other paths: marketStatus, allIndices, market-data-pre-open?key=ALL, holiday-master?type=trading,
+#   equity-stock-indices?index=NIFTY%20200, and (index=equities&from_date=DD-MM-YYYY&to_date=DD-MM-YYYY)
+#   corporate-announcements, event-calendar
+# NSE archive files: no cookies
+curl -sS -A "$UA" -o /dev/null -w '%{http_code}\n' https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv
+# Yahoo
+curl -sS -A 'Mozilla/5.0' 'https://query1.finance.yahoo.com/v8/finance/spark?symbols=%5ENSEI,%5EGSPC&range=5d&interval=1d'
+```
+
+How to read the result: `200` with JSON is healthy. **`404`** means the endpoint name is gone (NSE retired `equity-stockIndices` in
+2026): find the new name in the browser's network tab on the NSE page that shows the data, then update the constants in
+`ingestion/nse.py` and the register in `ingestion/registry.py` (`python scripts/generate_docs.py` rewrites `docs/DATA_SOURCES.md`).
+**`403`** on the API from curl but `200` from `monster-ai doctor` is normal: the project's client has a real browser TLS fingerprint
+and plain curl has not; if both get `403`, the provider blocks this address range (see the playbook above). **`429`** is a rate limit
+(GDELT allows one request every 5 seconds and is slow and throttling at times; it is optional, and a failing GDELT never stops a
+report). On Windows `curl.exe` may fail with `CRYPT_E_NO_REVOCATION_CHECK` behind a network that blocks the certificate-revocation
+check: add `--ssl-no-revoke` for the test (the project's own client is not affected).
 
 ## Backups and recovery
 

@@ -106,7 +106,7 @@ flowchart TB
 Dependency rules, checked against the import graph:
 
 - `database` and `ranking` import nothing but `app`; `event_graph` imports only `database`; `notifications` imports only
-  `ranking.types` besides `app`.
+  `ranking.types` and the list names of `backtesting.ideas` besides `app` (and Pillow, lazily, for the chart images).
 - `features`, `ingestion` and `backtesting` use `automation.calendar` as a shared service (it is the only `automation`
   module a lower layer imports; `models.external` imports `automation.runner` lazily to run the model-sync job).
 - Only `automation` and `app.cli` see every package; nothing below them imports upwards.
@@ -324,7 +324,15 @@ How it is built:
 - **Rendering and delivery** (`notifications/ideas.py`, `NotificationService.send_ideas`): the same guarantees as the other reports
   (escaping, `n/a` for a missing figure, messages of at most 3,900 characters, an idempotent ledger) plus a score that is never drawn
   as a probability and a report withheld after 15:05 unless forced (then marked late; one built after the deadline is also kept out of
-  the record).
+  the record). The levels are repeated in two monospace tables at the top (at most 37 characters wide) and, after the text, two chart
+  images follow (`notifications/charts.py`): the board and the trade plan.
+- **Chart images** (`notifications/canvas.py` draws, `notifications/charts.py` composes): Pillow draws each chart at twice its size and
+  shrinks it once (smooth edges without a vector library; the built-in font has ASCII only, so every label is sanitised and the arrows
+  are shapes). A chart is built from the same report object as the text and returned as bytes, a Telegram-HTML caption and the list of
+  every label drawn (the tests read it to check what a chart claims). `NotificationService` builds and sends the images only
+  after the text is delivered and recorded, within a 45-second budget, never for a late report, and any failure (no Pillow,
+  `SEND_CHARTS=false`, a drawing error, a refused or slow upload) is logged and changes nothing about the delivery; the ledger knows
+  the text only.
 
 ## News intelligence and the optional AI services
 
@@ -464,14 +472,14 @@ the batches of a drained backlog) are in `news.last_run`, and what the web check
 
 | Package | Responsibility |
 |---------|----------------|
-| [app/](../app) | configuration (single typed catalogue in `config.py`, generates `.env.example`), injectable clock (UTC instants, IST market logic, display zone), logging (daily files, secret redaction, crash hooks) with the `logs` / `diag` tools, code fingerprint (`release.py`), file locks, resource guards (RSS watchdog, disk, RAM), CLI, `doctor`, error hierarchy |
+| [app/](../app) | configuration (single typed catalogue in `config.py`, generates `.env.example`), injectable clock (UTC instants, IST market logic, display zone), logging (daily files, secret redaction, crash hooks) with the `logs` / `diag` tools, code fingerprint (`release.py`), file locks, resource guards (RSS watchdog, disk, RAM), CLI, `doctor` (machine preflight) and `sourcecheck.py` (reads every data endpoint through the production clients: `monster-ai sources-check`), error hierarchy |
 | [ingestion/](../ingestion) | the curl_cffi HTTP transport (`http.py`: browser impersonation, adaptive per-source rate limit, retries, circuit breaker, deadlines), Yahoo (chart + bulk `spark` probe), NSE archive and API clients, validation, universe building, freshness / data-quality gate, split-adjusted reads (`adjust.py`) and basis-break repair (`basis.py`), news collectors (RSS conditional GET), source catalogue (`registry.py` -> [DATA_SOURCES.md](DATA_SOURCES.md)) |
 | [database/](../database) | SQLite connection (WAL, busy timeout), versioned migrations, the `Store` repository, verified online backups with a size budget (optionally gpg-encrypted), S3-compatible object store (SigV4, stdlib only), off-box backup helpers |
 | [features/](../features) | the single feature builder used by training and live scoring: technical, F&O, global, regime, calendar, sector, similar-day; label construction; schema hash and `FEATURE_VERSION`; the point-in-time panel loader; `swing.py`, the as-of-session features of the closing-hour trade ideas (volume projected to a full day) |
 | [news_intelligence/](../news_intelligence), [event_graph/](../event_graph) | deduplication, entity linking, event extraction (rules first, then the optional Groq LLM `llm.py`, its web check `web.py` and Jev `jev.py` behind the shared safety rails of `remote.py`; `context.py` holds the facts both readers receive; `ai_check.py` is the live self-check behind `ai-test`), source quality and provenance (rumour, source class, independent sources), "priced in" detection; supply-chain / sector impact propagation over a seeded expert-prior graph whose edges are re-measured weekly from returns ([automation/graph_learning.py](../automation/graph_learning.py): lagged regression, out-of-sample lag choice, sign stability, Benjamini-Hochberg control; edges without a price series stay labelled priors) with an append-only edge history |
 | [models/](../models) | LightGBM specialists + meta model, isotonic calibration, walk-forward training, gates, artifact format (text models + JSON, **never pickle**), registry (champion/challenger, rollback), HMAC-signed bundles for external training |
 | [ranking/](../ranking) | eligibility, conviction tiers, contradiction checks, cost estimates (intraday and delivery-style), abstention, baselines; `ideas.py`, the closing-hour trade ideas: setups, gates, mechanical ATR levels, news veto, market regime |
-| [notifications/](../notifications) | Telegram client, report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`, `ideas.py` the closing-hour report), idempotent delivery with a ledger and deadline guard |
+| [notifications/](../notifications) | Telegram client (messages and photos), report renderers (4096-char safe; `style.py` holds the emoji, bars and next-step hints, `samples.py` the made-up data behind `telegram-preview`, `ideas.py` the closing-hour report), chart images (`canvas.py` drawing primitives, `charts.py` the four charts), idempotent delivery with a ledger and deadline guard |
 | [automation/](../automation) | the scan, the closing-hour ideas scan and evaluation (`ideas.py`), all jobs, the schedule engine, the daemon, the job runner, bootstrap, health, the exchange calendar, bounded-storage retention |
 | [backtesting/](../backtesting) | outcome evaluation (provisional -> official), metrics with day-block bootstrap intervals, the live range-forecast record and its slices, walk-forward backtest; `ideas.py`, the outcome rules and the live-record gate of the trade ideas |
 | [dashboard/](../dashboard) | optional read-only FastAPI dashboard (loopback by default) |
@@ -930,6 +938,8 @@ flowchart TB
 | A model file cannot be read (I/O error) | the champion is kept and the labelled baseline serves that scan only (`model_load_failed`); only definite damage (missing or altered files, wrong feature version) retires a model |
 | gpg missing while backup encryption is configured | the local backup stays, unencrypted, and is **not** uploaded off-box; `backup_encryption_failed` alert and a health warning until it is fixed |
 | Telegram down | reports and alerts are queued in the ledger and flushed when it returns; late final reports are withheld |
+| Pillow missing, a chart that cannot be drawn, or Telegram refusing an image | the text report is delivered and recorded first and stays as it is; the images are skipped, the reason is logged (`chart images stopped` / `charts skipped`) and `doctor` shows a `charts` warning when Pillow is missing |
+| GDELT slow or rate limited (it often is: HTTP 429, 14-36 s to first byte) | its queries are counted as failed and `source_health` (`gdelt`) warns; the 44 RSS feeds and everything else are unaffected, since GDELT is discovery only |
 | Process killed / reboot | systemd restarts the daemon; the ledger resumes; SQLite WAL recovery; `daemon_restarted` alert |
 | Database locked while the daemon lives | the heartbeat file proves liveness; `heartbeat_db_stale` warns instead of a false "daemon dead" |
 | Disk low | emergency cleanup of caches, logs and temp files; heavy jobs deferred and training refused; critical alert; retention windows shrink |

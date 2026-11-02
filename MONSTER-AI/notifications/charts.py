@@ -418,6 +418,8 @@ def _candidates(ctx: Any, sample: bool) -> Chart | None:
     blocks.append(_list(lead + ": expected intraday range", note, rows, 78, row))
     badge = text._MODEL_BADGES.get(status, text._SHADOW_BADGE)[1]
     notes = [(f"Model status: {badge}", cv.GREEN if validated else cv.AMBER)]
+    if stage == "Preliminary":
+        notes.insert(0, (text.PRELIM_NOTICE, cv.AMBER))
     if not validated:
         notes.append((text.SHADOW_BANNER, cv.AMBER))
     blocks.append(_notes([*notes, (text.DISCLAIMER, cv.MUTED)]))

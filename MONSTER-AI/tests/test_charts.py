@@ -146,6 +146,16 @@ def test_the_candidates_chart_shows_a_probability_only_for_a_model_that_is_not_t
     assert "WATCH" in said(capped) and "STRONG" not in said(capped)  # the tier is capped like it is in the text
 
 
+def test_a_preliminary_chart_carries_the_same_warning_as_the_text_and_a_final_one_does_not():
+    from notifications.report import PRELIM_NOTICE, render_prelim_report
+
+    (preliminary,) = report_charts(make_ctx(stage="pre", snapshot_ist="2026-11-02 08:45:00 IST"))
+    assert PRELIM_NOTICE in said(preliminary) and "Preliminary large-move scan" in said(preliminary)
+    assert PRELIM_NOTICE in "\n".join(render_prelim_report(make_ctx(stage="pre")))  # one wording for the text and the picture
+    (final,) = report_charts(make_ctx())
+    assert PRELIM_NOTICE not in said(final) and "Final large-move scan" in said(final)
+
+
 def test_the_candidates_chart_adds_the_sector_mix_when_there_is_more_than_one_sector():
     mixed = [make_candidate(rank=1, symbol="AAA", sector="Energy"), make_candidate(rank=2, symbol="BBB", sector="Banks"),
              make_candidate(rank=3, symbol="CCC", sector="Energy")]

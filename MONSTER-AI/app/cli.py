@@ -105,6 +105,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return EXIT_FAIL if report.failed else EXIT_OK
 
 
+def cmd_sources_check(args: argparse.Namespace) -> int:
+    """Read every data endpoint through the production clients and say which still answer (and why not)."""
+    from app.sourcecheck import render, run_checks
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    report = run_checks(settings, args.only)
+    if args.json:
+        _print_json(report.to_dict())
+    else:
+        print(render(report))
+    return EXIT_FAIL if report.failed else EXIT_OK
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     from automation.runner import execute_job
 
@@ -559,7 +573,7 @@ def cmd_telegram_test(args: argparse.Namespace) -> int:
 
 
 def cmd_telegram_preview(args: argparse.Namespace) -> int:
-    """Send one sample of every kind of Telegram message (made-up data, each one marked as a preview) to see how they look."""
+    """Send one sample of every kind of Telegram message (made-up data, each one marked as a preview, with its chart images) to see how they look."""
     from notifications import samples
     from notifications.telegram import TelegramClient
 
@@ -650,6 +664,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 # ------------------------------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
+    from app.sourcecheck import SECTIONS as SOURCE_SECTIONS
+
     parser = argparse.ArgumentParser(prog="monster", description="MONSTER AI - NSE large-move intelligence (shadow mode).")
     parser.add_argument("--env-file", help="dotenv file (default: $MONSTER_ENV_FILE or ./.env)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -664,6 +680,10 @@ def build_parser() -> argparse.ArgumentParser:
     add("init", cmd_init, "create directories, migrate the database, seed the calendar")
     p = add("doctor", cmd_doctor, "verify this machine can run the system")
     p.add_argument("--offline", action="store_true", help="skip network checks")
+    p.add_argument("--json", action="store_true")
+    p = add("sources-check", cmd_sources_check, "read every data endpoint (NSE, Yahoo, feeds, ...) and say which still answer")
+    p.add_argument("--only", nargs="+", choices=SOURCE_SECTIONS, metavar="SECTION",
+                   help=f"check only these sections: {', '.join(SOURCE_SECTIONS)} (default: all)")
     p.add_argument("--json", action="store_true")
     p = add("bootstrap", cmd_bootstrap, "first-run setup (resumable)")
     p.add_argument("--resume", action="store_true", help="continue from the last completed step")
@@ -735,7 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-only", action="store_true")
     p.add_argument("--write-env")
     add("telegram-test", cmd_telegram_test, "send a test message")
-    p = add("telegram-preview", cmd_telegram_preview, "send one sample of every Telegram message type (made-up data)")
+    p = add("telegram-preview", cmd_telegram_preview, "send one sample of every Telegram message type with its tables and charts (made-up data)")
     p.add_argument("--only", nargs="+", metavar="KIND", help="only these kinds (see --list)")
     p.add_argument("--list", action="store_true", help="list the kinds of sample message and exit")
     p.add_argument("--delay", type=float, default=1.2, help="seconds between messages (default 1.2)")

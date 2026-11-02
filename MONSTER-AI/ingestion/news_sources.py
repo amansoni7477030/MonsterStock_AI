@@ -34,6 +34,15 @@ FEED_DISABLE_HOURS = 24
 FEED_FULL_REFRESH_HOURS = 6  # conditional GETs are trusted for this long; then one unconditional fetch (a publisher may answer 304 forever)
 MAX_ITEMS_PER_FEED = 60
 TRACKING_PARAMS = {"fbclid", "gclid", "ref", "ocid", "cmpid", "taid", "mc_cid", "mc_eid", "guccounter", "guce_referrer"}
+GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+
+def gdelt_client(settings: Settings, clock: Clock | None = None) -> HttpClient:
+    """The client of the GDELT DOC API (a request every six seconds: the API allows one in five). One place, so the news job and
+    ``sources-check`` talk to GDELT the same way."""
+    return HttpClient.from_settings(
+        "gdelt", settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=6.0, timeout=(8.0, 25.0),
+        max_attempts=2, backoff_base=7.0, clock=clock, max_bytes=4 * 1024 * 1024)
 
 
 @dataclass
@@ -227,9 +236,7 @@ class NewsCollector:
         report = CollectReport()
         if not self.settings.gdelt_enabled:
             return report
-        client = HttpClient.from_settings(
-            "gdelt", self.settings, headers={"User-Agent": USER_AGENT_SIMPLE}, min_interval=6.0, timeout=(8.0, 25.0),
-            max_attempts=2, backoff_base=7.0, clock=self.clock, max_bytes=4 * 1024 * 1024)
+        client = gdelt_client(self.settings, self.clock)
         clk = self.clock or get_clock()
         hours = lookback_hours or self.settings.news_lookback_hours
         now_iso = iso(self._now())
@@ -239,7 +246,7 @@ class NewsCollector:
                 break
             report.attempted += 1
             try:
-                payload = client.get("https://api.gdeltproject.org/api/v2/doc/doc", params={
+                payload = client.get(GDELT_URL, params={
                     "query": q["query"], "mode": "artlist", "format": "json", "maxrecords": "60", "timespan": f"{hours}h",
                     "sort": "datedesc"}).json()
             except (DataUnavailable, CircuitOpen) as exc:

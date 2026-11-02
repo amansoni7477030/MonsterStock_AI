@@ -13,7 +13,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from app import jsonutil
@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 CHANNEL = "telegram"
 LATE_PREFIX = "⏰ <b>LATE</b> - sent after the deadline, for the record only"
 FLUSH_MIN_GAP_SEC = 1.0
+CHART_BUDGET_SEC = 45.0  # the images are an extra: they never hold a job longer than this once the text is out
 
 
 @dataclass
@@ -334,9 +335,10 @@ class NotificationService:
         if build is None or not callable(send) or not getattr(self.settings, "send_charts", True):
             return 0
         sent = 0
+        until = self.clock.now() + timedelta(seconds=CHART_BUDGET_SEC)
         try:
             for chart in build():
-                send(chat_id, chart.png, caption=chart.caption, filename=chart.filename)
+                send(chat_id, chart.png, caption=chart.caption, filename=chart.filename, deadline=until)
                 sent += 1
         except Exception as exc:  # noqa: BLE001 - an image is an extra: the text report is already delivered
             log.warning("%s: chart images stopped after %d: %s at %s", key, sent, _safe_reason(exc), exception_site(exc))

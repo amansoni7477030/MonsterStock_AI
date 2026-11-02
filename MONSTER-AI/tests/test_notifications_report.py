@@ -225,6 +225,36 @@ def test_plain_dict_candidates_render_like_objects():
     assert render_final_report(make_ctx([as_dict])) == render_final_report(make_ctx([candidate]))
 
 
+def glance_rows(messages):
+    block = re.search(r"At a glance.*?<pre>(.*?)</pre>", "\n".join(messages), re.DOTALL)
+    return html.unescape(block.group(1)).split("\n") if block else []
+
+
+def test_the_candidates_are_also_given_as_a_compact_monospace_table():
+    cands = [make_candidate(2, "BBB", tier="MODERATE", p={"hit_3": 0.5}, range={"q10": 1.0, "q90": 4.0}),
+             make_candidate(1, "AAA"), make_candidate(3, "M&M", tier="WATCH", p={}, range={})]
+    rows = glance_rows(render_final_report(make_ctx(cands)))
+    assert [row.split() for row in rows] == [
+        ["#", "SYMBOL", "TIER", "P(>3%)", "RANGE", "%"], ["1", "AAA", "STRONG", "62%", "2.1-5.6"],
+        ["2", "BBB", "MODERATE", "50%", "1.0-4.0"], ["3", "M&M", "WATCH", "n/a", "n/a"],
+    ]
+    assert all(len(row) <= 39 for row in rows)  # narrow enough for a phone without sideways scrolling
+    assert_telegram_safe(render_final_report(make_ctx(cands)))  # the ampersand in the symbol is escaped inside the block
+
+
+def test_the_table_shows_a_probability_only_for_a_model_that_is_not_the_baseline_and_caps_unvalidated_tiers():
+    baseline = glance_rows(render_final_report(make_ctx(model_status="baseline")))
+    assert baseline[1].split() == ["1", "FAKECO", "WATCH", "n/a", "2.1-5.6"]
+    assert "heuristic ranking, no probability" in "\n".join(render_final_report(make_ctx(model_status="baseline")))
+    shadow = glance_rows(render_final_report(make_ctx(model_status="shadow")))
+    assert shadow[1].split() == ["1", "FAKECO", "WATCH", "62%", "2.1-5.6"]  # STRONG is capped at WATCH, like everywhere else
+
+
+def test_a_day_without_a_setup_has_no_table_of_weak_names():
+    assert glance_rows(render_final_report(make_ctx(no_setup=True, no_setup_reason="weak"))) == []
+    assert glance_rows(render_final_report(make_ctx([]))) == []
+
+
 # --------------------------------------------------------------------------------------- no setup
 def test_no_setup_block_labels_remaining_names_as_weak_watchlist():
     ctx = make_ctx([make_candidate(1, "AAA", tier="STRONG")], no_setup=True, no_setup_reason="Top probability only 33% <low>")

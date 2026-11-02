@@ -7,11 +7,15 @@ by itself).
 
 ## [Unreleased]
 
-Closing-hour trade ideas (BTST, swing, bearish F&O and a next-day intraday watchlist) and a longer Groq model chain. No database
-migration; the new records live in the key-value store under `ideas:` and are pruned with the other records.
+Closing-hour trade ideas (BTST, swing, bearish F&O and a next-day intraday watchlist), a longer Groq model chain, and tables and chart
+images in the Telegram reports. No database migration; the new records live in the key-value store under `ideas:` and are pruned with
+the other records.
 
 ### Upgrade notes
 
+- **New dependency `Pillow==12.3.0`** (binary wheels for linux x86-64 and aarch64, CPython 3.10-3.13; the installer and the CI wheel
+  guard cover it, because both read `requirements.txt`). It only draws the chart images: without it the reports go out as text.
+  **New setting `SEND_CHARTS`** (true) switches the images off; the tables are part of the text and need nothing.
 - **New jobs and schedule entries** (picked up when the scheduler restarts): `collect_news` at 13:40 (slot `midday`), `closing_scan`
   at 14:30 (a try every minute for the whole window until 15:00) and `evaluate_ideas` after `ingest_eod`. Run `sudo monster-ai jobs`
   to see them.
@@ -25,6 +29,28 @@ migration; the new records live in the key-value store under `ideas:` and are pr
 
 ### Added
 
+- **Tables and chart images in the Telegram reports** (`notifications/canvas.py`, `notifications/charts.py`, `send_photo` in
+  `notifications/telegram.py`, see README *What the Telegram messages look like*). The 09:12 report and the closing-hour report get an
+  "at a glance" table in monospace (at most 39 / 37 characters wide, so a phone needs no sideways scrolling); the closing-hour report
+  also gets a table of tomorrow's buy-above / sell-below levels. After the text, each report is followed by PNG images drawn with
+  Pillow: the candidates' expected range against the target and the sector mix (morning), the **board** with a donut of the ideas by
+  list, the breadth bar and the bars of the setup scores plus the **trade plan** with the loss at the stop and the gain at the two
+  targets of each idea (afternoon), the hit / missed donut, the model against the baselines and the realised range of each pick
+  (evening). The images keep the honesty rules of the text: a score is never drawn as a probability, a probability is shown only for a
+  model that is not the heuristic baseline and under the shadow banner, a day without a setup and a late report get no image, a missing
+  number is left out. A chart is best-effort and sent only after the text is delivered and recorded, within a 45-second budget (a slow
+  Telegram cannot keep a job busy with pictures): no Pillow, `SEND_CHARTS=false`, a
+  drawing error or a refused upload leaves the delivered report untouched (the failure is logged). `telegram-preview` sends the
+  samples with a red SAMPLE strip on every image. The client's `send_photo` has the retries, rate-limit waits, chat migration and
+  plain-caption fallback of `send_message`.
+- **`monster-ai sources-check [--only SECTION ...] [--json]`** (`app/sourcecheck.py`): the endpoint audit as a command. It reads every
+  endpoint the system uses through the production clients (the NSE JSON API, the NSE archive files, Yahoo, all RSS feeds, GDELT) and
+  prints ok / warn / FAIL with the reason of each one, so a retired or renamed endpoint (NSE did it once already in 2026) is found
+  before a scan stumbles on it; exit code 1 when an endpoint the system needs does not answer, while GDELT and a single feed are only
+  warnings. It reads, never writes. Run against the live services on 2026-11-02 it reported every endpoint ok except GDELT (a timeout).
+  The GDELT client now lives in one function (`ingestion.news_sources.gdelt_client`), used by the news job and by the check.
+- **`doctor` checks the NSE JSON API** (the cookie handshake and the F&O live-quote list the closing scan reads, so a retired endpoint
+  name shows up as a warning with its reason before 14:30) **and the chart library**.
 - **Closing-hour trade ideas** (`automation/ideas.py`, `ranking/ideas.py`, `features/swing.py`, `backtesting/ideas.py`,
   `notifications/ideas.py`; CLI `monster-ai ideas [--dry-run] [--force]`): at 14:30 IST NSE's live quotes for the whole F&O segment (one
   request) are laid over the stored daily history as the session in progress, with volume projected to a full day by a typical
@@ -72,6 +98,22 @@ migration; the new records live in the key-value store under `ideas:` and are pr
   others the date of some old update) and its prices come as text; a first version that required today's date on every row would
   have refused the whole answer. Every row now carries the answer's own timestamp, and a stamp on a row is not trusted.
 - `ai-test --list-only` confirmed that the project's Groq key lists all three models of the chain.
+- **Full endpoint audit (2026-11-02 evening)**, every endpoint the code calls, through the project's own clients (curl_cffi, Chrome
+  profile) and cross-checked with the plain `curl` CLI; nothing else was outdated:
+  NSE API `marketStatus` (GIFT Nifty), `market-data-pre-open` (`ALL`, `FO`), `allIndices`, `equity-stockIndex`,
+  `equity-stock-indices` (Nifty 200 / 500), `corporate-announcements`, `event-calendar` and `holiday-master` all answer with data;
+  NSE archives (`sec_bhavdata_full`, the UDiFF F&O zip, the four index lists, `fo_mktlots.csv`) and Yahoo (`v8/finance/spark` for all
+  33 series, the chart endpoint for every series and the live-context quotes) answer; 44 of 44 RSS feeds parse (newest item 6
+  minutes to 88 hours old; the RBI, SEBI and Nikkei feeds carry dates feedparser cannot read, which the collector already tolerates);
+  Telegram (`getMe`, real messages and photos), Groq (key, all three models and the web search) and Jev answer.
+  **GDELT**, an optional discovery source, is up but was slow and throttling that day (HTTP 429 "one request every 5 seconds" on most
+  tries, 14-36 s to first byte, once an empty answer); its URL is current, raising the client's timeouts cannot help a rate limit, and
+  its failures were already isolated (counted, the source marked unhealthy, the 44 feeds unaffected), so it is left as it is.
+  `NseApi.live_equities` also works with the client's default `Referer`.
+- **curl on Windows**: `curl.exe` uses Schannel, which fails behind a network that blocks the certificate-revocation check
+  (`CRYPT_E_NO_REVOCATION_CHECK`); add `--ssl-no-revoke` for diagnosis. The project's own client (BoringSSL via curl_cffi) is not
+  affected. Plain curl gets a 403 on the NSE home page but still receives the cookies, and the API answers with them (see
+  `docs/OPERATIONS.md`).
 
 ### Found by an independent review of this change, and fixed
 

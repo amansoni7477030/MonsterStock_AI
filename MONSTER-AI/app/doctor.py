@@ -294,9 +294,9 @@ def run_doctor(*, offline: bool = False, env_file: str | None = None) -> DoctorR
     return report
 
 
-def render(report: DoctorReport) -> str:
+def render(report: DoctorReport, *, failed: str = "NOT READY: fix the [FAIL] items above",
+           passed: str = "READY (warnings, if any, are optional improvements)") -> str:
     marks = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
     width = max((len(c.name) for c in report.checks), default=10)
     lines = [f"{marks[c.status]} {c.name.ljust(width)}  {c.detail}" for c in report.checks]
-    verdict = "NOT READY: fix the [FAIL] items above" if report.failed else "READY (warnings, if any, are optional improvements)"
-    return "\n".join([*lines, "", verdict])
+    return "\n".join([*lines, "", failed if report.failed else passed])

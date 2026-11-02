@@ -25,6 +25,14 @@ def test_defaults_are_valid_and_safe(tmp_path):
     assert s.dashboard_enabled is False and s.dashboard_host == "127.0.0.1"
     assert s.db_path.name == "monster.db"
     assert s.telegram_configured is False
+    assert s.send_charts is True  # the charts are on by default and need nothing else than the Pillow package
+
+
+def test_the_charts_have_one_switch(tmp_path):
+    assert _load(tmp_path, SEND_CHARTS="false").send_charts is False and _load(tmp_path, SEND_CHARTS="0").send_charts is False
+    assert _load(tmp_path, SEND_CHARTS="yes").send_charts is True
+    with pytest.raises(ConfigError, match="SEND_CHARTS"):
+        _load(tmp_path, SEND_CHARTS="sometimes")
 
 
 def test_env_overrides_and_paths_follow_data_dir(tmp_path):

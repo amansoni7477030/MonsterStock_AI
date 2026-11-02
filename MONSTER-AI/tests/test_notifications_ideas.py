@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import html
 import math
+import re
 
 import pytest
 
@@ -14,7 +15,7 @@ from notifications.ideas import HEURISTIC_BANNER, LATE_BANNER, RECORD_BANNER, re
 from notifications.service import NotificationService
 from ranking.types import Catalyst, IdeasReport, TradeIdea
 from tests.test_notifications_report import _BAD_NUMBER, assert_telegram_safe, lines
-from tests.test_notifications_service import TOKEN, FakeClient, set_ist
+from tests.test_notifications_service import TOKEN, FakeClient, PhotoClient, set_ist
 
 KEY = "ideas:2026-11-02"
 
@@ -105,6 +106,35 @@ def test_missing_and_non_finite_figures_render_as_na_and_are_never_invented():
     text = text_of(make_report(ideas=[broken]))
     assert "n/a" in text and not _BAD_NUMBER.search(text)
     assert "score n/a" in text and "Stop n/a" in text and "Entry about n/a" in text
+
+
+def test_the_levels_are_also_given_as_compact_monospace_tables():
+    text = text_of(make_report())
+    first, second = re.findall(r"<pre>(.*?)</pre>", text, re.DOTALL)
+    assert [row.split() for row in html.unescape(first).split("\n")] == [
+        ["SYMBOL", "ENTRY", "STOP", "T1"], ["B+", "DEMOCO", "1000.0", "960.00", "1040.0"],
+        ["S+", "SWINGCO", "1000.0", "960.00", "1040.0"], ["B-", "SHORTCO", "1000.0", "1040.0", "960.00"],
+    ]
+    assert [row.split() for row in html.unescape(second).split("\n")] == [
+        ["SYMBOL", "BUY", "ABOVE", "SELL", "BELOW"], ["W", "WATCHCO", "505.00", "495.00"],
+    ]
+    assert all(len(line) <= 37 for block in (first, second) for line in html.unescape(block).split("\n"))  # no sideways scrolling
+    assert "B = BTST: sell in the next session" in text and "Tomorrow's levels" in text
+    assert text.index("At a glance") < text.index("BTST - buy before the close")  # the tables come first
+
+
+def test_a_report_without_levels_has_no_tables_and_unknown_levels_say_so():
+    assert "<pre>" not in text_of(make_report(ideas=[]))
+    broken = make_idea(entry=None, stop=float("nan"), target1=None)
+    (table,) = re.findall(r"<pre>(.*?)</pre>", text_of(make_report(ideas=[broken])), re.DOTALL)
+    assert html.unescape(table).split("\n")[1].split() == ["B+", "DEMOCO", "n/a", "n/a", "n/a"]
+
+
+def test_a_symbol_in_a_table_is_clipped_and_escaped():
+    text = text_of(make_report(ideas=[make_idea(symbol="M&M<b>VERYLONGSYMBOL")]))
+    (table,) = re.findall(r"<pre>(.*?)</pre>", text, re.DOTALL)
+    assert "<b>V" not in table and "M&amp;M&lt;b&gt;V..." in table  # escaped inside the block
+    assert html.unescape(table).split("\n")[1].split()[1] == "M&M<b>V..."  # clipped to ten characters before it was escaped
 
 
 def test_untrusted_text_is_escaped_everywhere():
@@ -299,3 +329,55 @@ def test_a_failed_delivery_is_retried_by_the_next_call(cfg, store, fake_clock):
     set_ist(fake_clock, "14:31")
     assert service.send_ideas(make_report()).status == "failed" and store.get_delivery("telegram", KEY)["status"] == "failed"
     assert service.send_ideas(make_report()).status == "sent" and store.get_delivery("telegram", KEY)["status"] == "sent"
+
+
+# ----------------------------------------------------------------------------------------- the charts
+def test_the_report_is_followed_by_its_board_and_its_trade_plan(cfg, store, fake_clock):
+    client = PhotoClient()
+    service = NotificationService(cfg, store, client=client, clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    result = service.send_ideas(make_report())
+    texts = len(render_ideas_report(make_report()))
+    assert result.status == "sent" and client.order == ["text"] * texts + ["photo", "photo"]  # the text is never held back
+    assert [name for _, _, _, name in client.photos] == ["ideas-board.png", "ideas-plan.png"]
+    assert all(chat == "1001" and png.startswith(b"\x89PNG") for chat, png, _, _ in client.photos)
+    assert all("not probabilit" in caption or "not forecasts" in caption for _, _, caption, _ in client.photos)
+    assert store.get_delivery("telegram", KEY)["status"] == "sent"
+
+
+def test_a_report_that_goes_out_late_gets_no_images(cfg, store, fake_clock):
+    client = PhotoClient()
+    service = NotificationService(cfg, store, client=client, clock=fake_clock)
+    set_ist(fake_clock, "15:20")
+    assert service.send_ideas(make_report(), force=True).status == "sent"  # built on time, sent after the deadline
+    assert client.photos == [] and "photo" not in client.order
+    late = PhotoClient()
+    other = NotificationService(cfg, store, client=late, clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    assert other.send_ideas(make_report(trade_date="2026-11-03", late=True), force=True).status == "sent"  # built late
+    assert late.photos == []
+
+
+def test_a_failed_image_never_changes_the_delivered_report(cfg, store, fake_clock):
+    client = PhotoClient(photo_script=[RuntimeError("telegram refused the photo")])
+    service = NotificationService(cfg, store, client=client, clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    assert service.send_ideas(make_report()).status == "sent"
+    assert store.get_delivery("telegram", KEY)["status"] == "sent" and store.pending_alerts() == [] and client.photos == []
+
+
+def test_the_charts_can_be_switched_off_with_one_setting(cfg, store, fake_clock):
+    client = PhotoClient()
+    service = NotificationService(dataclasses.replace(cfg, send_charts=False), store, client=client, clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    assert service.send_ideas(make_report()).status == "sent" and client.photos == []
+
+
+def test_the_text_still_goes_out_when_pillow_is_missing(cfg, store, fake_clock, monkeypatch):
+    from notifications import canvas
+
+    monkeypatch.setattr(canvas, "Image", None)
+    client = PhotoClient()
+    service = NotificationService(cfg, store, client=client, clock=fake_clock)
+    set_ist(fake_clock, "14:31")
+    assert service.send_ideas(make_report()).status == "sent" and client.photos == [] and "text" in client.order

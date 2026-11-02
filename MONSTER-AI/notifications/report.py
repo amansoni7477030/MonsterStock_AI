@@ -28,6 +28,10 @@ DISCLAIMER = (
     "A wide intraday range does not imply a profitable trade or a directional close."
 )
 SHADOW_BANNER = "SHADOW MODE: no demonstrated edge over simple baselines yet - tiers are capped at WATCH."
+PRELIM_NOTICE = (
+    "PRELIMINARY: based on the 08:45 scan, before pre-open price discovery. This list may change materially and must not be "
+    "treated as confirmed."
+)
 NO_SETUP_TITLE = "NO HIGH-CONVICTION SETUP today"
 WEAK_LABEL = "WEAK / WATCHLIST ONLY"
 HEURISTIC_LABEL = "heuristic, NOT calibrated"
@@ -466,10 +470,7 @@ def _render_report(ctx: ReportContext, *, preliminary: bool) -> list[str]:
         f"🧠 Model <code>{_esc(version)}</code> · {badge} <b>{status_label}</b>",
     ]
     if preliminary:
-        head.append(
-            "⏳ <b>PRELIMINARY: based on the 08:45 scan, before pre-open price discovery. This list may change "
-            "materially and must not be treated as confirmed.</b>"
-        )
+        head.append(f"⏳ <b>{PRELIM_NOTICE}</b>")
     if not validated:
         head.append(f"🧪 <b>{SHADOW_BANNER}</b>")
 

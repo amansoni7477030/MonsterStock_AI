@@ -282,6 +282,25 @@ deadline (marked late) and only scans first when nothing is frozen;
 (see [Configuration](#configuration)); `IDEAS_ENABLED=false` switches the whole feature off and `SEND_IDEAS_REPORT=false` keeps it
 computing, freezing and evaluating silently.
 
+## What the Telegram messages look like
+
+Every report is Telegram HTML (bold, italics, emoji) with a **table at a glance** in monospace (a `<pre>` block, at most 39 characters
+wide so a phone needs no sideways scrolling) and, sent **after the text**, **chart images** (PNG photos drawn on the machine with
+Pillow: no data goes to a chart service):
+
+| Report | Table | Chart images |
+|--------|-------|--------------|
+| 09:12 scan (and the optional 08:45 one) | rank, symbol, tier, P(range above the target), 80 % range | each candidate's expected range against the target line, and the sector mix when there are two sectors or more |
+| 14:30 closing-hour ideas | entry, stop and first target of every BTST, swing and bearish idea; buy-above / sell-below levels of the watchlist | the **board** (donut of the ideas by list, breadth bar, bars of the setup scores) and the **trade plan** (loss at the stop and gain at the two targets of each idea) |
+| evening evaluation | picks against what happened | donut of hit / missed / not judged, the model against the baselines, the realised range of each pick against the target |
+
+The images follow the same honesty rules as the text: a closing-hour score is called a score and is never drawn as a probability; a
+probability appears only for a model that is not the heuristic baseline, under the same shadow-mode banner; a morning without a
+high-conviction setup, and a report that goes out after its deadline, get no image; a missing number is left out, never invented.
+A chart is an extra: `SEND_CHARTS=false`, or a machine without Pillow, sends text only, and an image that cannot be drawn or is
+refused by Telegram is logged and never changes a report that was already delivered. `sudo monster-ai doctor` says whether charts
+are on, and `sudo monster-ai telegram-preview` sends a sample of everything (every image carries a red *SAMPLE PREVIEW* strip).
+
 ## Commands
 
 `python -m app.cli <command>` (on the server: `sudo monster-ai <command>`):
@@ -289,7 +308,8 @@ computing, freezing and evaluating silently.
 | Command | Purpose |
 |---------|---------|
 | `init` | create directories, migrate the database, seed the calendar |
-| `doctor [--offline] [--json]` | verify the machine: configuration, permissions, disk, RAM, clock, feed reachability |
+| `doctor [--offline] [--json]` | verify the machine: configuration, permissions, disk, RAM, clock, feed reachability, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
+| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read every data endpoint (NSE API, NSE archive files, Yahoo, the feeds, GDELT) through the production clients and say which still answer, with the reason of each failure; exit 1 when one the system needs does not answer |
 | `bootstrap [--resume] [--skip-train]` | first-run setup (resumable) |
 | `daemon` | run the scheduler (systemd does this) |
 | `run-job NAME [--key K] [--force] [--dry-run] [--opt K=V]`, `jobs` | run one job now; show the timetable and recent runs |
@@ -304,7 +324,7 @@ computing, freezing and evaluating silently.
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
 | `logs [--role R] [--date D] [-n N] [--level L] [--job J] [--grep T] [--since 90m] [--follow] [--list]` | read, filter and follow the daily logs (default: today's warnings and errors of every process) |
 | `diag` | write a redacted diagnostics bundle (`diag-<UTC>.tar.gz`) for a bug report |
-| `telegram-setup`, `telegram-test`, `telegram-preview` | discover the chat id; send a test message; send one sample of every message type (made-up data, marked *SAMPLE PREVIEW*) |
+| `telegram-setup`, `telegram-test`, `telegram-preview` | discover the chat id; send a test message; send one sample of every message type with its tables and chart images (made-up data, marked *SAMPLE PREVIEW*) |
 | `ai-test [--service llm\|web\|jev] [--list-only] [--json]` | check the Groq / Jev keys: lists the models the key can use, then sends one made-up news item through the real code (and makes one real web search when the web check is on) and prints the answer or why not (`--list-only` spends no tokens and makes no search) |
 | `dashboard` | optional read-only web view |
 | `env-example`, `version` | print the documented `.env` template; print the version and the running code fingerprint |
@@ -491,14 +511,14 @@ signed model bundle (`TRAINING_MODE=external`) for servers too small to train lo
 ## Project layout
 
 ```
-app/            configuration, clock, logging (redaction, daily files), log viewer, diagnostics, locks, resources, CLI, doctor
+app/            configuration, clock, logging (redaction, daily files), log viewer, diagnostics, locks, resources, CLI, doctor, sources-check
 database/       SQLite (WAL) schema + migrations, repository (Store), backup/restore, object store
 ingestion/      curl_cffi HTTP client, Yahoo, NSE, F&O, universe, news, freshness gate, split-basis repair
 features/       point-in-time feature engines + builder + loader, and the closing-hour swing features
 models/         training, calibration, inference, registry, artifacts, signing
 ranking/        eligibility, costs, tiers, abstention, evidence, and the closing-hour trade ideas
 automation/     calendar, scan, closing-hour ideas, jobs, scheduler, schedule engine, health, bootstrap, retention
-notifications/  Telegram client, report renderers and their emoji style, sample previews, idempotent delivery
+notifications/  Telegram client, report renderers and their emoji style, tables and chart images (Pillow), sample previews, idempotent delivery
 news_intelligence/, event_graph/   event extraction (rules + optional Groq / Jev), entity resolution, causal-graph propagation
 backtesting/    metrics, walk-forward report, live evaluation and live record, trade-idea outcomes
 dashboard/      optional read-only web UI (loopback)

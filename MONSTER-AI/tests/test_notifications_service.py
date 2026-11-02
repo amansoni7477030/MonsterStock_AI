@@ -639,3 +639,115 @@ def test_alerts_use_the_main_chat_when_no_alert_chat_is_set(cfg, store, fake_clo
     client = FakeClient()
     service = NotificationService(dataclasses.replace(cfg, telegram_alert_chat_id=None), store, client=client, clock=fake_clock)
     assert service.alert("error", "x", "y") is True and client.sent[0][0] == "1001"
+
+
+# ------------------------------------------------------------------------------------------ chart images
+class PhotoClient(FakeClient):
+    """A FakeClient that also takes photos; ``photo_script`` entries are None (ok) or an exception to raise."""
+
+    def __init__(self, *, photo_script=None, **kwargs):
+        super().__init__(**kwargs)
+        self.photos = []
+        self.photo_options = []
+        self.photo_script = list(photo_script or [])
+        self.order = []
+
+    def send_message(self, chat_id, text, **options):
+        self.order.append("text")
+        return super().send_message(chat_id, text, **options)
+
+    def send_photo(self, chat_id, photo, *, caption=None, filename="chart.png", **options):
+        step = self.photo_script.pop(0) if self.photo_script else None
+        if step is not None:
+            raise step
+        self.order.append("photo")
+        self.photos.append((chat_id, photo, caption, filename))
+        self.photo_options.append(options)
+        self._next_id += 1
+        return self._next_id
+
+
+@pytest.fixture()
+def photo_client():
+    return PhotoClient()
+
+
+@pytest.fixture()
+def photo_svc(cfg, store, fake_clock, photo_client):
+    return NotificationService(cfg, store, client=photo_client, clock=fake_clock)
+
+
+def test_a_report_is_followed_by_its_chart_after_the_text_and_the_ledger_only_knows_the_text(photo_svc, photo_client, store):
+    result = photo_svc.send_report(make_ctx())
+    assert (result.status, result.message_ids) == ("sent", [101])
+    assert photo_client.order == ["text", "photo"]
+    ((chat, png, caption, filename),) = photo_client.photos
+    assert chat == "1001" and png.startswith(b"\x89PNG") and filename == "candidates.png" and "scan" in caption
+    row = store.get_delivery("telegram", KEY)
+    assert row["status"] == "sent" and json.loads(row["message_ids"]) == [101]
+
+
+def test_the_evening_report_sends_its_chart_too(photo_svc, photo_client):
+    assert photo_svc.send_evening(make_summary()).status == "sent"
+    assert photo_client.order == ["text", "photo"] and photo_client.photos[0][3] == "evening.png"
+
+
+def test_charts_can_be_switched_off_and_a_client_without_photos_sends_text_only(cfg, store, fake_clock, photo_client, fake_client):
+    off = NotificationService(dataclasses.replace(cfg, send_charts=False), store, client=photo_client, clock=fake_clock)
+    assert off.send_report(make_ctx()).status == "sent" and photo_client.photos == []
+    plain = NotificationService(cfg, store, client=fake_client, clock=fake_clock)  # a duck-typed client with send_message only
+    assert plain.send_evening(make_summary()).status == "sent" and len(fake_client.sent) == 1
+
+
+def test_a_late_report_gets_no_images(photo_svc, photo_client, fake_clock):
+    set_ist(fake_clock, "09:20:00")
+    assert photo_svc.send_report(make_ctx(), force=True).status == "sent"
+    assert photo_client.order == ["text"]  # kept for the record only: nothing to look at
+
+
+def test_a_refused_image_never_changes_the_report_that_is_already_delivered(cfg, store, fake_clock, caplog):
+    client = PhotoClient(photo_script=[DataUnavailable("telegram", "HTTP 400: Bad Request: wrong file", retryable=False)])
+    service = NotificationService(cfg, store, client=client, clock=fake_clock)
+    with caplog.at_level(logging.WARNING):
+        result = service.send_report(make_ctx())
+    assert result.status == "sent" and store.get_delivery("telegram", KEY)["status"] == "sent" and store.pending_alerts() == []
+    assert "chart images stopped after 0" in caplog.text and "wrong file" in caplog.text
+
+
+def test_a_chart_that_cannot_be_drawn_never_changes_the_report_either(photo_svc, photo_client, store, monkeypatch, caplog):
+    from notifications import charts
+
+    def boom(_ctx):
+        raise RuntimeError(f"cannot draw {TOKEN}")
+
+    monkeypatch.setattr(charts, "report_charts", boom)
+    with caplog.at_level(logging.WARNING):
+        result = photo_svc.send_report(make_ctx())
+    assert result.status == "sent" and photo_client.photos == [] and store.get_delivery("telegram", KEY)["status"] == "sent"
+    assert "chart images stopped" in caplog.text and TOKEN not in caplog.text
+
+
+def test_the_images_get_a_time_budget_so_they_never_hold_a_job_for_long(photo_svc, photo_client, fake_clock):
+    assert photo_svc.send_report(make_ctx()).status == "sent"
+    (options,) = photo_client.photo_options
+    assert options == {"deadline": fake_clock.now() + timedelta(seconds=45)}
+
+
+def test_a_slow_telegram_cannot_keep_the_job_busy_with_images(cfg, store, fake_clock, caplog):
+    limited = FakeResponse(429, {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 60",
+                                 "parameters": {"retry_after": 60}})
+    service, session = real_service(cfg, store, fake_clock, ok(31), limited)
+    with caplog.at_level(logging.WARNING):
+        result = service.send_report(make_ctx())
+    assert (result.status, result.message_ids) == ("sent", [31])
+    assert [call["url"].rsplit("/", 1)[1] for call in session.calls] == ["sendMessage", "sendPhoto"]
+    assert fake_clock.sleeps == []  # a 60 s wait would cross the 45 s budget: the client gives up instead of sleeping
+    assert "chart images stopped after 0" in caplog.text and store.get_delivery("telegram", KEY)["status"] == "sent"
+
+
+def test_with_the_real_client_the_image_is_an_upload_after_the_text_and_does_not_count_as_an_attempt(cfg, store, fake_clock):
+    service, session = real_service(cfg, store, fake_clock, ok(31), ok(32))
+    result = service.send_report(make_ctx())
+    assert (result.status, result.message_ids, result.attempts) == ("sent", [31], 1)
+    assert [call["url"].rsplit("/", 1)[1] for call in session.calls] == ["sendMessage", "sendPhoto"]
+    assert session.calls[1]["json"] is None and store.get_delivery("telegram", KEY)["attempts"] == 1

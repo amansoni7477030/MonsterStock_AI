@@ -73,6 +73,64 @@ def test_doctor_reports_the_ai_services_as_optional_and_names_the_ones_that_are_
     assert "gsk_test" not in detail and "ts_test" not in detail
 
 
+def test_doctor_says_whether_chart_images_will_be_sent_and_why_not(cli_env, monkeypatch):
+    import sys
+
+    import app.doctor as doctor
+    from app.config import load_settings
+
+    def row():
+        report = doctor.DoctorReport()
+        doctor._charts(report, load_settings())
+        (check,) = report.checks
+        assert check.name == "charts" and not report.failed
+        return check
+
+    pytest.importorskip("PIL")
+    on = row()
+    assert on.status == "ok" and on.detail.startswith("Pillow ") and "chart images" in on.detail
+    monkeypatch.setenv("SEND_CHARTS", "false")
+    assert row().status == "ok" and "off (SEND_CHARTS=false)" in row().detail
+    monkeypatch.setenv("SEND_CHARTS", "true")
+    monkeypatch.setitem(sys.modules, "PIL", None)  # an import of PIL now fails, as on a machine without Pillow
+    missing = row()
+    assert missing.status == "warn" and "text only" in missing.detail and "requirements.txt" in missing.detail
+
+
+def test_sources_check_exits_0_when_every_endpoint_answers_and_1_when_one_does_not(cli_env, monkeypatch, capsys):
+    from app import sourcecheck
+    from app.doctor import DoctorReport
+
+    asked = []
+    verdicts = {"NSE live quotes": ("ok", "218 stocks")}
+
+    def fake(settings, sections=None, **_):
+        asked.append(sections)
+        report = DoctorReport()
+        report.add("NSE market status", "ok", "5 blocks")
+        report.add("GDELT DOC API (optional)", "warn", "HTTP 429")
+        report.add("NSE live quotes", *verdicts["NSE live quotes"])
+        return report
+
+    monkeypatch.setattr(sourcecheck, "run_checks", fake)
+    assert run(["sources-check", "--only", "nse", "gdelt"]) == 0
+    out = capsys.readouterr().out
+    assert asked == [["nse", "gdelt"]] and "[ ok ] NSE market status" in out and "[warn] GDELT DOC API (optional)" in out
+    assert out.rstrip().endswith("every endpoint answers (warnings, if any, are optional or temporary)")
+    verdicts["NSE live quotes"] = ("fail", "[nse_api] HTTP 404")
+    assert run(["sources-check", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert asked[-1] is None and payload["ok"] is False
+    assert {"name": "NSE live quotes", "status": "fail", "detail": "[nse_api] HTTP 404"} in payload["checks"]
+    assert run(["sources-check"]) == 1 and "1 endpoint(s) FAIL: see above" in capsys.readouterr().out
+
+
+def test_sources_check_only_accepts_the_known_sections(cli_env, capsys):
+    with pytest.raises(SystemExit) as stop:
+        run(["sources-check", "--only", "bogus"])
+    assert stop.value.code == 2 and "invalid choice" in capsys.readouterr().err
+
+
 def test_doctor_proves_the_nse_api_and_warns_with_the_reason_when_an_endpoint_is_gone(cli_env, monkeypatch):
     from types import SimpleNamespace
 
@@ -453,7 +511,8 @@ def test_telegram_preview_sends_marked_samples_and_routes_alerts_to_the_alert_ch
     assert run(["telegram-preview", "--delay", "0", "--only", "final", "alert", "unit"]) == 0
     assert all(text.startswith("🧪 <b>SAMPLE PREVIEW</b>") for _, text in sent)
     chats = [chat for chat, _ in sent]
-    assert chats[0] == "42" and set(chats[1:]) == {"77"}  # the report to the report chat, 4 alerts + the unit failure to the alert chat
+    first_alert = chats.index("77")  # the report (its messages) to the report chat, then 4 alerts + the unit failure to the alert chat
+    assert first_alert >= 1 and set(chats[:first_alert]) == {"42"} and set(chats[first_alert:]) == {"77"}
     assert len(sent) >= 6 and "made-up data" in capsys.readouterr().out
     ((chat, png, caption, filename),) = sent.photos  # the final report's chart: to the report chat, marked as a sample
     assert chat == "42" and png.startswith(b"\x89PNG") and caption.startswith("🧪 <b>SAMPLE PREVIEW</b>") and filename == "candidates.png"
@@ -494,7 +553,7 @@ def test_telegram_preview_reports_the_reason_when_telegram_fails_midway(cli_env,
     monkeypatch.setattr(tg, "TelegramClient", Flaky)
     assert run(["telegram-preview", "--delay", "0"]) == 1
     err = capsys.readouterr().err
-    assert re.search(r"after [1-9]\d* message\(s\): HTTP 429: rate limited by Telegram", err)
+    assert re.search(r"after [1-9]\d* message\(s\): .*HTTP 429: rate limited by Telegram", err)
 
 
 def _ai_checks(monkeypatch, *checks):
