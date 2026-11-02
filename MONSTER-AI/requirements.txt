@@ -7,4 +7,6 @@ lightgbm==4.6.0
 requests==2.32.5
 curl_cffi==0.17.0
 feedparser==6.0.12
+# draws the chart images of the Telegram reports; optional at run time (without it the reports go out as text only)
+Pillow==12.3.0
 tzdata==2025.2

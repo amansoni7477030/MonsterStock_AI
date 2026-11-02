@@ -163,6 +163,19 @@ def _telegram_config(report: DoctorReport, s: Settings) -> None:
         report.add("telegram settings", "warn", "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; reports cannot be delivered")
 
 
+def _charts(report: DoctorReport, s: Settings) -> None:
+    """Chart images are an optional extra of the Telegram reports: say whether they will be sent, and why not."""
+    if not s.send_charts:
+        report.add("charts", "ok", "off (SEND_CHARTS=false): the reports go out as text")
+        return
+    try:
+        import PIL
+    except ImportError:
+        report.add("charts", "warn", "the Pillow package is missing: the reports go out as text only (pip install -r requirements.txt)")
+        return
+    report.add("charts", "ok", f"Pillow {PIL.__version__}: every report is followed by its chart images")
+
+
 def _ai_config(report: DoctorReport, s: Settings) -> None:
     """The AI services are optional enrichment: being off is fine (a half-set configuration is caught by ``validate``)."""
     on = []
@@ -222,6 +235,33 @@ def _network(report: DoctorReport, s: Settings) -> None:
             report.add("telegram bot", "fail", f"getMe failed: {reason}")
 
 
+def _nse_api(report: DoctorReport, s: Settings) -> None:
+    """NSE's JSON API is another host than the archive files and needs a cookie handshake. Prove that it answers and that the
+    live-quote list the closing scan reads is still served (NSE retires endpoint names without notice)."""
+    if not s.nse_enabled:
+        return
+    from app.errors import DataUnavailable
+    from ingestion.nse import NseApi
+
+    api = NseApi(s)
+    try:
+        for name, call, describe in (
+            ("NSE API", api.market_status, lambda data: f"market status answered ({len(data)} blocks)"),
+            ("NSE live quotes", lambda: api.live_equities("SECURITIES IN F&O"),
+             lambda data: f"{len(data.rows)} F&O stocks, answer stamped {data.source_ts}"),
+        ):
+            try:
+                data = call()
+            except DataUnavailable as exc:
+                report.add(f"network: {name}", "warn", " ".join(redact(str(exc)).split())[:150])
+                continue
+            empty = hasattr(data, "rows") and not data.rows
+            report.add(f"network: {name}", "warn" if empty else "ok",
+                       "answered with no stocks (is the market closed?)" if empty else describe(data))
+    finally:
+        api.http.close()
+
+
 def _clock_skew(report: DoctorReport, header: str | None) -> None:
     if not header:
         return
@@ -245,9 +285,11 @@ def run_doctor(*, offline: bool = False, env_file: str | None = None) -> DoctorR
         _resources(report, settings)
         _http_transport(report, settings)
         _telegram_config(report, settings)
+        _charts(report, settings)
         _ai_config(report, settings)
         if not offline:
             _network(report, settings)
+            _nse_api(report, settings)
             _ai_network(report, settings)
     return report
 

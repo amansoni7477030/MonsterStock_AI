@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Any
 
 from app.clock import IST, iso, ist_date
+from notifications import charts, report
 from notifications import ideas as idea_messages
-from notifications import report
-from notifications.telegram import MAX_MESSAGE_CHARS, split_message
+from notifications.telegram import MAX_CAPTION_CHARS, MAX_MESSAGE_CHARS, split_message
 from ranking.ideas import BTST_PLAN, SWING_PLAN, WATCH_PLAN
 from ranking.types import (
     Candidate,
@@ -28,11 +28,11 @@ PREVIEW_BANNER = "🧪 <b>SAMPLE PREVIEW</b> - made-up data, not a market signal
 
 # kind -> what it shows; the order is the order they are sent in
 KINDS = {
-    "final": "the 09:12 report with a validated model",
+    "final": "the 09:12 report with a validated model: summary table, chart and the detail of every candidate",
     "prelim": "the optional 08:45 preliminary report (shadow model: tiers capped at WATCH)",
     "no-setup": "the report on a morning without a high-conviction setup",
-    "ideas": "the 14:30 closing-hour trade ideas (BTST, swing, bearish F&O, tomorrow's intraday watchlist) with their live record",
-    "evening": "the after-close evaluation with the live record",
+    "ideas": "the 14:30 closing-hour trade ideas (BTST, swing, bearish F&O, tomorrow's intraday watchlist) with level tables, charts and their live record",
+    "evening": "the after-close evaluation with the live record, a table and a chart",
     "alert": "one operational alert of each severity",
     "digest": "several queued alerts in one message",
     "failure": "the notice that a report was withheld",
@@ -181,6 +181,14 @@ def _ideas_report(today: str, now: datetime) -> IdeasReport:
     )
 
 
+def _final_context(today: str) -> ReportContext:
+    return _context(today, stage="final", status="validated", model="demo-model-0.1", candidates=_candidates())
+
+
+def _prelim_context(today: str) -> ReportContext:
+    return _context(today, stage="pre", status="shadow", model="demo-model-0.1", candidates=_candidates()[:2])
+
+
 def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
     """``[(kind, messages)]`` in sending order; ``now`` (aware) supplies the date and the alert times."""
     today = ist_date(now).isoformat()
@@ -190,10 +198,8 @@ def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
     journal = ("Nov 02 08:30:01 demo systemd[1]: monster-ai.service: Main process exited, code=killed, status=9/KILL\n"
                "Nov 02 08:30:01 demo systemd[1]: monster-ai.service: Failed with result 'signal'.")
     return [
-        ("final", report.render_final_report(_context(today, stage="final", status="validated", model="demo-model-0.1",
-                                                     candidates=_candidates()))),
-        ("prelim", report.render_prelim_report(_context(today, stage="pre", status="shadow", model="demo-model-0.1",
-                                                       candidates=_candidates()[:2]))),
+        ("final", report.render_final_report(_final_context(today))),
+        ("prelim", report.render_prelim_report(_prelim_context(today))),
         ("no-setup", report.render_final_report(_context(
             today, stage="final", status="validated", model="demo-model-0.1", candidates=[], no_setup=True,
             no_setup_reason="the top probability is only 33% and no name cleared the conviction gates"))),
@@ -206,6 +212,23 @@ def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
         ("unit", [report.render_unit_failure("monster-ai.service", journal, now)]),
         ("online", [report.render_test_message(settings)]),
     ]
+
+
+def build_sample_charts(now: datetime) -> dict[str, list[charts.Chart]]:
+    """``{kind: [chart]}`` for the kinds that come with images, drawn from the same made-up data as ``build_samples``. Every image
+    carries the SAMPLE strip, so none can pass for a real one."""
+    today = ist_date(now).isoformat()
+    return {
+        "final": charts.report_charts(_final_context(today), sample=True),
+        "prelim": charts.report_charts(_prelim_context(today), sample=True),
+        "ideas": charts.ideas_charts(_ideas_report(today, now), sample=True),
+        "evening": charts.evening_charts(_evening(today), sample=True),
+    }
+
+
+def marked_caption(caption: str) -> str:
+    """A chart caption introduced by the preview banner (the caption of a photo is limited to ``MAX_CAPTION_CHARS``)."""
+    return f"{PREVIEW_BANNER}\n{caption}"[:MAX_CAPTION_CHARS]
 
 
 def marked(messages: list[str]) -> list[str]:

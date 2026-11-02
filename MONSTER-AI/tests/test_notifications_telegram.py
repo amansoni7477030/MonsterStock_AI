@@ -67,7 +67,7 @@ class FakeSession:
         self.calls = []
 
     def post(self, url, json=None, timeout=None, **kwargs):
-        self.calls.append({"url": url, "json": json, "timeout": timeout})
+        self.calls.append({"url": url, "json": json, "timeout": timeout, "data": kwargs.get("data"), "files": kwargs.get("files")})
         item = self.script.pop(0) if self.script else ok(len(self.calls))
         if callable(item):
             item = item()
@@ -665,3 +665,95 @@ def test_last_attempts_counts_http_calls_per_public_call(make):
     assert client.last_attempts == 2
     client.send_message("1001", "b")
     assert client.last_attempts == 1
+
+
+# ------------------------------------------------------------------------------------------------ photos
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+
+
+def test_send_photo_uploads_the_png_as_multipart_with_an_html_caption(make):
+    client, session = make(ok(51))
+    assert client.send_photo("1001", PNG, caption="<b>Board</b> · 4 ideas", filename="board.png") == 51
+    (call,) = session.calls
+    assert call["url"] == f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    assert call["json"] is None  # an upload is form data, not JSON
+    assert call["data"] == {"chat_id": 1001, "caption": "<b>Board</b> · 4 ideas", "parse_mode": "HTML"}
+    assert call["files"] == {"photo": ("board.png", PNG, "image/png")}
+    assert call["timeout"] == (10.0, 30.0)  # an upload gets at least 30 s to be read
+    assert client.last_attempts == 1
+
+
+def test_a_photo_without_a_caption_sends_no_caption_fields_and_a_long_caption_is_cut(make):
+    client, session = make(ok(1), ok(2))
+    client.send_photo("-1001234567890", bytearray(PNG))
+    client.send_photo("1001", PNG, caption="x" * 2000, parse_mode=None)
+    first, second = session.calls
+    assert first["data"] == {"chat_id": -1001234567890} and first["files"]["photo"] == ("chart.png", PNG, "image/png")
+    assert second["data"] == {"chat_id": 1001, "caption": "x" * 1024}
+
+
+def test_send_photo_refuses_bad_input_locally(make, settings, fake_clock):
+    client, session = make()
+    for photo in (b"", None, "not bytes", 12):
+        with pytest.raises(DataUnavailable) as info:
+            client.send_photo("1001", photo)
+        assert info.value.retryable is False and "empty image" in str(info.value)
+    with pytest.raises(DataUnavailable, match="10 MB"):
+        client.send_photo("1001", b"x" * (10 * 1024 * 1024 + 1))
+    for chat in (None, "", "  "):
+        with pytest.raises(DataUnavailable, match="chat id"):
+            client.send_photo(chat, PNG)
+    assert session.calls == []
+    quiet_session = FakeSession()
+    quiet = TelegramClient(settings, session=quiet_session, clock=fake_clock)
+    with pytest.raises(DataUnavailable, match="not configured"):
+        quiet.send_photo("1", PNG)
+    assert quiet_session.calls == []
+
+
+def test_a_photo_is_retried_like_a_message(make, fake_clock):
+    client, session = make(err(429, "Too Many Requests: retry after 2", retry_after=2), err(500, "Internal"), ok(9))
+    assert client.send_photo("1001", PNG, caption="c") == 9
+    assert len(session.calls) == 3 and client.last_attempts == 3 and fake_clock.sleeps[0] == 2.0
+    assert all(call["files"]["photo"][1] == PNG for call in session.calls)  # the same bytes every time
+
+
+def test_a_rejected_html_caption_is_resent_as_plain_text(make):
+    client, session = make(err(400, PARSE_ERROR), ok(2))
+    assert client.send_photo("1001", PNG, caption="<b>Alpha &amp; <i>beta</i></b>") == 2
+    first, second = (call["data"] for call in session.calls)
+    assert first["parse_mode"] == "HTML" and "parse_mode" not in second and second["caption"] == "Alpha & beta"
+    client, session = make(err(400, PARSE_ERROR), err(400, PARSE_ERROR))
+    with pytest.raises(DataUnavailable) as info:
+        client.send_photo("1001", PNG, caption="<b>x")
+    assert info.value.retryable is False and len(session.calls) == 2
+
+
+def test_a_photo_follows_a_chat_migration_once_and_remembers_it(make):
+    client, session = make(err(400, "Bad Request: group chat was upgraded", migrate_to_chat_id=-100222), ok(3), ok(4))
+    assert client.send_photo("1001", PNG) == 3
+    assert [call["data"]["chat_id"] for call in session.calls] == [1001, -100222] and client.migrated_chat_ids == {"1001": "-100222"}
+    client.send_photo("1001", PNG)
+    assert session.calls[-1]["data"]["chat_id"] == -100222
+    client, session = make(err(400, "x", migrate_to_chat_id=-100222), err(400, "x", migrate_to_chat_id=-100333))
+    with pytest.raises(DataUnavailable):
+        client.send_photo("1001", PNG)
+    assert len(session.calls) == 2
+
+
+def test_photo_errors_never_leak_the_token(make, caplog):
+    client, _ = make(*[requests.exceptions.ConnectionError(LEAKY)] * 4)
+    with caplog.at_level(logging.DEBUG), pytest.raises(DataUnavailable) as info:
+        client.send_photo("1001", PNG)
+    assert_no_secret(str(info.value), caplog.text, "".join(traceback.format_exception(info.value)))
+    unexpected, _ = make(RuntimeError(LEAKY))
+    with pytest.raises(DataUnavailable) as info:
+        unexpected.send_photo("1001", PNG)
+    assert_no_secret(str(info.value))
+
+
+def test_a_photo_honours_the_deadline(make, fake_clock):
+    client, session = make()
+    with pytest.raises(DeadlineExceeded):
+        client.send_photo("1001", PNG, deadline=fake_clock.now() - timedelta(seconds=1))
+    assert session.calls == []

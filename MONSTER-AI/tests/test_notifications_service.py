@@ -422,7 +422,8 @@ def test_render_errors_become_failed_results_not_exceptions(svc, fake_client, st
 
 # --------------------------------------------------------------------------------- real client end to end
 def test_attempts_are_accumulated_from_the_real_client(cfg, store, fake_clock):
-    service, session = real_service(cfg, store, fake_clock, err(500, "Internal Server Error"), ok(31))
+    service, session = real_service(dataclasses.replace(cfg, send_charts=False), store, fake_clock,
+                                    err(500, "Internal Server Error"), ok(31))
     result = service.send_report(make_ctx())
     assert (result.status, result.message_ids, result.attempts) == ("sent", [31], 2)
     assert store.get_delivery("telegram", KEY)["attempts"] == 2 and len(session.calls) == 2

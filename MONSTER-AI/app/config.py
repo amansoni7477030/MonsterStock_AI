@@ -186,6 +186,9 @@ VARS: tuple[Var, ...] = (
     Var("send_prelim_report", "SEND_PRELIM_REPORT", "false", _bool,
         "Also send the 08:45 preliminary scan (off by default to avoid noise).", "Telegram"),
     Var("send_evening_report", "SEND_EVENING_REPORT", "true", _bool, "Send the post-session evaluation summary.", "Telegram"),
+    Var("send_charts", "SEND_CHARTS", "true", _bool,
+        "Attach chart images (donut, bars, trade-plan ladders) to the Telegram reports, sent after the text. Needs the Pillow "
+        "package; without it, or when false, the reports go out as text only.", "Telegram"),
     Var("telegram_timeout_sec", "TELEGRAM_TIMEOUT_SEC", "20", _int, "HTTP timeout per Telegram call.", "Telegram"),
     Var("telegram_max_attempts", "TELEGRAM_MAX_ATTEMPTS", "5", _int, "Bounded retries per message.", "Telegram"),
     # -- universe ----------------------------------------------------------------------------------
@@ -383,6 +386,7 @@ class Settings:
     telegram_alert_chat_id: str | None = None
     send_prelim_report: bool = False
     send_evening_report: bool = True
+    send_charts: bool = True
     telegram_timeout_sec: int = 20
     telegram_max_attempts: int = 5
     universe_mode: str = "fno_nifty100"

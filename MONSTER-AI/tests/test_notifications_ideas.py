@@ -213,8 +213,10 @@ def svc(cfg, store, fake_clock, fake_client):
 
 def test_the_report_is_sent_once_and_recorded_in_the_ledger(svc, fake_client, store, fake_clock):
     set_ist(fake_clock, "14:31")
+    expected = render_ideas_report(make_report())
     result = svc.send_ideas(make_report())
-    assert (result.status, result.reason, result.message_ids) == ("sent", None, [101])
+    assert (result.status, result.reason, result.message_ids) == ("sent", None, [101 + n for n in range(len(expected))])
+    assert [text for _, text, _ in fake_client.sent] == expected
     chat, text, options = fake_client.sent[0]
     assert chat == "1001" and text.startswith("🌙 <b>MONSTER AI</b> · Closing-hour trade ideas")
     assert options == {"deadline": at_ist("2026-11-02", "15:05")}
@@ -225,9 +227,10 @@ def test_the_report_is_sent_once_and_recorded_in_the_ledger(svc, fake_client, st
 def test_a_second_send_is_a_duplicate_even_when_forced(svc, fake_client, fake_clock):
     set_ist(fake_clock, "14:31")
     svc.send_ideas(make_report())
+    sent_once = len(fake_client.sent)
     again = svc.send_ideas(make_report(), force=True)
     assert (again.status, again.reason, again.attempts) == ("duplicate", "already_sent", 0)
-    assert len(fake_client.sent) == 1
+    assert len(fake_client.sent) == sent_once
 
 
 @pytest.mark.parametrize("hms, extra, expected", [("14:31:00", 0.0, "sent"), ("15:05:00", 0.0, "sent"), ("15:05:00", 0.001, "withheld"),

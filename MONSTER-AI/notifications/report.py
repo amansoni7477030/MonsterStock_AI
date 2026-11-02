@@ -429,6 +429,29 @@ def _footer(ctx: Any, candidates: Sequence[Any]) -> str:
     return "\n".join(lines)
 
 
+def _glance_table(ranked: Sequence[Any], *, capped: bool, heuristic: bool) -> str:
+    """The candidates at a glance as a monospace table, at most 39 characters wide so a phone needs no sideways scrolling. A
+    probability appears only for a model that is not the heuristic baseline."""
+    primary = next((t for t in (_num(_get(c, "primary_threshold")) for c in ranked) if t is not None), None)
+    head = f"P(>{_thr(primary)}%)" if primary is not None else "P"
+    lines = [f"{'#':>2} {'SYMBOL':<10} {'TIER':<8} {head:>7} {'RANGE %':>8}"]
+    for index, cand in enumerate(ranked[:_MAX_ROWS], 1):
+        rank = _num(_get(cand, "rank"))
+        threshold = _num(_get(cand, "primary_threshold"))
+        p = _map(_get(cand, "p"))
+        primary_p = next((v for t, v in _hit_items(p) if threshold is not None and abs(t - threshold) < 1e-9), None)
+        span = _map(_get(cand, "range"))
+        q10, q90 = _num(span.get("q10")), _num(span.get("q90"))
+        interval = f"{_n1(q10)}-{_n1(q90)}" if q10 is not None and q90 is not None else NA
+        lines.append(
+            f"{int(rank) if rank is not None and rank >= 1 else index:>2} {_clip(_get(cand, 'symbol'), 10) or 'UNKNOWN':<10} "
+            f"{_tier_name(_get(cand, 'tier'), weak=False, capped=capped)[:8]:<8} {NA if heuristic else _pct(primary_p):>7} {interval:>8}"
+        )
+    title = "📋 <b>At a glance</b> (RANGE: 80% interval of the expected high-low range, % of the open"
+    title += "; heuristic ranking, no probability)" if heuristic else ")"
+    return title + "\n<pre>" + "\n".join(_esc(line) for line in lines) + "</pre>"
+
+
 def _render_report(ctx: ReportContext, *, preliminary: bool) -> list[str]:
     version = _clip(_get(ctx, "model_version"), 60)
     if not version:
@@ -465,6 +488,8 @@ def _render_report(ctx: ReportContext, *, preliminary: bool) -> list[str]:
         if ranked:
             text += f"\n🔸 <b>{WEAK_LABEL}</b> - shown for transparency only; these are not signals."
         blocks.append(text)
+    elif ranked:
+        blocks.append(_glance_table(ranked, capped=not validated, heuristic=status == "baseline"))
     blocks += [
         _candidate_block(cand, index, weak=weak, capped=not validated, heuristic=status == "baseline")
         for index, cand in enumerate(ranked, 1)

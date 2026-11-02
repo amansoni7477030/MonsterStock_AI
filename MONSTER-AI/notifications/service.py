@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -19,6 +20,7 @@ from app import jsonutil
 from app.clock import Clock, at_ist, get_clock, iso, parse_date
 from app.errors import DataUnavailable
 from app.logging_setup import exception_site, redact, register_secret
+from notifications import charts as chart_images
 from notifications import ideas as idea_messages
 from notifications import report
 from notifications.telegram import MAX_MESSAGE_CHARS, DeadlineExceeded, TelegramClient, split_message
@@ -129,7 +131,8 @@ class NotificationService:
         if late:
             messages = _prefix_late(messages)
         return self._deliver(
-            kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline
+            kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
+            charts=None if late else lambda: chart_images.report_charts(ctx),
         )
 
     def send_evening(self, summary: EveningSummary) -> DeliveryResult:
@@ -147,7 +150,8 @@ class NotificationService:
             messages = report.render_evening_report(summary)
         except Exception as exc:
             return self._render_failed(kind, key, trade_date, exc)
-        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date)
+        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date,
+                             charts=lambda: chart_images.evening_charts(summary))
 
     def send_ideas(self, ideas_report: IdeasReport, *, force: bool = False) -> DeliveryResult:
         """Send the closing-hour trade-idea report once per trade date. It is time-critical: a report that would go out after
@@ -183,7 +187,9 @@ class NotificationService:
             messages = idea_messages.render_ideas_report(ideas_report)
         except Exception as exc:
             return self._render_failed(kind, key, trade_date, exc)
-        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline)
+        late = bool(getattr(ideas_report, "late", False)) or self.clock.now() > deadline  # too late to act on: no images either
+        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
+                             charts=None if late else lambda: chart_images.ideas_charts(ideas_report))
 
     def send_failure_notice(
         self, trade_date: str, stage: str, reason: str, details: Any = None
@@ -320,6 +326,24 @@ class NotificationService:
         )
         return DeliveryResult("failed", reason)
 
+    def _send_charts(self, build: Callable[[], list[Any]] | None, chat_id: Any, key: str) -> int:
+        """Send a report's chart images after its text, one photo each. Best effort: a missing library, a failed drawing or a refused
+        upload is logged and never changes the delivery that is already recorded. A client without ``send_photo`` (or
+        ``SEND_CHARTS=false``) sends none. Returns how many images went out."""
+        send = getattr(self.client, "send_photo", None)
+        if build is None or not callable(send) or not getattr(self.settings, "send_charts", True):
+            return 0
+        sent = 0
+        try:
+            for chart in build():
+                send(chat_id, chart.png, caption=chart.caption, filename=chart.filename)
+                sent += 1
+        except Exception as exc:  # noqa: BLE001 - an image is an extra: the text report is already delivered
+            log.warning("%s: chart images stopped after %d: %s at %s", key, sent, _safe_reason(exc), exception_site(exc))
+        if sent:
+            log.info("%s: %d chart image(s) delivered", key, sent)
+        return sent
+
     def _deliver(
         self,
         kind: str,
@@ -329,6 +353,7 @@ class NotificationService:
         chat_id: Any,
         trade_date: str | None,
         deadline: datetime | None = None,
+        charts: Callable[[], list[Any]] | None = None,
     ) -> DeliveryResult:
         digest = hashlib.sha256("\n".join(messages).encode("utf-8", "replace")).hexdigest()
         self.store.save_delivery(CHANNEL, kind, key, "pending", trade_date=trade_date, body_hash=digest)
@@ -358,6 +383,7 @@ class NotificationService:
                 message_ids=sent_ids, body_hash=digest,
             )
             log.info("%s delivered (%d message(s), %d attempt(s))", key, len(sent_ids), attempts)
+            self._send_charts(charts, chat_id, key)
             return DeliveryResult("sent", None, sent_ids, attempts)
 
         self.store.save_delivery(

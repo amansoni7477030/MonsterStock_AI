@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 
 import pytest
@@ -70,6 +71,61 @@ def test_doctor_reports_the_ai_services_as_optional_and_names_the_ones_that_are_
     detail = report.checks[0].detail
     assert "LLM via groq (openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)" in detail and "Jev (jev-1.14.0)" in detail
     assert "gsk_test" not in detail and "ts_test" not in detail
+
+
+def test_doctor_proves_the_nse_api_and_warns_with_the_reason_when_an_endpoint_is_gone(cli_env, monkeypatch):
+    from types import SimpleNamespace
+
+    import app.doctor as doctor
+    import ingestion.nse as nse_mod
+    from app.config import load_settings
+    from app.errors import DataUnavailable
+
+    closed = []
+
+    class FakeNse:
+        status: object = {"marketState": [], "giftnifty": {}}
+        live: object = SimpleNamespace(rows=[1, 2, 3], source_ts="2026-11-02T10:10:12Z")
+
+        def __init__(self, settings):
+            self.http = SimpleNamespace(close=lambda: closed.append(True))
+
+        @staticmethod
+        def _answer(value):
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def market_status(self):
+            return self._answer(FakeNse.status)
+
+        def live_equities(self, index):
+            assert index == "SECURITIES IN F&O"
+            return self._answer(FakeNse.live)
+
+    def run():
+        report = doctor.DoctorReport()
+        doctor._nse_api(report, load_settings())
+        return report
+
+    monkeypatch.setattr(nse_mod, "NseApi", FakeNse)
+    report = run()
+    assert [(c.name, c.status) for c in report.checks] == [("network: NSE API", "ok"), ("network: NSE live quotes", "ok")]
+    assert "3 F&O stocks" in report.checks[1].detail and closed == [True]
+
+    FakeNse.live = DataUnavailable("nse_api", "no live-quote endpoint knows SECURITIES IN F&O: did NSE change its API?")
+    report = run()
+    assert [c.status for c in report.checks] == ["ok", "warn"] and "did NSE change its API" in report.checks[1].detail
+
+    FakeNse.live = SimpleNamespace(rows=[], source_ts=None)
+    assert run().checks[1].status == "warn"
+
+    FakeNse.status = DataUnavailable("nse_api", "HTTP 403")
+    report = run()
+    assert [c.status for c in report.checks] == ["warn", "warn"] and not report.failed  # one failed probe never hides the other
+
+    monkeypatch.setenv("NSE_ENABLED", "false")
+    assert run().checks == []
 
 
 def test_doctor_probes_only_configured_ai_services_for_free_and_never_fails_the_machine_for_them(cli_env, monkeypatch):
@@ -350,10 +406,14 @@ def test_alert_unit_sanitises_the_unit_name_and_redacts_logs(cli_env, monkeypatc
 
 
 def _preview_env(monkeypatch, *, alert_chat="77"):
-    """Telegram settings plus a fake client that records what the preview sends."""
+    """Telegram settings plus a fake client that records what the preview sends: ``sent`` the texts, ``sent.photos`` the images."""
     import notifications.telegram as tg
 
-    sent: list[tuple[str, str]] = []
+    class Sent(list):
+        photos: list
+
+    sent = Sent()
+    sent.photos = []
 
     class RecordingClient:
         configured = True
@@ -364,6 +424,10 @@ def _preview_env(monkeypatch, *, alert_chat="77"):
         def send_message(self, chat_id, text, **kwargs):
             sent.append((chat_id, text))
             return [len(sent)]
+
+        def send_photo(self, chat_id, photo, *, caption=None, filename="chart.png", **kwargs):
+            sent.photos.append((chat_id, photo, caption, filename))
+            return len(sent.photos)
 
     monkeypatch.setattr(tg, "TelegramClient", RecordingClient)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
@@ -391,14 +455,26 @@ def test_telegram_preview_sends_marked_samples_and_routes_alerts_to_the_alert_ch
     chats = [chat for chat, _ in sent]
     assert chats[0] == "42" and set(chats[1:]) == {"77"}  # the report to the report chat, 4 alerts + the unit failure to the alert chat
     assert len(sent) >= 6 and "made-up data" in capsys.readouterr().out
+    ((chat, png, caption, filename),) = sent.photos  # the final report's chart: to the report chat, marked as a sample
+    assert chat == "42" and png.startswith(b"\x89PNG") and caption.startswith("🧪 <b>SAMPLE PREVIEW</b>") and filename == "candidates.png"
 
 
-def test_telegram_preview_sends_everything_by_default(cli_env, monkeypatch):
+def test_telegram_preview_sends_everything_by_default(cli_env, monkeypatch, capsys):
     from notifications import samples
 
     sent = _preview_env(monkeypatch)
     assert run(["telegram-preview", "--delay", "0"]) == 0
     assert len(sent) >= len(samples.KINDS)
+    assert [name for _, _, _, name in sent.photos] == ["candidates.png", "candidates.png", "ideas-board.png", "ideas-plan.png", "evening.png"]
+    assert all(photo.startswith(b"\x89PNG") and chat == "42" for chat, photo, _, _ in sent.photos)
+    assert "with 2 chart(s)" in capsys.readouterr().out
+
+
+def test_telegram_preview_sends_no_images_when_charts_are_off(cli_env, monkeypatch):
+    sent = _preview_env(monkeypatch)
+    monkeypatch.setenv("SEND_CHARTS", "false")
+    assert run(["telegram-preview", "--delay", "0", "--only", "ideas"]) == 0
+    assert sent and sent.photos == []
 
 
 def test_telegram_preview_reports_the_reason_when_telegram_fails_midway(cli_env, monkeypatch, capsys):
@@ -418,7 +494,7 @@ def test_telegram_preview_reports_the_reason_when_telegram_fails_midway(cli_env,
     monkeypatch.setattr(tg, "TelegramClient", Flaky)
     assert run(["telegram-preview", "--delay", "0"]) == 1
     err = capsys.readouterr().err
-    assert "after 2 message(s)" in err and "HTTP 429: rate limited by Telegram" in err
+    assert re.search(r"after [1-9]\d* message\(s\): HTTP 429: rate limited by Telegram", err)
 
 
 def _ai_checks(monkeypatch, *checks):

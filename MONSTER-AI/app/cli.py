@@ -578,6 +578,7 @@ def cmd_telegram_preview(args: argparse.Namespace) -> int:
         print("Telegram is not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (see telegram-setup).", file=sys.stderr)
         return EXIT_FAIL
     wanted = set(args.only or samples.KINDS)
+    pictures = samples.build_sample_charts(get_clock().now()) if settings.send_charts else {}
     sent = 0
     try:
         for kind, messages in samples.build_samples(settings, get_clock().now()):
@@ -589,7 +590,12 @@ def cmd_telegram_preview(args: argparse.Namespace) -> int:
                     get_clock().sleep(args.delay)  # Telegram allows about one message per second to a chat
                 client.send_message(chat, text)
                 sent += 1
-            print(f"preview {kind}: sent")
+            images = pictures.get(kind, [])
+            for chart in images:
+                get_clock().sleep(args.delay)
+                client.send_photo(chat, chart.png, caption=samples.marked_caption(chart.caption), filename=chart.filename)
+                sent += 1
+            print(f"preview {kind}: sent" + (f" with {len(images)} chart(s)" if images else ""))
     except Exception as exc:  # noqa: BLE001
         print(f"Telegram call failed after {sent} message(s): {_why(exc)}", file=sys.stderr)
         return EXIT_FAIL

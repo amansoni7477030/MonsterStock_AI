@@ -50,6 +50,7 @@ _SECTIONS = {
     "WATCH": ("⚡", "Tomorrow's intraday watchlist - levels to react to, not a call to enter today"),
 }
 _SYMBOL, _NAME, _SECTOR, _SETUP, _LINE = 24, 60, 40, 80, 140
+_GLANCE_ROWS = 15
 _GRADE_BADGE = {"A": "🔥", "B": "⚡", "C": "👀"}
 _HORIZON_WORD = {"BTST": "BTST", "SWING": "swing"}
 
@@ -192,6 +193,45 @@ def _market_line(market: Any) -> str:
     return "🌍 <b>Market:</b> " + " · ".join(_esc(p) if "<" in p or "&" in p else p for p in parts)
 
 
+def idea_group(idea: Any) -> str:
+    """The list an idea is shown in: a bearish BTST or swing idea has a list of its own."""
+    horizon, side = _clean(_get(idea, "horizon")).upper(), _clean(_get(idea, "side")).upper()
+    return "SHORT" if side == "SHORT" and horizon in ("BTST", "SWING") else horizon
+
+
+def _table_price(value: Any) -> str:
+    x = _num(value)
+    return NA if x is None else (f"{x:.1f}" if abs(x) >= 1000 else f"{x:.2f}")
+
+
+def _by_rank(ideas: list[Any]) -> list[Any]:
+    return sorted(ideas, key=lambda idea: _num(_get(idea, "rank")) or math.inf)
+
+
+def _glance_blocks(by_group: Mapping[str, list[Any]]) -> list[str]:
+    """The trade levels at a glance as monospace tables, at most 37 characters wide so a phone needs no sideways scrolling: the
+    ideas with an entry (entry, stop, first target) and the watchlist (the two trigger levels)."""
+    blocks: list[str] = []
+    rows = [f"{'':2} {'SYMBOL':<10} {'ENTRY':>7} {'STOP':>7} {'T1':>7}"]
+    for group in ("BTST", "SWING", "SHORT"):
+        for idea in _by_rank(by_group.get(group, [])):
+            tag = ("B" if _clean(_get(idea, "horizon")).upper() == "BTST" else "S") + ("-" if group == "SHORT" else "+")
+            rows.append(f"{tag:<2} {_clip(_get(idea, 'symbol'), 10) or 'UNKNOWN':<10} {_table_price(_get(idea, 'entry')):>7} "
+                        f"{_table_price(_get(idea, 'stop')):>7} {_table_price(_get(idea, 'target1')):>7}")
+    if len(rows) > 1:
+        blocks.append("📋 <b>At a glance</b> (entry = last price at the scan, T1 = first target)\n<pre>"
+                      + "\n".join(_esc(line) for line in rows[:_GLANCE_ROWS + 1]) + "</pre>\n"
+                      "<i>B = BTST: sell in the next session · S = swing: hold 2-5 sessions · + long · - short (F&amp;O only)</i>")
+    watch = [f"{'':2} {'SYMBOL':<10} {'BUY ABOVE':>9} {'SELL BELOW':>10}"]
+    for idea in _by_rank(by_group.get("WATCH", [])):
+        watch.append(f"{'W':<2} {_clip(_get(idea, 'symbol'), 10) or 'UNKNOWN':<10} {_table_price(_get(idea, 'trigger_long')):>9} "
+                     f"{_table_price(_get(idea, 'trigger_short')):>10}")
+    if len(watch) > 1:
+        blocks.append("⚡ <b>Tomorrow's levels</b> (react to a break; not a call to enter today)\n<pre>"
+                      + "\n".join(_esc(line) for line in watch[:_GLANCE_ROWS + 1]) + "</pre>")
+    return blocks
+
+
 def render_ideas_report(report: IdeasReport) -> list[str]:
     """The closing-hour report as Telegram messages. Raises ``ValueError`` without a trade date (a report is never anonymous)."""
     if not _clip(_get(report, "trade_date"), 10):
@@ -215,13 +255,13 @@ def render_ideas_report(report: IdeasReport) -> list[str]:
     ideas = _seq(_get(report, "ideas"))
     by_group: dict[str, list[Any]] = {group: [] for group in GROUPS}
     for idea in ideas:
-        horizon, side = _clean(_get(idea, "horizon")).upper(), _clean(_get(idea, "side")).upper()
-        group = "SHORT" if side == "SHORT" and horizon in ("BTST", "SWING") else horizon
+        group = idea_group(idea)
         if group in by_group:
             by_group[group].append(idea)
+    blocks += _glance_blocks(by_group)
     for group in GROUPS:
         icon, title = _SECTIONS[group]
-        members = sorted(by_group[group], key=lambda i: _num(_get(i, "rank")) or math.inf)
+        members = _by_rank(by_group[group])
         lines = [f"{icon} <b>{_esc(title)}</b>", _record_line(group, record)]
         if not members:
             lines.append("🛑 Nothing passed the gates for this list today.")

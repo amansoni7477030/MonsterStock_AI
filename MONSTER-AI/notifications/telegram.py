@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 
 API_ROOT = "https://api.telegram.org"
 MAX_MESSAGE_CHARS = 3900
+MAX_CAPTION_CHARS = 1024  # Telegram's limit of a photo caption
+MAX_PHOTO_BYTES = 10 * 1024 * 1024  # Telegram's limit of a photo upload
+UPLOAD_MIN_READ_SEC = 30.0
 CONNECT_TIMEOUT_SEC = 10.0
 BACKOFF_BASE_SEC = 1.0
 BACKOFF_CAP_SEC = 30.0
@@ -378,6 +381,54 @@ class TelegramClient:
             raise
         return sent
 
+    def send_photo(
+        self,
+        chat_id: Any,
+        photo: bytes,
+        *,
+        caption: str | None = None,
+        parse_mode: str | None = "HTML",
+        filename: str = "chart.png",
+        deadline: datetime | None = None,
+    ) -> int | None:
+        """Send one PNG image (``photo`` is its bytes) with an optional caption; returns the Telegram message id.
+
+        The same retries, rate-limit waits, chat migration and plain-text fallback for a rejected caption as ``send_message``;
+        ``deadline`` works the same way. A caption longer than ``MAX_CAPTION_CHARS`` is cut."""
+        self._require_configured()
+        self.last_attempts = 0
+        if not isinstance(photo, (bytes, bytearray)) or not photo:
+            raise DataUnavailable(_SOURCE, "refusing to send an empty image", retryable=False) from None
+        if len(photo) > MAX_PHOTO_BYTES:
+            raise DataUnavailable(_SOURCE, "the image is larger than Telegram's 10 MB limit", retryable=False) from None
+        if chat_id is None or not str(chat_id).strip():
+            raise DataUnavailable(_SOURCE, "no destination chat id was given", retryable=False) from None
+        chat = _chat_value(self.migrated_chat_ids.get(str(chat_id).strip(), chat_id))
+        text = (caption or "")[:MAX_CAPTION_CHARS]
+        mode = parse_mode if text else None
+        files = {"photo": (filename, bytes(photo), "image/png")}
+        migrated = plain = False
+        while True:
+            payload: dict[str, Any] = {"chat_id": chat}
+            if text:
+                payload["caption"] = text
+            if mode:
+                payload["parse_mode"] = mode
+            reply = self._execute("sendPhoto", payload, max(self._read_timeout, UPLOAD_MIN_READ_SEC), deadline, files=files)
+            if reply.ok:
+                return _message_id(reply.result)
+            if reply.migrate_to and not migrated:
+                migrated = True
+                chat = _chat_value(reply.migrate_to)
+                self.migrated_chat_ids[str(payload["chat_id"])] = str(chat)
+                continue
+            if reply.code == 400 and mode and not plain and _is_parse_error(reply.description):
+                plain = True
+                text, mode = to_plain_text(text)[:MAX_CAPTION_CHARS], None
+                log.warning("telegram rejected the HTML caption; resending it as plain text")
+                continue
+            raise DataUnavailable(_SOURCE, reply.reason, retryable=False) from None
+
     def get_updates(self, offset: int | None = None, timeout: int = 0) -> list[dict[str, Any]]:
         self._require_configured()
         self.last_attempts = 0
@@ -447,7 +498,8 @@ class TelegramClient:
         return reply.result
 
     def _execute(
-        self, method: str, payload: dict[str, Any], read_timeout: float, deadline: datetime | None
+        self, method: str, payload: dict[str, Any], read_timeout: float, deadline: datetime | None,
+        files: dict[str, Any] | None = None,
     ) -> _Reply:
         """Run one API call with bounded retries; returns a success or a final (non-retryable) reply."""
         max_attempts = max(1, int(getattr(self._settings, "telegram_max_attempts", 5) or 1))
@@ -456,7 +508,7 @@ class TelegramClient:
             if deadline is not None and self.clock.now() > deadline:
                 raise DeadlineExceeded() from None
             self.last_attempts += 1
-            reply = self._post(method, payload, read_timeout)
+            reply = self._post(method, payload, read_timeout, files)
             if reply.ok or not reply.transient:
                 return reply
             last_reason = reply.reason
@@ -475,11 +527,14 @@ class TelegramClient:
         ceiling = min(BACKOFF_CAP_SEC, BACKOFF_BASE_SEC * (2 ** (attempt - 1)))
         return ceiling * (0.5 + 0.5 * self._rng.random())
 
-    def _post(self, method: str, payload: dict[str, Any], read_timeout: float) -> _Reply:
+    def _post(self, method: str, payload: dict[str, Any], read_timeout: float, files: dict[str, Any] | None = None) -> _Reply:
         url = f"{API_ROOT}/bot{self._token}/{method}"
         timeout = (CONNECT_TIMEOUT_SEC, read_timeout)
         try:
-            response = self._session.post(url, json=dict(payload), timeout=timeout)
+            if files:  # an upload is multipart form data; every other call is JSON
+                response = self._session.post(url, data=dict(payload), files=files, timeout=timeout)
+            else:
+                response = self._session.post(url, json=dict(payload), timeout=timeout)
         except requests.exceptions.Timeout:
             return _Reply(transient=True, reason="request timed out")
         except (

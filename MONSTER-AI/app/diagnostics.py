@@ -27,7 +27,7 @@ from app.logging_setup import redact
 
 log = logging.getLogger(__name__)
 
-PACKAGES = ("numpy", "pandas", "scipy", "lightgbm", "requests", "curl_cffi", "feedparser", "tzdata", "fastapi", "uvicorn")
+PACKAGES = ("numpy", "pandas", "scipy", "lightgbm", "requests", "curl_cffi", "feedparser", "pillow", "tzdata", "fastapi", "uvicorn")
 ERROR_TAIL_LINES = 400
 ROLE_TAIL_LINES = 150
 MAX_FILE_BYTES = 400_000
