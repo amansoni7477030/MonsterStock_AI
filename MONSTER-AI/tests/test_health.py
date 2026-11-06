@@ -84,6 +84,23 @@ def test_missing_final_scan_is_not_flagged_before_the_scheduler_existed(env):
     assert "final_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock))
 
 
+def test_a_missing_opening_read_is_a_warning_once_its_window_is_over_and_the_scheduler_existed(env):
+    assert "opening_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock))  # the scheduler is not installed yet
+    env.store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
+    report = evaluate_health(env.store, env.settings, env.clock)  # 10:00 IST: the 09:30 read should have been recorded by 09:50
+    assert "opening_scan_missing" in codes(report) and next(p for p in report.problems if p.code == "opening_scan_missing").level == "warn"
+    env.clock.set(ist(2026, 11, 2, 9, 49))
+    assert "opening_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock))  # not yet late
+    env.clock.set(ist(2026, 11, 2, 10, 0))
+    env.store.job_record("opening_scan", "2026-11-02", "skipped", message="special session")  # a skipped run is settled
+    assert "opening_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
+def test_a_scheduler_installed_after_the_opening_does_not_blame_the_scan_it_never_had_a_chance_to_run(env):
+    env.store.kv_set("daemon.first_start", "2026-11-02T04:00:00Z")  # installed at 09:30 IST sharp: too late for that day's read
+    assert "opening_scan_missing" not in codes(evaluate_health(env.store, env.settings, env.clock))
+
+
 def test_success_after_failure_clears_the_job_problem(env):
     env.store.job_record("collect_global", "2026-11-02", "failed", message="x")
     env.store.job_record("collect_global", "2026-11-02", "success", message="ok")

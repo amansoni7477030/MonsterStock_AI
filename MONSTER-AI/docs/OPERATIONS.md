@@ -33,15 +33,17 @@ All messages arrive in the Telegram chat that was linked at install time (alerts
 
 | When (IST, trading days) | Message |
 |--------------------------|---------|
-| ~08:45 | preliminary report (only if `SEND_PRELIM_REPORT=true`; off by default) |
+| ~08:45 | preliminary scan runs **silently** (a report is only sent if `SEND_PRELIM_REPORT=true`; off by default): it repairs the previous session and is the fallback snapshot |
 | **~09:09-09:12** | **final report**: the top-5 names, calibrated probabilities, expected range, catalysts (with how far each can be trusted), regime including GIFT Nifty, data freshness; an at-a-glance table at the top and a chart of the expected ranges after it |
+| **~09:30-09:45** | **opening read** (`SEND_OPENING_REPORT`): the first fifteen minutes of the session against each stock's normal: the 09:12 picks read again (did the stock start moving, did its gap hold), new opening movers, reference levels around the opening range and the market at the open; it estimates how wide the day will be, **not which way**, and says what that is based on (see [reading the opening read](#the-0930-opening-read)); two tables at the top, text only |
 | **~14:31-15:05** | **closing-hour trade ideas** (`SEND_IDEAS_REPORT`): BTST, swing, bearish F&O and next-day intraday watchlist, each idea with its entry reference, stop, targets, cost and reasons; heuristic setups with their own live record per list (see [reading the ideas report](#the-closing-hour-ideas-report)); tables of the levels at the top, then two charts (the board and the trade plan) |
 | after 18:15 | evening summary: what happened to this morning's picks, and the **live record** of the last 20 days, 60 days and all days (hit rate, range-forecast error, interval coverage, direction accuracy, realised range against the baselines, ranking quality), every number with its sample size and 95 % interval (`SEND_EVENING_REPORT`); a chart of the day's hits and misses follows
 | any time | alerts (de-duplicated; queued while Telegram is unreachable) |
 
 A morning with nothing worth reporting produces a short **"no setup"** message that says why. A final report that
-could not be delivered before **09:14:30** is withheld rather than sent late; you get an alert instead. A closing-hour report that
-would go out after **15:05** is withheld the same way. On an exchange holiday nothing is sent.
+could not be delivered before **09:14:30** is withheld rather than sent late; you get an alert instead. An opening read that would go
+out after **09:45** and a closing-hour report that would go out after **15:05** are withheld the same way. On an exchange holiday
+nothing is sent.
 
 ### Reading a message
 
@@ -63,6 +65,7 @@ each message is marked *SAMPLE PREVIEW*) so you can see them before the first re
 | ⏰ **LATE** | a final report forced out after the 09:14:30 deadline, "for the record only" |
 | ✅ ❌ ➖ in the evening table | the pick's range was above the threshold / was not / is unknown |
 | 🌙 📈 🔻 ⚡ in the ideas report | the BTST, swing, bearish and next-day watchlist lists; the words in each heading say how long the idea is held |
+| 😴 🙂 🔥 💥 in the opening read | the opening strength of a stock: QUIET, NORMAL, HOT or EXPLOSIVE, the first fifteen minutes' range against the stock's mean daily range (what has happened, not a call) |
 | 📚 **Live record** | what the earlier ideas of that list did after costs, with the number of ideas, days and a 95 % interval; *not validated* until the list has earned the label |
 
 A note under the regime names stocks with an **ex-date today** (split or bonus), which are scored without their opening gap;
@@ -99,13 +102,14 @@ calibrated"* and caps every name at WATCH.
 | `health [--json]` | exit 0 ok / 1 warnings / 2 critical; every problem with its explanation |
 | `jobs` | the timetable and the last runs of every job |
 | `doctor` | full preflight: configuration, permissions, disk, RAM, clock, reachability of every data feed, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
-| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read **every** data endpoint (NSE API, NSE archive files, Yahoo, the 44 feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure (exit 1 when one fails); run it after an NSE or Yahoo change and when a report is missing data, see [Checking an endpoint by hand](#checking-an-endpoint-by-hand-curl) |
+| `sources-check [--only nse archive yahoo kotak rss gdelt] [--json]` | read **every** data endpoint (NSE API, NSE archive files, Yahoo, the Kotak broker feed when its key is set, the 44 feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure (exit 1 when one fails); run it after an NSE or Yahoo change and when a report is missing data, see [Checking an endpoint by hand](#checking-an-endpoint-by-hand-curl) |
 | `logs [...]` | read, filter and follow the logs, see [Logs and diagnostics](#logs-and-diagnostics) |
 | `diag` | write a redacted diagnostics bundle for a bug report |
 | `storage [--prune [--dry-run] [--vacuum]] [--json]` | disk usage, row counts, retention windows; apply the retention now |
 | `scan --stage pre\|final --dry-run [--date YYYY-MM-DD]` | print a report without freezing or sending |
 | `scan --stage final --force` | recompute and re-send today's report (adds a new snapshot; the earlier one is kept) |
 | `ideas [--date D] [--dry-run] [--force]` | the closing-hour scan now: `--dry-run` prints a trade-idea report and freezes and sends nothing (it works after 15:05 too, on the day's final figures); `--force` sends the frozen report even after the 15:05 deadline, marked late, and scans first only when nothing is frozen (a frozen report is never replaced) |
+| `opening [--date D] [--dry-run] [--force]` | the 09:30 opening read now: `--dry-run` prints the report and freezes and sends nothing (outside 09:30-09:45 the figures cover whatever stretch of the session the quotes show, and the report says PREVIEW); `--force` sends the frozen report even after the 09:45 deadline, marked late, and scans first only when nothing is frozen |
 | `evaluate [--date D]` | evaluate a day's predictions now |
 | `models list` / `rollback --stage S` / `approve V --status shadow\|validated` / `activate V` | model governance |
 | `train [--stage pre\|final\|both]` | retrain now (heavy: 30-90 minutes on a 1 GB server) |
@@ -139,6 +143,7 @@ Knobs you may want, all with safe defaults:
 | Purpose | Variables |
 |---------|-----------|
 | Closing-hour trade ideas | `IDEAS_ENABLED` (true), `SEND_IDEAS_REPORT` (true: false = compute, freeze and evaluate without sending), `IDEAS_REPORT_DEADLINE_TIME` (15:05), `IDEAS_ENTRY_BY_TIME` (15:15), `IDEAS_TOP_N` (5 per list), `IDEAS_MIN_SCORE` (60), `IDEAS_MAX_RISK_PCT` (4), `IDEAS_INCLUDE_SHORTS` (true). The scan reuses `MIN_PRICE`, `MIN_MEDIAN_TURNOVER_CR` and `MAX_COST_TO_RANGE_RATIO` for its liquidity, price and cost gates |
+| 09:30 opening read | `OPENING_ENABLED` (true), `SEND_OPENING_REPORT` (true: false = compute, freeze and evaluate without sending), `OPENING_REPORT_DEADLINE_TIME` (09:45, at most 10:00), `OPENING_TOP_N` (8 new movers), `OPENING_MIN_X` (0.60: how wide a new mover's opening range must be, as a multiple of the stock's mean daily range; 0.85 = EXPLOSIVE only). The read reuses `MIN_PRICE`, `MIN_MEDIAN_TURNOVER_CR` and `MAX_COST_TO_RANGE_RATIO` for its gates; `SEND_PRELIM_REPORT` (false) is the old 08:45 report |
 | Storage budget and retention | `DATA_MAX_MB` (4000), `NEWS_RETENTION_DAYS` (45), `EVENT_RETENTION_DAYS` (1100), `QUOTE_RETENTION_DAYS` (400), `RECORD_RETENTION_DAYS` (1825), `OPS_RETENTION_DAYS` (180), `BACKUP_KEEP_DAILY` (7), `BACKUP_KEEP_WEEKLY` (4), `BACKUP_MAX_MB` (1500) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (`text` or `json`), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150), `MONSTER_TIMEZONE` (log stamps only) |
 | Network | `HTTP_TRANSPORT` (`auto`, `curl_cffi`, `requests`), `HTTP_IMPERSONATE` (`chrome`), `HTTP_TIMEOUT_SEC`, `HTTP_MAX_ATTEMPTS`, `HTTP_MAX_RESPONSE_MB`, `YAHOO_MIN_INTERVAL_SEC`, `NSE_MIN_INTERVAL_SEC`, `NSE_ENABLED`, `GDELT_ENABLED`, `GDELT_FALLBACK` (Google News search when GDELT does not deliver a topic) |
@@ -151,6 +156,7 @@ Optional capabilities, all off by default:
 | Groq LLM: event extraction from news | `GROQ_API_KEY` (default chain `openai/gpt-oss-120b`, then `openai/gpt-oss-20b`, then `qwen/qwen3.8-27b`; every model has its own rate limits); tune with `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODELS` (further models, comma separated; `none` = no further model), `LLM_REASONING_EFFORT` (low), `LLM_MAX_ARTICLES_PER_RUN` (60), `LLM_MAX_SECONDS_PER_RUN` (240), `LLM_MAX_OUTPUT_TOKENS` (1200), `LLM_TIMEOUT_SEC` (40). Another OpenAI-compatible provider: `LLM_API_BASE` + `LLM_MODEL` (+ `LLM_API_KEY`). Rules-only without a key; every LLM claim needs a verifiable quote. See [the AI services](#the-ai-services-groq-and-jev) |
 | Groq web check: is an unconfirmed company story true, denied or old | on by default once `GROQ_API_KEY` is set (Groq with a gpt-oss model only); `LLM_WEB_SEARCH` (true), `LLM_WEB_MAX_PER_RUN` (8 per news job) and `LLM_WEB_MAX_PER_DAY` (16 per IST day), 0 = off. Works on Groq's free tier (verified) but costs about 7,000 tokens a check against the per-minute and per-day token limits; needs `LLM_MAX_SECONDS_PER_RUN` of at least 34 (it gets 30 % of it) |
 | Jev (TypeSafe AI): news judgments | `TYPESAFE_API_KEY`; `JEV_MODEL` (`jev-1.14.0`, pinned), `JEV_MAX_ITEMS_PER_RUN` (200), `JEV_MIN_CONFIDENCE` (0.5), `JEV_TIMEOUT_SEC` (20) |
+| Kotak broker feed: a second live source and exchange-grade candles | `KOTAK_CONSUMER_KEY` (the application token only: no MPIN, TOTP secret, mobile or UCC); `KOTAK_ENABLED` (true), `KOTAK_MAX_LAG_SEC` (90; 0 = no age check), `KOTAK_BASE_URL` (https on kotaksecurities.com only), `KOTAK_QUOTE_INTERVAL_SEC` (0.2), `KOTAK_HISTORY_INTERVAL_SEC` (1.1). See [the broker feed](#the-kotak-broker-feed) |
 | Off-box storage (backups, external models) | `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_ENDPOINT_URL`, `S3_REGION`, `S3_PREFIX` |
 | Encrypted backups | `BACKUP_PASSPHRASE` (gpg AES256; keep a copy somewhere else, a backup without it cannot be read) |
 | External training | `TRAINING_MODE=external`, `MODEL_SIGNING_KEY`, `MODEL_ARTIFACT_URL` or `S3_*` |
@@ -196,6 +202,9 @@ Alerts are Telegram messages with a code. The same problem is not repeated withi
 | `telegram_extra_delivery_failed` | a report reached you but not one of the extra chats (one warning per chat and day; the text says which chat and why, usually `bot was blocked by the user`) | ask the person to press **Start** again, or remove their id from `TELEGRAM_EXTRA_CHAT_IDS`; it never affects your own report |
 | `ideas_scan_failed` | the closing-hour scan stopped: NSE's live quotes unavailable (the message gives the reason: blocked, offline, an endpoint that was renamed) or not from today, too few names with a complete row, a gap in the stored history (run `collect_india`), or an unexpected error; it retries every minute for the whole window until 15:00 and sends a notice on the last attempt | read the message; `monster-ai ideas --dry-run`; see [no closing-hour report](#no-closing-hour-report) |
 | `ideas_deadline_missed` | the closing-hour report was ready after 15:05 and was withheld on purpose (the ideas are frozen and still judged in the evening; a report *built* after the deadline is also kept out of the record) | nothing to do; `monster-ai ideas --force` sends the frozen report anyway, marked *late* |
+| `opening_scan_failed` | the 09:30 opening read stopped: NSE's live quotes unavailable (the message gives the reason) or not from today, stamped before the third candle closed (*not formed yet*: it retries) or more than 30 minutes after the open (*too late for an opening read*), too few names with a complete row, a gap in the stored history (run `collect_india`), or an unexpected error; it retries every 20 seconds until 09:44 and sends a notice on the last attempt | read the message; `monster-ai opening --dry-run`; see [no opening read](#no-opening-read) |
+| `opening_deadline_missed` | the opening read was ready after 09:45 and was withheld on purpose (it is frozen and still judged in the evening; a report *built* after the deadline is also kept out of the record) | nothing to do; `monster-ai opening --force` sends the frozen report anyway, marked *late* |
+| `health_opening_scan_missing` | no 09:30 opening read recorded for a trading day by 09:50 (a warning, only on days the scheduler was installed before 09:30) | `monster-ai jobs`, `monster-ai logs --job opening_scan`; `monster-ai opening` runs it now if it is still before 09:45 |
 | `health_calibration_drift` / `health_skill_negative` | live calibration worse than 0.10 ECE / live Brier skill below the base rate over the last 90 days | see [models](#models); consider `models rollback` |
 | `health_calendar_horizon` | the official NSE holiday list ends within 21 days | none: NSE publishes the next year's list in December and the daily refresh picks it up; see [calendar](#the-calendar-every-month-every-year) |
 | `health_calendar_unofficial` | no official list covers today (the year changed and NSE has not published yet, or the refresh is blocked) | none in most cases: rule-based holidays and the live check cover it; with `NSE_ENABLED=false` add dates to `calendar_overrides.json` |
@@ -287,6 +296,24 @@ the attempts and accept the reduced data (and `IDEAS_ENABLED=false` to stop the 
    (HTTP 404 ...)` means all the known names are gone. The scan then needs a code update; nothing is guessed meanwhile.
    `sudo monster-ai sources-check --only nse` shows which NSE endpoints still answer.
 
+### No opening read
+
+1. `sudo monster-ai jobs` - did `opening_scan` run at 09:30, and with which status? On an exchange holiday and on a special session
+   (Muhurat trading) it is `skipped`; with `OPENING_ENABLED=false` it is `skipped` too.
+2. `failed` with an `opening_scan_failed` alert: the message says why. *not formed yet ... N minutes after the open* means NSE's quotes were
+   stamped before the third five-minute candle had closed: the scan simply retries every 20 seconds. *too late for an opening read*
+   means the quotes were stamped more than 30 minutes after the open: the window is over and nothing is sent. *NSE live quotes
+   unavailable ...*, *too few live quotes ...* and *the stored history ends on ...* are the same causes as for the closing-hour scan
+   (see [no closing-hour report](#no-closing-hour-report)): `sudo monster-ai run-job collect_india --force` repairs a missing session.
+3. `sudo monster-ai opening --dry-run` prints what the scan would say now without freezing or sending. Outside 09:30-09:45 its figures
+   cover whatever stretch of the session the quotes show (the report says *PREVIEW* and how many minutes), so it proves the data path
+   and the layout, not the numbers; `sudo monster-ai logs --job opening_scan` has the details of every attempt.
+4. `success` but nothing arrived: the report is frozen and was withheld after 09:45 (`opening_deadline_missed`), `SEND_OPENING_REPORT=false`
+   keeps it silent on purpose, or Telegram failed (it is re-sent on the next attempt); `sudo monster-ai opening --force` sends the frozen
+   report, marked *late* if it is past 09:45.
+5. The report says *no 09:12 report was stored for today*: the final scan did not freeze a snapshot (see
+   [no report this morning](#no-report-this-morning)); only the new movers are shown.
+
 ### Telegram problems
 
 `sudo monster-ai telegram-test` sends a "MONSTER AI online" message to the report chat and prints `telegram test: sent`, or
@@ -311,7 +338,7 @@ While Telegram is down, reports and alerts queue in the database and are deliver
 
 ### Adding or removing a reader
 
-The reports (the 09:12 scan, the optional 08:45 one, the closing-hour ideas, the evening review) and their chart images can go to more
+The reports (the 09:12 scan, the optional 08:45 one, the 09:30 opening read, the closing-hour ideas, the evening review) and their chart images can go to more
 chats than yours; alerts, failure notices and tests never do. To add a person:
 
 1. They open the bot in Telegram and press **Start** (a bot cannot write to someone first).
@@ -330,6 +357,40 @@ person blocking the bot changes nothing for you or for the others, and the only 
 once a day per chat. A report withheld for you (a missed deadline, a failed delivery) is not sent to anybody; a repeat of a report that
 was sent is not sent again to anybody. Everybody sees the same text, so a reader of the closing-hour ideas gets the same "research
 output, not advice" wording you do.
+
+### The Kotak broker feed
+
+Optional, off until `KOTAK_CONSUMER_KEY` is set; NSE and Yahoo do everything without it. What it does, how it is merged with NSE and what it
+never does is in the [README](../README.md#optional-broker-feed-kotak-neo) and [ARCHITECTURE](ARCHITECTURE.md#the-optional-broker-feed).
+
+**Turn on and verify** (one value; the deployment never asks for, stores or sends the MPIN, the TOTP secret, the mobile number or the UCC):
+
+```bash
+sudo nano /etc/monster-ai/monster.env     # KOTAK_CONSUMER_KEY=<the application token from NEO app > More > Trade API>
+sudo systemctl restart monster-ai
+sudo monster-ai sources-check --only kotak    # the token, the instrument master, live quotes, index quotes, five-minute candles
+sudo monster-ai doctor                        # "broker feed" (configuration) and "network: Kotak quotes" (one index quote proves the token)
+```
+
+The application token is also what a Kotak **IP whitelist** would have to allow, if your account has one. Quotes and history are read-only data
+calls that answer to the token alone (no login): measured on 2026-11-06 from a development PC and from the deployment server (quotes in about 0.1 s
+there). If `sources-check --only kotak` ever says `refused the application token (HTTP 403)` on the server but works from your PC, allow the
+server's address in the broker's settings (`curl -4 ifconfig.me` shows it).
+
+**The candle limit belongs to the token, not to the address.** About one history request a second is allowed for the token across every program that
+uses it (measured: a second client on another address was refused with HTTP 429 while the first was running). This system asks for candles only in the
+evening judging (after 18:30), one request a name, so it does not compete with a dashboard that polls the broker during the session; if you run one
+in the evening too, a 429 only makes this client slow down and Yahoo judge those names.
+
+| What you see | Meaning | What to do |
+|--------------|---------|------------|
+| `FAIL/WARN ... refused the application token (HTTP 401 / 403)` | the token is wrong, revoked or tied to another address | copy `KOTAK_CONSUMER_KEY` again from the NEO app (a new "Generate application" replaces the old token); if it works from another machine, allow this server's address |
+| `Kotak instrument master ... outside kotaksecurities.com` | the broker's file list points to a host that is not Kotak's; the file is **not** fetched and the token is never sent there | nothing is lost (NSE carries the scans); report it if it persists |
+| report footer / source line says `NSE (...)` only and a note `Kotak live feed unavailable: NSE alone was used` | the broker did not answer (see `source_health` row `kotak_quotes`, `monster-ai health`) | `sources-check --only kotak` for the reason; the scan itself is unaffected |
+| note `Kotak live feed not used: its newest trade was N s old` | during the session even the freshest of ~200 liquid stocks last traded more than `KOTAK_MAX_LAG_SEC` ago: the broker feed is lagging, NSE alone was used | nothing; if it happens daily raise `KOTAK_MAX_LAG_SEC` or leave the guard to do its job |
+| note `NSE and Kotak disagreed on N name(s), left out: ...` | the two feeds' previous close, open or last price differ more than 0.3 % / 0.5 % / 3 %: one of them has the wrong basis (a corporate action applied by one only) | nothing: those names are skipped for that scan; the names are in the note |
+| source line says `Kotak broker feed (NSE did not answer)` | NSE was blocked or down and the broker alone carried the scan | nothing; check `sources-check --only nse` |
+| `source_health` `kotak_history` failing in the evening | candle requests are refused (HTTP 429 above about one request a second, or the broker's archive is down) | nothing: Yahoo judges those names; lower the load by raising `KOTAK_HISTORY_INTERVAL_SEC` |
 
 ### The AI services (Groq and Jev)
 
@@ -721,3 +782,36 @@ does it).
   was built too late to act on.
 - A bearish idea needs an F&O position (short futures, or buy a put); an overnight position can open with a gap that a stop does not
   cover; at 14:30 the day's volume is a projection from a typical intraday profile. None of this is advice, and the system places no orders.
+
+### The 09:30 opening read
+
+- **It estimates how wide the day will be, not which way.** In the research (out of sample on 138 sessions of the exchange's own
+  candles) the day's SIZE was predictable, mostly from each stock's own volatility and a little more from the opening range: among the
+  names that had not yet passed a 3 % range, the six highest-rated each day went on to one in 80 % of cases, against 63 % on the
+  09:12 information alone and 28 % for random names. It carried **no direction** (earlier study), and a breakout plan on its levels
+  lost about what trading it costs (-0.20 % per trade after costs, -0.02 % before). The head of every report says this again; read
+  the levels as references and as a way to size the risk, not as a call to enter.
+- **"So far" and "still ahead" are shown apart on purpose.** A good part of what the opening range adds is the move already on the
+  board: a stock that made 2.5 % in 15 minutes has nearly made a 3 % day by that fact alone (a first version overstated the result for
+  exactly this reason). For the range still to come the opening adds nothing measurable over the 09:12 information (among hot openings
+  the six with the largest expected remaining range made at least 2 % more in 83 % of cases, 83 % when ranked on the 09:12 information
+  alone, 54 % at random). The *still ahead* range (with its 80 % band) is the part that is yet to come, and it varies much less between
+  stocks than the day's range does. A stock whose range so far has already passed 3 % reads *"already above 3 %"* (no chance is quoted:
+  it would be a trivial 100 %), and a day-range band bounded by what has printed reads *"at least X %"*.
+- **Strength words describe what has happened.** QUIET, NORMAL, HOT and EXPLOSIVE are the opening range divided by the stock's mean
+  daily range of the last 20 sessions (under 0.30, 0.30-0.60, 0.60-0.85, 0.85 and above); the legend at the foot of the report shows
+  the median range still ahead (1.7, 1.9, 2.0 and 2.5 %) and how often each band ended with a range above 3 % (16, 25, 42 and 73 %,
+  partly already on the board at 09:30). A quiet opening in a volatile stock lowers the expected range ahead only modestly.
+- **A morning pick is listed whatever its estimate**, so you see what its first fifteen minutes did; a new mover needs a HOT or
+  EXPLOSIVE opening (`OPENING_MIN_X`, 0.60 times the stock's mean daily range) and to pass the liquidity, price, history and cost gates,
+  and the movers are ranked by the range still expected. *"No new name passed the gates today: nothing is forced"* is a normal answer.
+- **Read the record line first.** `Live record: none judged yet` means the figures come from the 138 sessions of research only. Once
+  sessions are judged the line says what the stated chance of a range above 3 % came to against what happened over every name the model
+  scored that had not already passed 3 % (the others are shown as *"already past 3 %: not a test"*), and how the model's top six did; it
+  is called validated after 20 sessions with the pooled stated chance within 5 points of what happened and its top names clearly above
+  the base rate, otherwise it says what is missing. The levels' own record (*levels as a plan*) is shown beside it whatever it is, and
+  is expected to hover around zero.
+- **Timing.** The scan starts at 09:30:15. A retry a few minutes late is scaled back to the fifteen-minute basis and the notes say so; a
+  report later than 09:45 is withheld unless forced. Judging happens at 18:32 (`evaluate_opening`), after the official bars are in.
+- The numbers have not been tested live yet: the first real 09:30 run is their first live test. None of this is advice, and the system
+  places no orders.

@@ -112,6 +112,7 @@ _HINTS: tuple[tuple[str, str], ...] = (
     ("scan_final_failed", "sudo monster-ai logs --job final_scan"),
     ("snapshot_repair", "sudo monster-ai logs --job final_scan"),
     ("ideas_", "sudo monster-ai logs --job closing_scan"),
+    ("opening_", "sudo monster-ai logs --job opening_scan"),
     ("report_", "sudo monster-ai jobs"),
     ("job_failed_", "sudo monster-ai logs --job {rest}"),
     ("job_crashed_", "sudo monster-ai logs --job {rest}"),
@@ -149,6 +150,7 @@ def alert_hint(code: Any) -> str | None:
 
 
 def scan_hint(stage: Any) -> str:
-    """The log command for a scan stage (``pre`` / ``final`` / ``closing``); the job list for anything else."""
+    """The log command for a scan stage (``pre`` / ``final`` / ``closing`` / ``opening``); the job list for anything else."""
     return {"pre": "sudo monster-ai logs --job prelim_scan", "final": "sudo monster-ai logs --job final_scan",
-            "closing": "sudo monster-ai logs --job closing_scan"}.get(str(stage or "").strip().lower(), "sudo monster-ai jobs")
+            "closing": "sudo monster-ai logs --job closing_scan",
+            "opening": "sudo monster-ai logs --job opening_scan"}.get(str(stage or "").strip().lower(), "sudo monster-ai jobs")

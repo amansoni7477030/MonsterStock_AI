@@ -20,7 +20,10 @@ alerts, nightly backups).
 You need a server you can SSH into with a user that has `sudo` (or `root`), and - optionally - a Telegram bot
 token from [@BotFather](https://t.me/BotFather). Put the token into a local `.env` file first (copy
 `.env.example`, fill in `TELEGRAM_BOT_TOKEN=`), or add it to the server later. The same file takes the optional AI keys
-(`GROQ_API_KEY`, `TYPESAFE_API_KEY`); the system works without them.
+(`GROQ_API_KEY`, `TYPESAFE_API_KEY`) and the optional Kotak broker feed's application token (`KOTAK_CONSUMER_KEY`, the token only); the
+system works without them. The deploy scripts upload **only the settings `.env.example` defines**: anything else in that file - for example
+the broker's login values `KOTAK_MOBILE`, `KOTAK_UCC`, `KOTAK_MPIN` and `KOTAK_TOTP_SECRET`, which MONSTER AI never reads - stays on your
+machine, and the script lists the names (never the values) it left behind.
 
 **From Windows 10/11** (uses the built-in OpenSSH client and `tar`; run it in Windows Terminal / a PowerShell
 window, not in the ISE):
@@ -46,9 +49,9 @@ sudo bash deployment/install.sh --yes
 ```
 
 What happens: the project is packed (without `.git`, `.venv`, tests, runtime data and env files), uploaded with
-your env file to a private temporary directory (`mktemp -d`, mode 700), installed with `sudo bash
-deployment/install.sh --yes`, and the temporary directory is removed again - the env copy is **shredded** (even
-when the installation fails). The exit code is that of the installer.
+a filtered copy of your env file (only the settings `.env.example` defines; `lib/envseed.ps1` / `lib/envseed.sh`) to a private temporary
+directory (`mktemp -d`, mode 700), installed with `sudo bash deployment/install.sh --yes`, and the temporary directory is removed
+again - the env copy is **shredded** (even when the installation fails). The exit code is that of the installer.
 
 During the installation (about 5 minutes without the bootstrap):
 
@@ -224,7 +227,9 @@ touch them, because `copytruncate` would empty a file that several processes app
   other world-readable file; the installer and the application mask them in all output.
 - **SSH**: use key authentication. The deploy scripts use `StrictHostKeyChecking=accept-new` (the first
   connection records the host key, later changes are refused), `ServerAliveInterval=30`, `ConnectTimeout=20`.
-  The env file travels over SSH only and is shredded on the server afterwards.
+  The env file travels over SSH only and is shredded on the server afterwards. Only the settings `.env.example` defines are uploaded: a
+  key the application does not know (the broker's MPIN and TOTP secret, another project's secret, a typo) stays on your machine and only
+  its name is shown. If the filter cannot read the file, nothing is uploaded.
 - **No firewall or SSH configuration is changed.** MONSTER AI only makes outbound connections and listens on
   nothing by default. Hardening the host (key-only SSH, `ufw allow OpenSSH`, unattended security updates) is your
   decision.

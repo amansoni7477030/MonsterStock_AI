@@ -194,6 +194,93 @@ class IdeasReport:
         return cls(**payload)
 
 
+# ------------------------------------------------------------------------------------------ the 09:30 opening read
+OPENING_KINDS = ("PICK", "MOVER")  # a name of the 09:12 report | a new name whose opening range stands out
+STRENGTHS = ("QUIET", "NORMAL", "HOT", "EXPLOSIVE")  # how big the first fifteen minutes were against the stock's usual day
+
+
+@dataclass
+class OpeningIdea:
+    """One stock at the 09:30 opening read: what its first fifteen minutes showed, what the opening-range model makes of it, and the
+    reference levels around the opening range. Nothing here is a call to buy or sell: the model estimates how WIDE the day will be
+    (validated), not which way it will go (no edge found)."""
+
+    symbol: str
+    rank: int
+    kind: str  # PICK | MOVER
+    ltp: float
+    open: float
+    prev_close: float
+    or_high: float  # the day's high at the scan = the opening range's high
+    or_low: float
+    gap_pct: float  # the open against the previous close, %
+    or_pct: float  # the opening range, % of the open, normalised to the first fifteen minutes
+    move_pct: float  # the last price against the open, %
+    x: float  # the opening range as a multiple of the stock's mean daily range of the last 20 sessions
+    strength: str  # QUIET | NORMAL | HOT | EXPLOSIVE (bands of ``x``)
+    p3: float  # estimated chance that the whole day's range exceeds 3 % of the open
+    p5: float
+    day_range: list[float] = field(default_factory=list)  # q10, q50, q90 of the day's range, % of the open
+    ahead: list[float] = field(default_factory=list)  # q10, q50, q90 of the range still to come after the scan, % of the last price
+    name: str | None = None
+    sector: str | None = None
+    is_fno: bool = False
+    atr_pct: float | None = None
+    turnover_cr: float | None = None
+    est_cost_pct: float | None = None  # all-in intraday round trip, % of the position
+    levels: dict[str, float] = field(default_factory=dict)  # trigger_long / long_stop / long_target1 / long_target2 and the short side
+    pre: dict[str, Any] = field(default_factory=dict)  # a pick's 09:12 view: rank, tier, p (its primary-threshold probability), threshold
+    notes: list[str] = field(default_factory=list)
+    metrics: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.symbol}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> OpeningIdea:
+        return cls(**_filter_fields(cls, data))
+
+
+@dataclass
+class OpeningReport:
+    """The frozen 09:30 report: the first fifteen minutes of the session read against the 09:12 picks, the opening movers and the
+    live record that stands behind the model."""
+
+    trade_date: str
+    snapshot_ist: str  # display string, e.g. "2026-11-02 09:30:42 IST"
+    elapsed_min: float = 15.0  # minutes of trading the live range covers (15 = exactly the opening range)
+    source: str = ""
+    picks: list[OpeningIdea] = field(default_factory=list)  # the names of the 09:12 report, read again
+    movers: list[OpeningIdea] = field(default_factory=list)  # new names whose opening range stands out
+    pre_stage: str = ""  # which morning snapshot the picks were taken from: final | pre (empty = none was stored)
+    market: dict[str, Any] = field(default_factory=dict)
+    record: dict[str, Any] = field(default_factory=dict)
+    model: dict[str, Any] = field(default_factory=dict)  # model id and the evidence it stands on
+    notes: list[str] = field(default_factory=list)
+    mode: str = "shadow"
+    universe_size: int = 0
+    n_eligible: int = 0
+    late: bool = False  # built after the report deadline: kept out of the live record
+
+    @property
+    def ideas(self) -> list[OpeningIdea]:
+        return [*self.picks, *self.movers]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> OpeningReport:
+        payload = _filter_fields(cls, data)
+        for name in ("picks", "movers"):
+            payload[name] = [OpeningIdea.from_dict(i) if isinstance(i, dict) else i for i in payload.get(name, [])]
+        return cls(**payload)
+
+
 @dataclass
 class EveningRow:
     symbol: str

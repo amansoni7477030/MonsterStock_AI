@@ -163,6 +163,33 @@ class YahooClient:
         change = ((price / prev - 1.0) * 100.0) if price and prev else None
         return {"symbol": symbol, "price": price, "prev_close": prev, "change_pct": change, "source_ts": source_ts}
 
+    def fetch_intraday(self, symbol: str, *, range_: str = "5d", interval: str = "5m") -> list[dict[str, Any]]:
+        """Intraday bars (five-minute by default, the last few sessions), oldest first. Used after the close to judge intraday levels
+        against the path the price took; never to build a prediction (Yahoo's feed omits the opening auction's volume and some
+        closing bars)."""
+        return self._parse_intraday(self._chart(symbol, {"range": range_, "interval": interval}))
+
+    @staticmethod
+    def _parse_intraday(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+        meta = result.get("meta") or {}
+        tz = _tz(str(meta.get("exchangeTimezoneName") or "UTC"))
+        stamps = result.get("timestamp") or []
+        block = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        bars: list[dict[str, Any]] = []
+        for idx, stamp in enumerate(stamps):
+            try:
+                moment = datetime.fromtimestamp(int(stamp), timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            o, h, low, c = (_num(_at(block.get(k), idx)) for k in ("open", "high", "low", "close"))
+            if None in (o, h, low, c):  # Yahoo leaves a null bar where nothing traded (and in the closing minutes)
+                continue
+            local = moment.astimezone(tz)
+            bars.append({"ts": iso(moment), "trade_date": local.date().isoformat(), "hhmm": local.strftime("%H:%M"), "open": o, "high": h,
+                         "low": low, "close": c, "volume": _num(_at(block.get("volume"), idx))})
+        bars.sort(key=lambda b: b["ts"])
+        return bars
+
     def spark_latest(self, symbols: Sequence[str]) -> dict[str, SparkPoint]:
         """Newest daily point of MANY symbols in ``ceil(n / 20)`` requests (the spark endpoint answers up to 20 symbols per
         call; a chart call answers one). Used as a freshness probe so unchanged series are not fetched one by one."""

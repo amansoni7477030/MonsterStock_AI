@@ -12,14 +12,18 @@ from typing import Any
 from app.clock import IST, iso, ist_date
 from notifications import charts, report
 from notifications import ideas as idea_messages
+from notifications import opening as opening_messages
 from notifications.telegram import MAX_CAPTION_CHARS, MAX_MESSAGE_CHARS, split_message
 from ranking.ideas import BTST_PLAN, SWING_PLAN, WATCH_PLAN
+from ranking.opening import MODEL_INFO
 from ranking.types import (
     Candidate,
     Catalyst,
     EveningRow,
     EveningSummary,
     IdeasReport,
+    OpeningIdea,
+    OpeningReport,
     ReportContext,
     TradeIdea,
 )
@@ -31,6 +35,7 @@ KINDS = {
     "final": "the 09:12 report with a validated model: summary table, chart and the detail of every candidate",
     "prelim": "the optional 08:45 preliminary report (shadow model: tiers capped at WATCH)",
     "no-setup": "the report on a morning without a high-conviction setup",
+    "opening": "the 09:30 opening read: the 09:12 picks read again, new opening movers, reference levels, the market at the open and the model's live record (text and tables)",
     "ideas": "the 14:30 closing-hour trade ideas (BTST, swing, bearish F&O, tomorrow's intraday watchlist) with level tables, charts and their live record",
     "evening": "the after-close evaluation with the live record, a table and a chart",
     "alert": "one operational alert of each severity",
@@ -181,6 +186,51 @@ def _ideas_report(today: str, now: datetime) -> IdeasReport:
     )
 
 
+def _opening_idea(symbol: str, rank: int, kind: str, strength: str, x: float, or_pct: float, ltp: float, move: float, gap: float,
+                  p3: float, p5: float, day: list[float], ahead: list[float], **over: Any) -> OpeningIdea:
+    base = dict(
+        symbol=symbol, rank=rank, kind=kind, ltp=ltp, open=round(ltp / (1 + move / 100), 2), prev_close=round(ltp / (1 + move / 100) / (1 + gap / 100), 2),
+        or_high=round(ltp * 1.006, 2), or_low=round(ltp * 0.985, 2), gap_pct=gap, or_pct=or_pct, move_pct=move, x=x, strength=strength, p3=p3, p5=p5,
+        day_range=day, ahead=ahead, is_fno=True, atr_pct=2.4, turnover_cr=312.5, est_cost_pct=0.19, metrics={"or_raw_pct": or_pct},
+        levels={"trigger_long": round(ltp * 1.0075, 2), "long_stop": round(ltp * 0.9985, 2), "long_target1": round(ltp * 1.0255, 2),
+                "long_target2": round(ltp * 1.0455, 2), "trigger_short": round(ltp * 0.9825, 2), "short_stop": round(ltp * 1.0095, 2),
+                "short_target1": round(ltp * 0.9565, 2), "short_target2": round(ltp * 0.9365, 2)},
+    )
+    return OpeningIdea(**{**base, **over})
+
+
+def _opening_report(today: str, now: datetime) -> OpeningReport:
+    """A 09:30 report with a hot pick, a quiet pick, an explosive mover already past a 3% range, a hot mover whose band is bounded below by
+    the range so far, and a validated model record."""
+    cut = now.astimezone(IST)
+    return OpeningReport(
+        trade_date=today, snapshot_ist=f"{cut:%Y-%m-%d %H:%M:%S} IST", elapsed_min=15.1,
+        source="NSE (SECURITIES IN F&O): 196 of 201 names with a complete live row", pre_stage="final",
+        picks=[
+            _opening_idea("DEMOONE", 1, "PICK", "HOT", 0.74, 1.9, 842.1, 1.2, 0.8, 0.48, 0.09, [1.95, 2.9, 4.75], [1.3, 2.08, 3.59],
+                          name="Demo One Industries Ltd", sector="Energy", pre={"rank": 1, "tier": "STRONG", "p": 0.64, "threshold": 3.0, "stage": "final"},
+                          notes=["gap up +0.8%: still holding", "trading at the top of its opening range"]),
+            _opening_idea("DEMOTWO", 2, "PICK", "QUIET", 0.22, 0.45, 1530.4, -0.1, -0.2, 0.03, 0.0, [0.95, 1.41, 2.31], [0.83, 1.32, 2.28],
+                          name="Demo Two Bank Ltd", sector="Financial Services", pre={"rank": 2, "tier": "MODERATE", "p": 0.52, "threshold": 3.0, "stage": "final"}),
+        ],
+        movers=[
+            _opening_idea("DEMOFIV", 1, "MOVER", "EXPLOSIVE", 1.12, 3.4, 241.15, 2.9, 1.7, 1.0, 0.41, [3.4, 4.21, 6.9], [1.74, 2.79, 4.81],
+                          name="Demo Five Retail Ltd", sector="Consumer Services", notes=["gap up +1.7%: still holding", "news: Demo board approves a fund raise (Demo Wire)"]),
+            _opening_idea("DEMOSIX", 2, "MOVER", "HOT", 0.81, 2.4, 512.6, -2.4, -1.1, 0.67, 0.19, [2.4, 3.46, 5.67], [1.52, 2.43, 4.2],
+                          name="Demo Six Rail Ltd", sector="Capital Goods"),
+        ],
+        market={"nifty_chg": 0.31, "nifty_or_pct": 0.42, "nifty_x": 0.71, "vix": 13.2, "vix_chg": -2.9, "advancers": 131, "decliners": 83,
+                "median_chg": 0.12, "median_x": 0.472, "day_type": "wide", "hot_share": 0.23,
+                "sectors_up": [["Banks", 0.8], ["Auto", 0.5], ["Metals", 0.4]], "sectors_down": [["IT", -0.6], ["Pharma", -0.4], ["FMCG", -0.2]]},
+        record={"model": {"days": 24, "n": 5104, "n_decided": 118, "mean_p3": 0.281, "hit3": 0.274, "gap": -0.007, "top_n": 6, "top_hit": 0.88,
+                          "top_ci": [0.81, 0.93], "validated": True},
+                "PICK": {"n": 140, "n_open": 128, "n_decided": 12, "hit3": 0.46, "mean_p3": 0.44, "mean_range_pct": 3.1},
+                "MOVER": {"n": 150, "n_open": 96, "n_decided": 54, "hit3": 0.61, "mean_p3": 0.58, "mean_range_pct": 4.4},
+                "plan": {"n": 120, "t1_rate": 0.23, "stop_rate": 0.24, "mean_net_pct": -0.06, "net_ci": [-0.19, 0.07]}},
+        model=dict(MODEL_INFO), notes=["sample preview: nothing in this message is real"], universe_size=201, n_eligible=164,
+    )
+
+
 def _final_context(today: str) -> ReportContext:
     return _context(today, stage="final", status="validated", model="demo-model-0.1", candidates=_candidates())
 
@@ -203,6 +253,7 @@ def build_samples(settings: Any, now: datetime) -> list[tuple[str, list[str]]]:
         ("no-setup", report.render_final_report(_context(
             today, stage="final", status="validated", model="demo-model-0.1", candidates=[], no_setup=True,
             no_setup_reason="the top probability is only 33% and no name cleared the conviction gates"))),
+        ("opening", opening_messages.render_opening_report(_opening_report(today, now))),
         ("ideas", idea_messages.render_ideas_report(_ideas_report(today, now))),
         ("evening", report.render_evening_report(_evening(today))),
         ("alert", [report.render_alert(level, code, message, created_at=stamp) for level, code, message in alerts]),

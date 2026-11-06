@@ -6,6 +6,17 @@ calibrated probability of an unusually large intraday range** (default: range > 
 "no high-conviction setup" when nothing qualifies. After the close it evaluates what it predicted against simple baselines and
 retrains weekly under fixed validation gates.
 
+A **day has four reports**: the pre-open one at about 09:12, an **opening read at 09:30** that looks at what the first fifteen minutes
+(three five-minute candles) actually showed, the closing-hour ideas at about 14:31 and the evening review after the close. The old
+08:45 report is no longer sent (that scan still runs silently as a safety net).
+
+At 09:30 IST the **opening read** takes NSE's live quotes, which then hold the day's open, high and low of the first fifteen minutes,
+and reads them against each stock's own normal: the names of the 09:12 report are read again (has the stock started moving, did its gap
+hold), new names whose opening range stands out are listed, and each gets an estimate of how wide the day will be and reference levels
+around the opening range (see [The 09:30 opening read](#the-0930-opening-read)). What was measured: the day's **size** is predictable,
+mostly from each stock's own volatility and a little more from its opening range (and part of that is simply the move already on the
+board); it does **not** predict the direction, and the report says so.
+
 Every trading afternoon at about 14:31 IST it also sends a **closing-hour trade-idea report**: BTST ideas (buy before the close, sell
 in the next session), swing ideas (hold a few sessions), bearish F&O setups and a watchlist of intraday levels for the next day, each
 with a mechanical entry, stop and targets, the estimated cost and the reasons, built from NSE's live quotes and the stored history
@@ -26,14 +37,15 @@ with a mechanical entry, stop and targets, the estimated cost and the reasons, b
 5. [Quick start (development machine)](#quick-start-development-machine)
 6. [Server deployment](#server-deployment)
 7. [Daily timetable](#daily-timetable-asiakolkata-trading-days)
-8. [Closing-hour trade ideas](#closing-hour-trade-ideas)
-9. [Commands](#commands)
-10. [Configuration](#configuration)
-11. [Reliability guarantees](#reliability-guarantees)
-12. [Quality gates and CI/CD](#quality-gates-and-cicd)
-13. [Project layout](#project-layout)
-14. [Documentation map](#documentation-map)
-15. [Limitations](#limitations)
+8. [The 09:30 opening read](#the-0930-opening-read)
+9. [Closing-hour trade ideas](#closing-hour-trade-ideas)
+10. [Commands](#commands)
+11. [Configuration](#configuration)
+12. [Reliability guarantees](#reliability-guarantees)
+13. [Quality gates and CI/CD](#quality-gates-and-cicd)
+14. [Project layout](#project-layout)
+15. [Documentation map](#documentation-map)
+16. [Limitations](#limitations)
 
 ## At a glance
 
@@ -47,7 +59,9 @@ with a mechanical entry, stop and targets, the estimated cost and the reasons, b
 | **Traceability** | daily log files per process role plus a shared errors file, millisecond stamps with offset, per-job tags, crash hooks, secret redaction, `monster-ai logs` / `diag`, and every frozen report stamped with the exact code that made it |
 | **Self-healing** | resumable bootstrap, ledger-based scheduler (nothing runs twice, missed work is visible), RSS watchdog, systemd restart + watchdog + independent health timer, heartbeat file, queued alerts, automatic model rollback to a labelled baseline, verified backups |
 | **Honesty** | calibrated probabilities, fixed gates, tier caps, sample sizes and 95 % intervals on every live statistic, explicit "no setup" |
+| **Opening read** | at 09:30 IST the first fifteen minutes (NSE's live open / high / low) are read against each stock's own normal: the 09:12 picks are read again, new opening movers are listed, each with an out-of-sample-tested estimate of how wide the day will be and reference levels around the opening range; the direction is **not** predicted (none was found); frozen once, sent by 09:45, every name it scored is judged against the official bars the same evening ([details](#the-0930-opening-read)) |
 | **Closing-hour ideas** | at 14:30 IST NSE's live quotes, laid over the stored daily history, become BTST, swing, bearish F&O and next-day intraday ideas with mechanical levels, costs and reasons; the report is frozen once, sent by 15:05 and judged against the official bars the same evening; every list shows its own live record and is only called validated after a fixed gate ([details](#closing-hour-trade-ideas)) |
+| **Optional broker feed** | with `KOTAK_CONSUMER_KEY` (one application token, read-only, no login) the 09:30 and 14:30 scans read Kotak Neo's live quotes beside NSE's and merge them per name (a disagreement leaves the name out, the fresher row wins, a lagging feed is not used, either feed alone carries a scan), and the evening judging uses the broker's exchange-grade five-minute candles instead of Yahoo's smoothed ones ([details](#optional-broker-feed-kotak-neo)) |
 | **Optional AI** | **Groq** (open-weight `openai/gpt-oss-120b`, with `gpt-oss-20b` and `qwen/qwen3.8-27b` behind it, each model with its own rate limits) reads news for structure and can **check unconfirmed company news on the web** (its built-in browser search); **Jev** (TypeSafe AI) judges event type, rumour, denial, severity and direction with calibrated confidence. Both are given the facts a human reader would use (when, by whom, which company and sector), are off until you add a key, are cached, budgeted and rate-limit aware, fall back to the rules on any failure and never change the calibrated forecast ([details](#optional-ai-groq-and-jev)) |
 
 ## What you have to do
@@ -56,7 +70,7 @@ Only this (everything else is automated, including first-time setup, history bac
 clean-up and the yearly holiday list):
 
 1. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and copy its token.
-2. Run the one-command deployment (see [Server deployment](#server-deployment)). Optional keys (S3 backup, Groq / Jev AI)
+2. Run the one-command deployment (see [Server deployment](#server-deployment)). Optional keys (S3 backup, Groq / Jev AI, the Kotak broker feed)
    can be added later to `/etc/monster-ai/monster.env`; for the AI keys, restart the service and run `sudo monster-ai ai-test`
    (see [Optional AI](#optional-ai-groq-and-jev)).
 
@@ -135,7 +149,7 @@ flowchart TB
     subgraph L4["app/ - platform, used by every layer"]
         PLAT["config, clock, logging, locks, resources, errors, doctor"]
     end
-    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, Groq, Jev"]
+    EXT["External: Yahoo, NSE, RSS, GDELT, Telegram, S3, Groq, Jev, Kotak"]
     UNITS ~~~ SCHED
     SCHED ~~~ FEAT
     FEAT ~~~ ING
@@ -197,6 +211,7 @@ flowchart TB
         M5 --> M6["08:45 prelim_scan"]
         M6 --> M7["09:00:30 refresh_preopen"]
         M7 --> M8["09:08:45 final_scan<br/>report by 09:12, hard deadline 09:14:30"]
+        M8 --> M9["09:30:15 opening_scan<br/>first 15 minutes read, report by 09:45"]
     end
     subgraph MID["Closing hour"]
         direction TB
@@ -206,12 +221,13 @@ flowchart TB
         direction TB
         E1["17:45 ingest_eod"] --> E2["18:15 evaluate"]
         E2 --> E2B["18:30 evaluate_ideas"]
-        E2B --> E3["20:00 health_check"]
+        E2B --> E2C["18:32 evaluate_opening"]
+        E2C --> E3["20:00 health_check"]
         E3 --> E4["23:30 backup"]
         E4 --> E5["23:50 housekeeping<br/>retention, official-bar upgrade"]
     end
     classDef critical fill:#fde2e0,stroke:#c0392b,color:#000
-    class M6,M7,M8,C2 critical
+    class M6,M7,M8,M9,C2 critical
 ```
 
 | Time | Job | Purpose |
@@ -219,19 +235,88 @@ flowchart TB
 | 06:00-08:30 | `collect_global` | US/Europe/Asia closes, FX, commodities, rates, VIX, GIFT Nifty (retries) |
 | 06:30, 08:10, 13:40 | `collect_news` | RSS (conditional GET) + GDELT (Google News search as its fallback) + NSE filings, entity/event extraction, market-reaction check; the 13:40 pass gives the closing scan fresh catalysts |
 | 08:00 | `collect_india` | previous-session completeness (official bhavcopy first), results calendar |
-| 08:45 | `prelim_scan` | preliminary scan, frozen snapshot (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete |
+| 08:45 | `prelim_scan` | preliminary scan, frozen snapshot, **silent** (Telegram only if `SEND_PRELIM_REPORT=true`); first repairs the previous session if `collect_india` left it incomplete; its snapshot is the fallback when the final scan is missing |
 | 09:00:30 | `refresh_preopen` | NSE pre-open book (indicative/final equilibrium prices) |
 | 09:08:45 | `final_scan` | final scan with the opening gap, frozen snapshot, **Telegram report by 09:12-09:14:30** |
+| 09:30:15-09:44 | `opening_scan` | NSE live quotes (and the Kotak broker's, when its key is set) after the third five-minute candle: the first fifteen minutes read against each stock's normal, the 09:12 picks read again, new movers, reference levels; frozen once, **Telegram report by 09:45**; retried every 20 seconds |
 | 14:30-15:00 | `closing_scan` | NSE live quotes over the stored history: BTST, swing, bearish F&O and next-day intraday ideas, frozen once, **Telegram report by 15:05** (enter before 15:15); retried every minute for the whole window |
 | 17:45+ | `ingest_eod` | official end-of-day data (retries until 23:30) |
 | 18:15+ | `evaluate` | outcomes vs baselines, evening report with the live record |
 | 18:30+ | `evaluate_ideas` | the earlier trade ideas judged on the official bars; outcomes are kept apart from the frozen reports and make up each list's live record |
+| 18:32+ | `evaluate_opening` | the earlier opening reads judged on the official bars (every name the model scored, not only the listed ones) and, for the listed names, the range ahead and the reference levels as a plan on five-minute candles (the Kotak broker's when its key is set, else Yahoo's, which reach back five sessions); kept apart from the frozen reports |
 | 23:30 / 23:50 | `backup`, `housekeeping` | verified online DB backup (+ off-box copy when S3 is configured); retention, official-bar upgrade, basis repair, DB maintenance |
 | Sat 02:00 | `train` | walk-forward retraining, champion/challenger governance (`TRAINING_MODE=local-light`) |
 
 Also every day at 05:30: `refresh_calendar` (NSE holidays) and `model_sync` (external training mode: pull and verify signed models).
 Weekly: `refresh_universe` (Sun). Every 5 minutes an independent systemd timer runs `health --notify`. A ledger (`job_runs`) makes
 every job restart-safe: missed windows are recorded and alerted, catch-up jobs run after a reboot, and nothing runs twice.
+
+## The 09:30 opening read
+
+By 09:30 IST three five-minute candles have formed, and NSE's live quotes then hold each stock's **open, high and low of exactly the
+first fifteen minutes**. `opening_scan` (started at 09:30:15, retried every 20 seconds, report by 09:45) reads that opening range
+against the stock's own normal and sends one report:
+
+- **The 09:12 picks, read again**: for each name of the morning report, the opening range, whether its gap held or filled, how strong
+  the opening was and the updated estimate.
+- **New opening movers**: names the morning report did not list whose opening is HOT or EXPLOSIVE (an opening range of at least 0.60
+  times the stock's mean daily range, `OPENING_MIN_X`), at most 8, the largest expected range still ahead first.
+- **Reference levels** around each opening range: a trigger just beyond its high and its low, each with a stop and two targets in
+  the same ATR multiples as the next-day watchlist.
+- **The market at the open**: Nifty and VIX, breadth, how wide the stocks' openings are on the whole (calm, average or wide, against
+  the 138 sessions measured) and the leading and lagging sectors.
+
+**What was measured** (the broker's own five-minute candles of 138 sessions, 2026-04-13 to 2026-10-30, laid over the stored daily
+history; 28,982 stock-days of the F&O stocks; every figure is out of sample: an expanding window fitted on earlier sessions only, from the
+21st session on with one session's embargo, so 118 sessions are judged). The strength bands, the 3 % level and the hot-opening line were
+chosen on an earlier 60-session study on Yahoo's bars, which overlaps the last 59 of these sessions; the coefficients and every figure below
+were then refitted and re-measured on the exchange's own candles, because the live quotes the model reads are exchange-grade while
+Yahoo's first-fifteen-minute range is about a tenth narrower:
+
+| Question | Answer |
+|---|---|
+| Does the opening range predict how **wide** the day will be? | **Yes, but less than it first looks.** Most of the day's size is each stock's own volatility, known before the open, and a range that has already printed counts towards the day (the earlier study found that 59 % of its six highest-rated names a day had already printed a range above 3 % in their first fifteen minutes). So the claim is judged on the names that had **not** yet passed 3 % (24,988 of 25,578 stock-days): AUC for "the day's range exceeds 3 %" is 0.695 on the 09:12 information (history and the gap) and 0.763 with the opening range; the six highest-rated of those names each day made a range above 3 % in 80 % of cases, against 63 % on the 09:12 information and 28 % for six random names (the opening's gain over 09:12: +17 points, 95 % day-block interval +13 to +20). The stated chances were calibrated (slope 0.96; 26.1 % stated against 25.9 % real) and the 80 % range band held 79 % of the time (85 % for hot openings) |
+| Is that news about the move still **to come**? | **Not measurably.** Among the hot openings (about 47 names a day) the six with the largest expected range after 09:30 made at least 2 % more in 83 % of cases, against 54 % for six random hot openings, and also 83 % when ranked on the 09:12 information alone: the opening's own gain for the range still ahead is -2 to +2 points. How far the move extends beyond the opening range is not predictable from it, so the report shows "so far" and "still ahead" apart |
+| Does it predict the **direction**? | **No.** In the earlier 60-session study the move from 09:30 to the close, signed by the first fifteen minutes' direction, was statistically zero in every strength band, also net of the market (not repeated on the exchange data) |
+| Are breakouts of the opening range a profitable **plan**? | **No.** Buy above its high or sell below its low (stop 0.5 ATR, first target 0.6 ATR, costs included): -0.20 % per trade over the 138 sessions (20,115 trades, interval -0.20 to -0.18) and -0.02 % before costs, so the loss is about what the trading costs. The levels are references and a way to size risk, not an edge |
+
+The model is deliberately small: four inputs (the 20-session mean daily range, the 14-day ATR, the gap and the opening range, each
+against the stock's own normal) into logistic and log-linear fits, so every number can be reproduced by hand (`ranking/opening.py`
+holds the coefficients and the evidence, `tests/test_opening_model.py` the golden cases computed independently). It estimates the
+chance of a day range above 2, 3 and 5 % and the 80 % band of the day's range and of the range still ahead. Two logical floors apply:
+a level the range so far has already passed has a chance of exactly 1 (the report then says "already above 3 %" instead of printing a
+trivial 100 %), and the day's range band never starts below the range so far ("at least X %"). A range is not a direction and not a
+profit.
+
+**Honesty rules.**
+
+- The opening strength (QUIET, NORMAL, HOT, EXPLOSIVE: the opening range against the stock's mean daily range) describes what **has
+  happened**; it is not a call. Over the 138 sessions the median range still ahead after 09:30 was 1.7 / 1.9 / 2.0 / 2.5 % for the four
+  strengths, and 16 / 25 / 42 / 73 % of those days ended with a range above 3 % (part of that is already on the board at 09:30). A
+  quiet opening in a volatile stock lowers the expected range ahead only modestly.
+- The report is **frozen once** (`opening:run:<date>`) and the scored table of every eligible name is frozen beside it
+  (`opening:state:<date>`); a retry, a late run and `--force` send the frozen report and never scan again. A scan that has to retry a
+  few minutes late is normalised back to the fifteen-minute basis with the measured growth of the range (and says so); after 30
+  minutes it is no opening read and does not run. Special sessions (Muhurat trading) are skipped.
+- `evaluate_opening` judges **every name the model scored** (about 200 a day), not only the listed ones: what the stated chance came
+  to, the model's top six against the base rate and the coverage of the 80 % band. The chance of a range above 3 % is judged on the
+  names whose range so far had **not** yet passed 3 % at the scan (for the others it is 1 by construction and a hit proves nothing;
+  they are counted apart). For the listed names it also judges the range ahead and the levels as a plan, on five-minute candles (the
+  broker's when its key is set, else Yahoo's, which reach back five sessions; a bar that reaches both the stop and the target counts as
+  stopped). The model is called validated only
+  after 20 judged sessions with the pooled stated chance within 5 points of what happened and its top names clearly above the base
+  rate.
+- It **fails visibly**: no live quotes, quotes that are not from today, quotes stamped before the third candle closed (it retries), a
+  gap in the stored history or too few names with a complete row stop the scan with an alert. Nothing is guessed from older prices.
+- **Not yet proven live.** The relationships come from 138 sessions (April to October 2026) of one market regime, the fitted figures have no
+  live record yet,
+  and Yahoo's feed leaves out the opening auction's volume (so volume is not an input). The first real 09:30 run is the first live
+  test; the record in each report starts empty.
+
+Commands: `sudo monster-ai opening --dry-run` prints a report and freezes and sends nothing (outside 09:30-09:45 it is a clearly
+marked preview of whatever stretch of the session the quotes cover); `sudo monster-ai opening` runs the scheduled job now; `--force`
+sends the frozen report even after the deadline (marked late). The settings are `OPENING_*` (see [Configuration](#configuration));
+`OPENING_ENABLED=false` switches the feature off and `SEND_OPENING_REPORT=false` keeps it computing, freezing and evaluating silently.
 
 ## Closing-hour trade ideas
 
@@ -292,6 +377,7 @@ Pillow: no data goes to a chart service):
 | Report | Table | Chart images |
 |--------|-------|--------------|
 | 09:12 scan (and the optional 08:45 one) | rank, symbol, tier, P(range above the target), 80 % range | each candidate's expected range against the target line, and the sector mix when there are two sectors or more |
+| 09:30 opening read | opening range, strength and the chance of a day range above 3 % (or that it has already passed it) of every name read; the buy-above / sell-below reference levels | none (text and tables only) |
 | 14:30 closing-hour ideas | entry, stop and first target of every BTST, swing and bearish idea; buy-above / sell-below levels of the watchlist | the **board** (donut of the ideas by list, breadth bar, bars of the setup scores) and the **trade plan** (loss at the stop and gain at the two targets of each idea) |
 | evening evaluation | picks against what happened | donut of hit / missed / not judged, the model against the baselines, the realised range of each pick against the target |
 
@@ -317,12 +403,13 @@ of its own, so a person who blocked the bot costs the others nothing and raises 
 |---------|---------|
 | `init` | create directories, migrate the database, seed the calendar |
 | `doctor [--offline] [--json]` | verify the machine: configuration, permissions, disk, RAM, clock, feed reachability, the NSE API and its live-quote list, the chart library, the bot and the AI keys |
-| `sources-check [--only nse archive yahoo rss gdelt] [--json]` | read every data endpoint (NSE API, NSE archive files, Yahoo, the feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure; exit 1 when one the system needs does not answer |
+| `sources-check [--only nse archive yahoo kotak rss gdelt] [--json]` | read every data endpoint (NSE API, NSE archive files, Yahoo, the Kotak broker feed when its key is set, the feeds, GDELT and its Google News fallback) through the production clients and say which still answer, with the reason of each failure; exit 1 when one the system needs does not answer |
 | `bootstrap [--resume] [--skip-train]` | first-run setup (resumable) |
 | `daemon` | run the scheduler (systemd does this) |
 | `run-job NAME [--key K] [--force] [--dry-run] [--opt K=V]`, `jobs` | run one job now; show the timetable and recent runs |
 | `scan --stage pre\|final [--date D] [--dry-run] [--force]` | run a scan now (`--dry-run` prints the report, freezes and sends nothing) |
 | `ideas [--date D] [--dry-run] [--force]` | run the closing-hour trade-idea scan now (`--dry-run` prints the report, freezes and sends nothing; `--force` sends the frozen report even after the 15:05 deadline, marked late, and scans first only when nothing is frozen) |
+| `opening [--date D] [--dry-run] [--force]` | run the 09:30 opening read now (`--dry-run` prints the report, freezes and sends nothing; `--force` sends the frozen report even after the 09:45 deadline, marked late, and scans first only when nothing is frozen) |
 | `evaluate [--date D]` | evaluate a day's predictions |
 | `train [--stage pre\|final\|both] [--publish]` | train now (`--publish`: CI worker mode) |
 | `backtest [--stage S] [--years N] [--out FILE]` | walk-forward evaluation against the baselines |
@@ -356,7 +443,7 @@ of truth in `app/config.py` (`python scripts/generate_docs.py`). Only `TELEGRAM_
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (text or json), `LOG_RETENTION_DAYS` (30), `LOG_MAX_MB` (150) |
 | Resources | `MIN_FREE_DISK_MB_WARN` / `_CRIT`, `JOB_MAX_RSS_MB` (720) |
 | Training | `TRAINING_MODE` (`local-light`, `external` signed models, or `disabled`), `MODEL_SIGNING_KEY`, S3 storage for off-box backups and model bundles |
-| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it, including the model chain `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODELS`, or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` / `LLM_WEB_MAX_PER_DAY` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
+| Optional | Groq LLM (`GROQ_API_KEY`; `LLM_*` to tune it, including the model chain `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODELS`, or to use another provider; `LLM_WEB_SEARCH` / `LLM_WEB_MAX_PER_RUN` / `LLM_WEB_MAX_PER_DAY` for the web check), Jev (`TYPESAFE_API_KEY`, `JEV_*`), the Kotak broker feed (`KOTAK_CONSUMER_KEY`, `KOTAK_ENABLED`, `KOTAK_MAX_LAG_SEC` (90), `KOTAK_BASE_URL`, `KOTAK_QUOTE_INTERVAL_SEC` (0.2), `KOTAK_HISTORY_INTERVAL_SEC` (1.1)), dashboard (`DASHBOARD_*`), backup encryption (`BACKUP_PASSPHRASE`) |
 
 ### Optional AI: Groq and Jev
 
@@ -480,6 +567,35 @@ access to; `monster-ai ai-test --list-only` shows which models of the chain the 
 not an error: the extractor skips it when Groq refuses it). Another provider (`LLM_API_BASE` + `LLM_MODEL`) gets only the models it is
 told about.
 
+### Optional broker feed: Kotak Neo
+
+A second, independent **real-time** source and exchange-grade candles, **off until you add one value**: `KOTAK_CONSUMER_KEY`, the application token
+from the NEO app (*More > Trade API > Generate application*). Read-only: this system never trades and never logs in. If your local `.env`
+also holds the broker's login values (`KOTAK_MOBILE`, `KOTAK_UCC`, `KOTAK_MPIN`, `KOTAK_TOTP_SECRET`, for instance copied from another
+program), MONSTER AI ignores them and the deploy scripts never upload them.
+
+| | What it does |
+|---|---|
+| **Live quotes** | the 09:30 and 14:30 scans read every F&O stock from the broker as well as from NSE (40 stocks a request, about 1.5 s for the whole universe) and merge the two per name: a name both feeds have must **agree** (previous close within 0.3 %, open within 0.5 %, last price within 3 %) or it is left out and counted; of two agreeing rows the one with the larger day volume, the **fresher**, is taken whole. Either feed alone carries the scan when the other fails (NSE blocks datacentre addresses now and then); the report says which feeds it was read from |
+| **Lag guard** | during the session the age of the freshest trade in the broker's answer is measured; beyond `KOTAK_MAX_LAG_SEC` (90) the feed is lagging and is not used |
+| **Candles** | in the evening the opening reads are judged on the broker's five-minute candles, built from the exchange's own trades, instead of Yahoo's (a name the broker has no complete day for falls back to Yahoo). Yahoo's five-minute bars are smoothed: on the same stock-days its first-15-minute range was about a tenth narrower than the exchange's (the broker's was wider on 87 % of them) and its 09:15 bar misses the opening auction |
+| **Indices** | Nifty 50 and India VIX come from the broker when NSE's index call gives nothing |
+| **Not used** | login, TOTP, MPIN, orders, the websocket stream, market depth: quotes and candles need only the token |
+
+```bash
+sudo nano /etc/monster-ai/monster.env     # KOTAK_CONSUMER_KEY=...   (the token only: keep the MPIN, TOTP secret, mobile number and UCC off the server)
+sudo systemctl restart monster-ai
+sudo monster-ai sources-check --only kotak    # the token, the instrument master, live quotes, index quotes and candles through the real code
+```
+
+Safety: the token is sent as a header to https hosts on `kotaksecurities.com` only (a different `KOTAK_BASE_URL` is refused at start-up, a file URL
+the API returns is followed only on such a host and then without the token), it is registered for log redaction like every secret, and the trading
+credentials are not even settings. Measured on the live API (2026-11-06; details in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)): quotes, history and the
+instrument master need no login; the documented limit of 50 stocks a quote request is refused with HTTP 400 (49 works) so 40 are asked; history
+stops at the 15:10 five-minute bar (the last 15 minutes of each session are missing, and on some days the 15:10 bar carries a negative volume, which makes that day unfinished and sends the judging to Yahoo for the name); about one candle request a second is accepted. What could
+not be measured: the broker's live latency in the session (the first session after setup shows it in `source_health` and the lag guard).
+`KOTAK_ENABLED=false` switches the feed off without removing the key.
+
 ## Reliability guarantees
 
 The full explanation, with diagrams, is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the operator view is in
@@ -525,11 +641,11 @@ database/       SQLite (WAL) schema + migrations, repository (Store), backup/res
 ingestion/      curl_cffi HTTP client, Yahoo, NSE, F&O, universe, news, freshness gate, split-basis repair
 features/       point-in-time feature engines + builder + loader, and the closing-hour swing features
 models/         training, calibration, inference, registry, artifacts, signing
-ranking/        eligibility, costs, tiers, abstention, evidence, and the closing-hour trade ideas
-automation/     calendar, scan, closing-hour ideas, jobs, scheduler, schedule engine, health, bootstrap, retention
+ranking/        eligibility, costs, tiers, abstention, evidence, the closing-hour trade ideas and the 09:30 opening model
+automation/     calendar, scan, closing-hour ideas, 09:30 opening read, jobs, scheduler, schedule engine, health, bootstrap, retention
 notifications/  Telegram client, report renderers and their emoji style, tables and chart images (Pillow), sample previews, idempotent delivery
 news_intelligence/, event_graph/   event extraction (rules + optional Groq / Jev), entity resolution, causal-graph propagation
-backtesting/    metrics, walk-forward report, live evaluation and live record, trade-idea outcomes
+backtesting/    metrics, walk-forward report, live evaluation and live record, trade-idea and opening-read outcomes
 dashboard/      optional read-only web UI (loopback)
 deployment/     installer, systemd units, logrotate / journald config, remote deploy
 scripts/        documentation generator
@@ -558,6 +674,12 @@ tests/          hermetic tests built on real captured provider responses
 - The universe is today's F&O + Nifty 100 membership plus the delisted or quarantined names the database holds; names it never
   ingested stay absent (residual survivorship bias). Vendor-adjusted prices precede the official-file period.
 - Calibrated probabilities describe *range*, not direction or profit. Costs are modelled estimates.
+- The **09:30 opening read** estimates how wide the day will be and nothing else: its relationships were measured on 138 sessions of one
+  market regime (out of sample, see [The 09:30 opening read](#the-0930-opening-read)), the direction was not predictable from the
+  opening, its breakout levels lost about what trading them costs, Yahoo's five-minute feed omits the opening auction's volume, and none of it
+  has run live yet: the first real 09:30 run is its first live test and its live record starts empty. Much of what the opening range
+  adds for the day's size is the move already on the board, and for the range still to come it adds nothing measurable over what each
+  stock's own volatility already says.
 - The closing-hour trade ideas are **heuristics**, not a model: their scores rank setups, their stops and targets are mechanical ATR
   multiples, and nothing says yet that they make money. The live record in each report starts empty; a list is only called
   validated after 60 judged ideas over 20 days with intervals that clear no-edge. At 14:30 volume is a projection, an overnight (BTST)

@@ -22,9 +22,10 @@ from app.errors import DataUnavailable
 from app.logging_setup import exception_site, redact, register_secret
 from notifications import charts as chart_images
 from notifications import ideas as idea_messages
+from notifications import opening as opening_messages
 from notifications import report
 from notifications.telegram import MAX_MESSAGE_CHARS, DeadlineExceeded, TelegramClient, split_message
-from ranking.types import EveningSummary, IdeasReport, ReportContext
+from ranking.types import EveningSummary, IdeasReport, OpeningReport, ReportContext
 
 log = logging.getLogger(__name__)
 
@@ -205,6 +206,43 @@ class NotificationService:
         late = bool(getattr(ideas_report, "late", False)) or self.clock.now() > deadline  # too late to act on: no images either
         return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
                              charts=None if late else lambda: chart_images.ideas_charts(ideas_report),
+                             extra_chat_ids=self._extras())
+
+    def send_opening(self, opening_report: OpeningReport, *, force: bool = False) -> DeliveryResult:
+        """Send the 09:30 opening read once per trade date. It is time-critical: a report that would go out after
+        ``opening_report_deadline_time`` is withheld (the range no longer is an opening range and the move is under way) unless
+        ``force`` is set, which a manual run uses; the report then says itself that it is late."""
+        trade_date = str(getattr(opening_report, "trade_date", "") or "").strip()
+        try:
+            parse_date(trade_date)
+        except (TypeError, ValueError):
+            return self._reject(f"invalid trade_date {trade_date!r}")
+        kind, key = "opening_report", f"opening:{trade_date}"
+        duplicate = self._duplicate(key)
+        if duplicate:
+            return duplicate
+        if not self.settings.send_opening_report:
+            return self._withhold(kind, key, trade_date, "opening_disabled")
+        chat_id = self.settings.telegram_chat_id
+        if not self._can_send(chat_id):
+            return self._withhold(kind, key, trade_date, "telegram_not_configured", warn=True)
+        deadline = at_ist(trade_date, self.settings.opening_report_deadline_time)
+        if self.clock.now() > deadline and not force:
+            withheld = self._withhold(kind, key, trade_date, "deadline_missed", warn=True)
+            self.alert(  # queued only: the scheduler's flush delivers it
+                "warning",
+                "opening_deadline_missed",
+                f"the 09:30 opening read for {trade_date} was withheld: the send attempt came after the "
+                f"{self.settings.opening_report_deadline_time} IST deadline",
+                dedupe_key=f"delivery:{key}",
+                deliver_now=False,
+            )
+            return withheld
+        try:
+            messages = opening_messages.render_opening_report(opening_report)
+        except Exception as exc:
+            return self._render_failed(kind, key, trade_date, exc)
+        return self._deliver(kind, key, messages, chat_id=chat_id, trade_date=trade_date, deadline=None if force else deadline,
                              extra_chat_ids=self._extras())
 
     def send_failure_notice(

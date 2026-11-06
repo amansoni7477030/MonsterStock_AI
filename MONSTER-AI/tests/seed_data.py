@@ -189,6 +189,7 @@ class FakeNseApi:
         self.live = live or []
         self.live_ts = live_ts
         self.live_calls: list[str] = []
+        self.live_deadlines: list[float | None] = []
         self.indices = indices or {}
         self.indices_fail = indices_fail
         self.clock = clock
@@ -205,6 +206,7 @@ class FakeNseApi:
 
         self._admit(deadline)
         self.live_calls.append(index)
+        self.live_deadlines.append(deadline)
         if self.fail:
             raise DataUnavailable("nse", "simulated block", retryable=True)
         return LiveEquities(self.live_ts, [row for row in self.live if symbols is None or row["symbol"] in symbols])
@@ -242,6 +244,73 @@ class FakeNseApi:
 
     def event_calendar(self, start, end, symbols=None):
         return []
+
+
+class FakeKotakApi:
+    """Scripted Kotak client. ``rows`` are the live rows ``quotes`` answers (their own ``row_ts`` is each stock's last update; ``asof`` overrides
+    the newest one), ``fail`` breaks every call and ``master_fail`` only the instrument master, ``tokens`` is the instrument master (default:
+    every symbol of ``rows`` maps to itself), ``index_rows`` what ``indices`` answers and ``bars`` the five-minute candles per symbol (an
+    Exception value makes that name fail). With a ``clock`` no call starts at or after the ``deadline`` it is given."""
+
+    def __init__(self, rows: list[dict[str, Any]] | None = None, *, asof: Any = None, fail: bool = False, master_fail: bool = False,
+                 tokens: dict[str, str] | None = None, index_rows: dict[str, dict[str, Any]] | None = None,
+                 bars: dict[str, Any] | None = None, clock: Any = None) -> None:
+        self.rows = rows or []
+        self.asof, self.fail, self.master_fail = asof, fail, master_fail
+        self.tokens = tokens
+        self.index_rows = index_rows or {}
+        self.bars = bars or {}
+        self.clock = clock
+        self.master_calls = 0
+        self.index_calls = 0
+        self.quote_calls: list[list[str]] = []
+        self.candle_calls: list[tuple[str, str, str]] = []
+
+    def _admit(self, deadline: float | None) -> None:
+        from app.errors import DataUnavailable
+
+        if self.fail:
+            raise DataUnavailable("kotak_quotes", "simulated outage", retryable=True)
+        if self.clock is not None and deadline is not None and self.clock.monotonic() >= deadline:
+            raise DataUnavailable("kotak_quotes", "deadline reached", retryable=True)
+
+    def token_map(self, *, deadline: float | None = None) -> dict[str, str]:
+        from app.errors import DataUnavailable
+
+        self.master_calls += 1
+        if self.master_fail:
+            raise DataUnavailable("kotak_quotes", "simulated master outage", retryable=True)
+        self._admit(deadline)
+        return dict(self.tokens) if self.tokens is not None else {row["symbol"]: row["symbol"] for row in self.rows}
+
+    def quotes(self, tokens: dict[str, str], *, deadline: float | None = None):
+        from datetime import datetime
+
+        from app.clock import UTC
+        from ingestion.kotak import KotakQuotes, newest_trade
+
+        self._admit(deadline)
+        self.quote_calls.append(sorted(tokens))
+        rows = [dict(row) for row in self.rows if row["symbol"] in tokens]
+        received = self.clock.now() if self.clock is not None else datetime.now(UTC)
+        asof = self.asof if self.asof is not None else newest_trade(rows, received)
+        return KotakQuotes(rows, received, len(tokens), asof)
+
+    def indices(self, *, deadline: float | None = None) -> dict[str, dict[str, Any]]:
+        self._admit(deadline)
+        self.index_calls += 1
+        return dict(self.index_rows)
+
+    def candles(self, token: str, interval: str, start: Any, end: Any, *, deadline: float | None = None) -> list[dict[str, Any]]:
+        self._admit(deadline)
+        self.candle_calls.append((token, interval, start.isoformat()))
+        got = self.bars.get(token)
+        if isinstance(got, Exception):
+            raise got
+        return [bar for bar in got or [] if start.isoformat() <= bar["trade_date"] <= end.isoformat()]
+
+    def close(self) -> None:
+        pass
 
 
 class FakeNews:

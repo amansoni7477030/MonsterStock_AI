@@ -297,11 +297,98 @@ def test_the_fallback_can_be_switched_off_and_is_then_not_asked(world):
     assert "rss" not in world.closed  # no Google client was even opened
 
 
+# ----------------------------------------------------------------------------------------------- Kotak
+class FakeBroker:
+    """Stands in for ``KotakApi``: ``script`` maps a call name to a value (or an exception to raise); closes are recorded on the class."""
+
+    script: dict[str, object] = {}
+    closed = 0
+
+    def __init__(self, settings):
+        FakeBroker.closed = 0
+
+    def _get(self, name, default):
+        value = FakeBroker.script.get(name, default)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def token_map(self, **_):
+        return self._get("master", {f"S{i}": str(i) for i in range(600)} | {"RELIANCE": "2885", "HDFCBANK": "1333", "TCS": "11536",
+                                                                             "INFY": "1594", "SBIN": "3045"})
+
+    def indices(self, **_):
+        return self._get("indices", {"NIFTY 50": {"last": 25030.35}, "INDIA VIX": {"last": 17.47}})
+
+    def quotes(self, tokens, **_):
+        from datetime import datetime, timezone
+
+        from ingestion.kotak import KotakQuotes
+
+        got = self._get("quotes", None)
+        if got is not None:
+            return got
+        stamp = datetime(2026, 11, 2, 4, 0, tzinfo=timezone.utc)
+        return KotakQuotes([{"symbol": s} for s in tokens], stamp, len(tokens), stamp)
+
+    def candles(self, token, interval, start, end, **_):
+        return self._get("candles", [{"trade_date": "2026-10-30", "hhmm": "15:10"}] * 72)
+
+    def close(self):
+        FakeBroker.closed += 1
+
+
+@pytest.fixture()
+def broker(monkeypatch, world):
+    import ingestion.kotak as kotak
+
+    FakeBroker.script = {}
+    monkeypatch.setattr(kotak, "KotakApi", FakeBroker)
+    return dataclasses.replace(world.cfg, kotak_consumer_key="kotak-test-token-0123456789abcdef0123")
+
+
+def test_the_broker_section_is_ok_and_says_so_when_there_is_no_key(world):
+    assert rows(run_checks(world.cfg, ["kotak"], today=TODAY)) == {
+        "Kotak broker feed": ("ok", "off (KOTAK_CONSUMER_KEY is not set, or KOTAK_ENABLED=false)")}
+
+
+def test_a_broker_that_answers_is_ok_through_every_step_and_its_client_is_closed(broker):
+    report = run_checks(broker, ["kotak"], today=TODAY)
+    assert rows(report) == {
+        "Kotak instrument master": ("ok", "605 stocks"), "Kotak index quotes": ("ok", "NIFTY 50 25030.3, INDIA VIX 17.47"),
+        "Kotak live quotes": ("ok", "5 stocks, newest trade 2026-11-02 04:00:00 UTC"),
+        "Kotak 5-minute candles": ("ok", "72 bars of RELIANCE, the last on 2026-10-30 starting 15:10 IST")} and not report.failed
+    assert FakeBroker.closed == 1
+
+
+def test_the_broker_is_optional_so_every_failure_is_a_warning_and_never_a_failed_check(broker):
+    FakeBroker.script = {"master": DataUnavailable("kotak_quotes", "HTTP 503")}
+    report = run_checks(broker, ["kotak"], today=TODAY)
+    assert rows(report)["Kotak instrument master"] == ("warn", "[kotak_quotes] HTTP 503") and not report.failed
+    assert "Kotak live quotes" not in rows(report)  # nothing to quote without the master
+    FakeBroker.script = {"master": {"S1": "1"}, "indices": {}, "candles": []}
+    got = rows(run_checks(broker, ["kotak"], today=TODAY))
+    assert got["Kotak instrument master"] == ("warn", "only 1 stocks") and got["Kotak index quotes"] == ("warn", "no index quote")
+
+
+def test_partial_quotes_and_missing_candles_are_warnings_with_what_was_found(broker):
+    from datetime import datetime, timezone
+
+    from ingestion.kotak import KotakQuotes
+
+    stamp = datetime(2026, 11, 2, 4, 0, tzinfo=timezone.utc)
+    FakeBroker.script = {"quotes": KotakQuotes([{"symbol": "RELIANCE"}], stamp, 5, stamp), "candles": []}
+    report = run_checks(broker, ["kotak"], today=TODAY)
+    got = rows(report)
+    assert got["Kotak live quotes"] == ("warn", "1 of 5 stocks answered") and got["Kotak 5-minute candles"] == ("warn", "no five-minute bars")
+    assert not report.failed
+
+
 # ---------------------------------------------------------------------------------- selection and output
 def test_only_the_chosen_sections_run_in_the_fixed_order(world):
     got = list(rows(run_checks(world.cfg, ["rss", "nse"], today=TODAY)))
     assert got[0] == "NSE market status" and got[-1] == "RSS feeds" and not any(name.startswith(("Yahoo", "GDELT")) for name in got)
-    assert SECTIONS == ("nse", "archive", "yahoo", "rss", "gdelt")
+    assert SECTIONS == ("nse", "archive", "yahoo", "kotak", "rss", "gdelt")
 
 
 def test_a_secret_in_an_error_never_reaches_the_report(world):

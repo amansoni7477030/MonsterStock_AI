@@ -176,7 +176,7 @@ def test_powershell_script_never_reads_or_prints_the_env_file():
     forbidden = ("Get-Content", "ReadAllText", "ReadAllLines", "ReadAllBytes", "[System.IO.File]::Open", "Select-String",
                  "ConvertFrom-StringData", "Import-Csv", "[IO.File]")
     for token in forbidden:
-        assert token not in text, f"deploy_remote.ps1 must not read files ({token}): the env file is only copied"
+        assert token not in text, f"deploy_remote.ps1 must not read files ({token}): lib/envseed.ps1 is the one place that does"
     for line in text.splitlines():
         if re.search(r"Write-(Host|Output|Verbose|Debug|Warning)", line):
             assert not re.search(r"\$\(|\$envText|\$content|\$secret|\$token|\$values", line, re.I), line
@@ -1458,6 +1458,235 @@ def test_feed_summary_snippet_reads_doctor_json():
     assert run("this is not json").returncode == 3
     assert run(json.dumps({"ok": True, "checks": []})).returncode == 4
     assert run(json.dumps(["unexpected"])).returncode == 4
+
+
+# ============================================================================ the env seed that leaves the PC
+# Both deploy scripts seed the server from the real .env by default. That file may also hold values MONSTER AI never
+# uses - the broker's login (KOTAK_MPIN, KOTAK_TOTP_SECRET, ...) - and those must stay on the workstation: only the
+# settings .env.example defines are uploaded, and only the NAMES of the rest are shown.
+LOGIN_NAMES = ("KOTAK_MOBILE", "KOTAK_UCC", "KOTAK_MPIN", "KOTAK_TOTP_SECRET")
+SEED_LINES = [
+    "# a comment that mentions KOTAK_MPIN=comment-value",
+    "TELEGRAM_BOT_TOKEN=tg-fake-1",
+    'export GROQ_API_KEY="groq fake 2"',
+    "KOTAK_CONSUMER_KEY=ck-fake-3",
+    "KOTAK_MPIN=mpin-fake-4",
+    "KOTAK_TOTP_SECRET = totp-fake-5",
+    "  KOTAK_UCC=ucc-fake-6",
+    "KOTAK_MOBILE=mob-fake-7",
+    "SEND_PRELIM_REPORT=false",
+    "kotak_lower=low-fake-8",
+    "TYPO_SETTINGZ=typo-fake-9",
+    "KOTAK_MPIN=again-fake-10",
+    "TOP_N=6",
+    "TOP_N=7",
+]
+SEED_KEPT_LINES = [
+    "TELEGRAM_BOT_TOKEN=tg-fake-1",
+    'export GROQ_API_KEY="groq fake 2"',
+    "KOTAK_CONSUMER_KEY=ck-fake-3",
+    "SEND_PRELIM_REPORT=false",
+    "TOP_N=6",
+    "TOP_N=7",
+]
+SEED_LEFT_NAMES = ["KOTAK_MPIN", "KOTAK_TOTP_SECRET", "KOTAK_UCC", "KOTAK_MOBILE", "TYPO_SETTINGZ"]
+SEED_FAKE_VALUES = ("comment-value", "mpin-fake", "totp-fake", "ucc-fake", "mob-fake", "low-fake", "typo-fake",
+                    "again-fake", "tg-fake", "ck-fake", "groq fake")
+SEED_TEMPLATE = "# template\nTELEGRAM_BOT_TOKEN=\nGROQ_API_KEY=\nKOTAK_CONSUMER_KEY=\nSEND_PRELIM_REPORT=true\nTOP_N=6\n"
+SEED_VALUE_PATTERN = "|".join(SEED_FAKE_VALUES)  # plain words and hyphens: the same text is a valid regex for Python and grep -E
+
+
+def seed_variants(directory: Path) -> dict[str, Path]:
+    """The seed as plain text, as a Windows editor saves it (UTF-8 BOM + CRLF) and as PowerShell's > writes it (UTF-16)."""
+    lf = "\n".join(SEED_LINES) + "\n"
+    crlf = "\r\n".join(SEED_LINES) + "\r\n"
+    data = {"lf": lf.encode("utf-8"), "crlf-bom": b"\xef\xbb\xbf" + crlf.encode("utf-8"), "utf16": crlf.encode("utf-16")}
+    paths = {}
+    for kind, content in data.items():
+        paths[kind] = directory / f"seed.{kind}"
+        paths[kind].write_bytes(content)
+    (directory / "template").write_text(SEED_TEMPLATE, encoding="utf-8", newline="\n")
+    (directory / "expected").write_bytes(("\n".join(SEED_KEPT_LINES) + "\n").encode("utf-8"))
+    return paths
+
+
+def test_seed_fixture_uses_the_real_setting_names():
+    template_keys = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", read(ROOT / ".env.example"), re.M))
+    assert template_keys == VAR_NAMES, "the installer's template (.env.example) must define exactly the settings"
+    for line in SEED_KEPT_LINES:
+        assert re.search(r"([A-Z][A-Z0-9_]*)=", line).group(1) in VAR_NAMES, line
+    assert not set(LOGIN_NAMES) & VAR_NAMES, "the broker's login values must never become settings"
+    assert "KOTAK_CONSUMER_KEY" in VAR_NAMES
+
+
+def test_seed_helpers_never_print_values():
+    ps = read(DEPLOY / "lib" / "envseed.ps1")
+    assert all(ord(ch) < 128 for ch in ps), "envseed.ps1 must be pure ASCII (Windows PowerShell 5.1 reads it as ANSI)"
+    assert not re.search(r"Write-(Host|Output|Verbose|Debug|Warning|Information|Error)|Out-Host|\[Console\]", ps), \
+        "the seed filter returns names; it prints nothing"
+    for line in ps.splitlines():
+        if re.search(r"\bthrow\b", line):
+            assert not re.search(r"\$(line|kept|text|body|bytes|seedFull)\b", line), line
+    sh = read(DEPLOY / "lib" / "envseed.sh")
+    for line in sh.splitlines():
+        if "printf" in line and ">&2" in line:
+            assert not re.search(r"\$(line|key|text|work)\b", line), line
+
+
+def test_powershell_seed_helper_parses():
+    shell = _tool("pwsh") or _tool("powershell")
+    if shell is None:
+        pytest.skip("no PowerShell available")
+    path = DEPLOY / "lib" / "envseed.ps1"
+    command = (
+        "$e=$null;$t=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{path}',[ref]$t,[ref]$e);if($e.Count){{$e|ForEach-Object{{$_.Message}};exit 1}}"
+    )
+    result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
+                            text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_deploy_scripts_upload_the_filtered_copy_never_the_original():
+    ps = read(DEPLOY / "deploy_remote.ps1")
+    assert "Select-UploadSeed" in ps and "lib\\envseed.ps1" in ps
+    ps_scp = [line for line in ps.splitlines() if re.search(r"&\s*\$scp\b", line)]
+    assert ps_scp and any("$uploadSeedName" in line for line in ps_scp)
+    assert not any(token in line for line in ps_scp for token in ("$envFileFull", "$EnvFile")), ps_scp
+    assert "Remove-Item -LiteralPath $uploadSeedPath" in ps, "the filtered copy must be deleted when the script ends"
+    sh = read(DEPLOY / "deploy_remote.sh")
+    assert "envseed_filter" in sh and "lib/envseed.sh" in sh
+    sh_scp = [line for line in sh.splitlines() if re.match(r"\s*scp\b", line)]
+    assert sh_scp and any('"$UPLOAD_SEED"' in line for line in sh_scp)
+    assert not any('"$ENV_FILE"' in line for line in sh_scp), sh_scp
+    assert 'rm -f -- "$UPLOAD_SEED"' in sh, "the filtered copy must be deleted on every exit path"
+
+
+def test_powershell_install_call_survives_a_redirected_ssh_farewell():
+    """ssh ends a -tt session with "Connection to HOST closed." on stderr. With the script's output redirected (2>&1) PowerShell turns that
+    line into an error record, which under $ErrorActionPreference = 'Stop' reported a successful installation as failed."""
+    lines = read(DEPLOY / "deploy_remote.ps1").splitlines()
+    call = next(i for i, line in enumerate(lines) if "& $ssh '-tt'" in line)
+    assert any("$ErrorActionPreference = 'Continue'" in line for line in lines[call - 4:call]), "relax it just for the interactive call"
+    assert any("$ErrorActionPreference = 'Stop'" in line for line in lines[call + 1:call + 4]), "and restore it right after"
+    assert "$installExit = $LASTEXITCODE" in lines[call + 1], "the installer's exit code decides"
+
+
+POWERSHELL_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+. $args[0]
+$names = @(Select-UploadSeed $args[1] $args[2] $args[3])
+Write-Output ('count=' + $names.Count)
+foreach ($name in $names) { Write-Output ('name=' + $name) }
+"""
+
+
+def run_powershell_filter(tmp_path: Path, seed: Path, template: Path, out: Path) -> subprocess.CompletedProcess[str]:
+    shell = _tool("pwsh") or _tool("powershell")
+    if shell is None:
+        pytest.skip("no PowerShell available")
+    harness = tmp_path / "harness.ps1"
+    harness.write_text(POWERSHELL_HARNESS, encoding="ascii")
+    return subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness),
+                           str(DEPLOY / "lib" / "envseed.ps1"), str(seed), str(template), str(out)],
+                          capture_output=True, text=True, check=False, timeout=120)
+
+
+@pytest.mark.parametrize("kind", ["lf", "crlf-bom", "utf16"])
+def test_powershell_seed_filter_uploads_only_defined_settings(tmp_path: Path, kind: str):
+    seeds = seed_variants(tmp_path)
+    out = tmp_path / "upload.env"
+    result = run_powershell_filter(tmp_path, seeds[kind], tmp_path / "template", out)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert [line[5:] for line in lines if line.startswith("name=")] == SEED_LEFT_NAMES
+    assert f"count={len(SEED_LEFT_NAMES)}" in lines
+    assert out.read_bytes() == (tmp_path / "expected").read_bytes()
+    assert not re.search(SEED_VALUE_PATTERN, result.stdout + result.stderr)
+
+
+def test_powershell_seed_filter_with_nothing_to_keep_reports_zero_names(tmp_path: Path):
+    only_login = tmp_path / "seed.login"
+    only_login.write_text("KOTAK_MPIN=mpin-fake-4\nKOTAK_UCC=ucc-fake-6\n", encoding="utf-8", newline="\n")
+    (tmp_path / "template").write_text(SEED_TEMPLATE, encoding="utf-8", newline="\n")
+    out = tmp_path / "upload.env"
+    result = run_powershell_filter(tmp_path, only_login, tmp_path / "template", out)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "count=2" in result.stdout.splitlines()
+    assert out.read_bytes() == b""
+
+
+def test_powershell_seed_filter_fails_closed(tmp_path: Path):
+    seeds = seed_variants(tmp_path)
+    original = seeds["lf"].read_bytes()
+    empty_template = tmp_path / "empty.template"
+    empty_template.write_text("# nothing\n", encoding="utf-8", newline="\n")
+    out = tmp_path / "upload.env"
+    result = run_powershell_filter(tmp_path, seeds["lf"], empty_template, out)
+    assert result.returncode != 0
+    assert out.read_bytes() == b"", "a failed run must not leave a partial upload copy"
+    result = run_powershell_filter(tmp_path, seeds["lf"], tmp_path / "template", seeds["lf"])
+    assert result.returncode != 0
+    assert seeds["lf"].read_bytes() == original, "the env file itself must never be the output"
+    assert not re.search(SEED_VALUE_PATTERN, result.stdout + result.stderr)
+
+
+@needs_bash
+def test_bash_seed_filter_uploads_only_defined_settings(tmp_path: Path):
+    seed_variants(tmp_path)
+    script = HARNESS_HEADER + r"""
+source "$LIB/envseed.sh"
+for kind in lf crlf-bom utf16; do
+  names=$(envseed_filter "$WORK/seed.$kind" "$WORK/template" "$WORK/out.$kind")
+  check "left-out-$kind" "KOTAK_MPIN KOTAK_TOTP_SECRET KOTAK_UCC KOTAK_MOBILE TYPO_SETTINGZ" "$(printf '%s' "$names" | tr '\n' ' ' | sed 's/ $//')"
+  yes_ "upload-copy-$kind" cmp -s "$WORK/out.$kind" "$WORK/expected"
+done
+check "no-side-files-left" "0" "$(find "$WORK" -name '*.names' -o -name '*.utf8' | wc -l | tr -d ' ')"
+case $(uname -s) in
+  MINGW* | MSYS* | CYGWIN*) ;;
+  *) check "mode-0600" "600" "$(stat -c %a "$WORK/out.lf" 2>/dev/null || stat -f %Lp "$WORK/out.lf")" ;;
+esac
+cp "$WORK/seed.lf" "$WORK/seed.before"
+printf '# nothing\n' >"$WORK/empty.template"
+no_ "empty-template-refused" envseed_filter "$WORK/seed.lf" "$WORK/empty.template" "$WORK/out.empty"
+check "failed-run-leaves-the-copy-empty" "0" "$(wc -c <"$WORK/out.empty" | tr -d ' ')"
+no_ "unreadable-seed-refused" envseed_filter "$WORK/missing.env" "$WORK/template" "$WORK/out.missing"
+no_ "output-equal-to-seed-refused" envseed_filter "$WORK/seed.lf" "$WORK/template" "$WORK/seed.lf"
+yes_ "seed-untouched" cmp -s "$WORK/seed.lf" "$WORK/seed.before"
+printf 'KOTAK_MPIN=mpin-fake-4\n' >"$WORK/seed.login"
+names=$(envseed_filter "$WORK/seed.login" "$WORK/template" "$WORK/out.login")
+check "nothing-to-keep-is-not-an-error" "KOTAK_MPIN" "$names"
+check "nothing-to-keep-uploads-nothing" "0" "$(wc -c <"$WORK/out.login" | tr -d ' ')"
+""" + HARNESS_FOOTER
+    result = run_bash(script, tmp_path)
+    assert_harness_ok(result)
+    assert not re.search(SEED_VALUE_PATTERN, result.stdout + result.stderr)
+
+
+@needs_bash
+@pytest.mark.slow
+def test_bash_deploy_uploads_only_the_defined_settings(tmp_path: Path):
+    """deploy_remote.sh end to end with ssh / scp / tar replaced by functions: what would reach the server."""
+    seed_variants(tmp_path)
+    (tmp_path / "tmp").mkdir()
+    script = HARNESS_HEADER + r"""
+CAPTURE=$WORK/capture
+mkdir -p "$CAPTURE"
+export CAPTURE
+ssh() { case "$*" in *"mktemp -d"*) echo /tmp/monster-ai-deploy.TESTDIR123 ;; esac; }
+scp() { local n=$# args=("$@"); cp -- "${args[n-2]}" "$CAPTURE/$(basename -- "${args[n-1]#*:}")"; }
+tar() { : >"$2"; }
+export -f ssh scp tar
+TMPDIR=$WORK/tmp bash "$PROJECT/deployment/deploy_remote.sh" ubuntu@203.0.113.10 --env-file "$WORK/seed.crlf-bom" >"$WORK/deploy.out" 2>"$WORK/deploy.err" && rc=0 || rc=$?
+check deploy-exit-code "0" "$rc"
+yes_ uploaded-env-is-the-filtered-copy cmp -s "$CAPTURE/monster.env" "$WORK/expected"
+check names-are-listed "yes" "$(grep -q 'KOTAK_MPIN' "$WORK/deploy.out" && echo yes || echo no)"
+check no-value-is-printed "0" "$(cat "$WORK/deploy.out" "$WORK/deploy.err" | grep -c -E "$VALUE_PATTERN" || true)"
+check temporary-copy-removed "0" "$(find "$WORK/tmp" -name 'monster-ai-seed.*' | wc -l | tr -d ' ')"
+""" + HARNESS_FOOTER
+    result = run_bash(script, tmp_path, VALUE_PATTERN=SEED_VALUE_PATTERN)
+    assert_harness_ok(result)
 
 
 @needs_bash

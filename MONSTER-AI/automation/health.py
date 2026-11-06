@@ -171,6 +171,9 @@ def _check_jobs(report: HealthReport, store: Store, calendar: ExchangeCalendar, 
         deadline = at_ist(today, "09:20")
         if now > deadline and not store.job_settled("final_scan", today.isoformat()):
             report.add("crit", "final_scan_missing", f"no final scan recorded for {today} by 09:20 IST")
+    if calendar.is_trading_day(today) and first_start is not None and first_start < at_ist(today, "09:30"):
+        if now > at_ist(today, "09:50") and not store.job_settled("opening_scan", today.isoformat()):
+            report.add("warn", "opening_scan_missing", f"no 09:30 opening read recorded for {today} by 09:50 IST")
 
 
 def _check_data(report: HealthReport, store: Store, calendar: ExchangeCalendar, now: datetime) -> None:

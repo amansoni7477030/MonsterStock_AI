@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.clock import parse_ts
 from automation.calendar import ExchangeCalendar, seed_calendar
 from automation.jobspec import JOBS
 from automation.schedule import SCHEDULE, ScheduleEngine, ScheduleEntry, run_key_for
@@ -76,6 +77,36 @@ def test_success_settles_the_run(engine, store):
     engine.clock.set(ist(*MON, 6, 1))
     store.job_record("collect_global", "2026-11-02", "success")
     assert "collect_global" not in labels(engine.due(ist(*MON, 8, 20)))
+
+
+def test_the_opening_read_starts_just_after_the_third_candle_and_retries_every_twenty_seconds(engine, store):
+    engine.clock.set(ist(*MON, 9, 30, 10))
+    assert "opening_scan" not in labels(engine.due())  # the third five-minute candle has not closed yet
+    engine.clock.set(ist(*MON, 9, 30, 16))
+    first = [d for d in engine.due() if d.entry.job == "opening_scan"]
+    assert len(first) == 1 and first[0].attempt == 1 and first[0].critical and first[0].run_key == "2026-11-02"
+    store.job_record("opening_scan", "2026-11-02", "failed", message="NSE slow")
+    engine.clock.set(ist(*MON, 9, 30, 30))
+    assert "opening_scan" not in labels(engine.due())  # the 20 s retry delay has not passed since the failure
+    engine.clock.set(ist(*MON, 9, 30, 50))
+    again = [d for d in engine.due() if d.entry.job == "opening_scan"]
+    assert len(again) == 1 and again[0].attempt == 2
+    engine.clock.set(ist(*MON, 9, 45))
+    assert "opening_scan" not in labels(engine.due())  # past its window: no further attempt
+
+
+def test_the_opening_read_is_a_trading_day_job_and_its_evening_judging_waits_for_the_official_data(engine, store):
+    assert "opening_scan" not in labels(engine.due(ist(*SAT, 9, 31)))
+    entry = next(e for e in SCHEDULE if e.job == "evaluate_opening")
+    assert entry.after == ("ingest_eod",) and entry.catch_up and entry.at == "18:32" and entry.days == "trading"
+    assert [e.job for e in SCHEDULE].index("opening_scan") < [e.job for e in SCHEDULE].index("closing_scan")  # the day's order is readable
+    assert JOBS["opening_scan"].critical and not JOBS["evaluate_opening"].critical and not JOBS["evaluate_opening"].heavy
+
+
+def test_the_morning_reports_leave_the_opening_window_free(engine):
+    morning = [e for e in SCHEDULE if e.job in ("prelim_scan", "refresh_preopen", "final_scan")]
+    opening = next(e for e in SCHEDULE if e.job == "opening_scan")
+    assert all(e.until < opening.at for e in morning)  # nothing from the pre-open still runs when the opening read starts
 
 
 def test_window_closed_without_success_is_missed_not_retried(engine, store):
@@ -270,6 +301,67 @@ def test_installed_after_the_window_is_skipped_silently(store, settings, fake_cl
     rows = store.job_runs_for("prelim_scan", "2026-11-02")
     assert rows and rows[0]["status"] == "skipped"
     assert not any(a["code"].startswith("job_missed") for a in store.pending_alerts(50))
+
+
+def test_a_job_added_by_an_upgrade_is_not_missed_for_the_days_before_it_existed(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    added = {"opening_scan", "evaluate_opening"}
+    before = tuple(e for e in SCHEDULE if e.job not in added)  # the timetable of the release that is being upgraded
+    store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
+    saturday = ist(*SAT, 21, 14)
+    ScheduleEngine(store, ExchangeCalendar(store), fake_clock, entries=before).due(saturday)
+    upgraded = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)  # a new process: the same database, the full timetable
+    upgraded.due(saturday)
+    for job in sorted(added):
+        for day in ("2026-10-29", "2026-10-30"):  # trading days whose windows closed before the upgrade
+            assert store.job_runs_for(job, day) == [], (job, day)
+    assert not {a["code"] for a in store.pending_alerts(500)} & {f"job_missed_{job}" for job in added}
+    seen = store.kv_get_json("daemon.entries_seen")
+    assert set(seen) == {e.label for e in SCHEDULE} and parse_ts(seen["opening_scan"]) == saturday
+    assert parse_ts(seen["collect_global"]) == parse_ts("2026-10-01T00:00:00Z")  # an entry that was already there keeps its old stamp
+    # from the upgrade on the new job is held to its own windows like any other
+    assert [(d.entry.job, d.run_key) for d in upgraded.due(ist(*MON, 9, 30, 20)) if d.entry.job == "opening_scan"] == [("opening_scan", "2026-11-02")]
+    upgraded.due(ist(*MON, 9, 50))
+    assert [r["status"] for r in store.job_runs_for("opening_scan", "2026-11-02")] == ["missed"]
+    assert any(a["code"] == "job_missed_opening_scan" for a in store.pending_alerts(500))
+
+
+def test_a_job_added_during_its_own_day_is_skipped_for_that_day_and_runs_the_next(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    before = tuple(e for e in SCHEDULE if e.job != "opening_scan")
+    store.kv_set("daemon.first_start", "2026-10-01T00:00:00Z")
+    ScheduleEngine(store, ExchangeCalendar(store), fake_clock, entries=before).due(ist(*MON, 8, 0))
+    upgraded = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)
+    upgraded.due(ist(*MON, 11, 0))  # upgraded after that day's 09:30 window
+    rows = store.job_runs_for("opening_scan", "2026-11-02")
+    assert [r["status"] for r in rows] == ["skipped"] and "not installed yet" in rows[0]["message"]
+    assert not any(a["code"] == "job_missed_opening_scan" for a in store.pending_alerts(500))
+    upgraded.due(ist(2026, 11, 3, 9, 30, 20))  # the next trading day: due as usual
+    assert [d.run_key for d in upgraded.due(ist(2026, 11, 3, 9, 30, 25)) if d.entry.job == "opening_scan"] == ["2026-11-03"]
+
+
+def test_the_first_release_that_records_entries_takes_every_entry_to_have_existed_since_the_first_start(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    store.kv_set("daemon.first_start", "2026-10-25T00:00:00Z")
+    eng = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)
+    assert store.kv_get_json("daemon.entries_seen") is None
+    eng.due(ist(2026, 11, 3, 7, 0))
+    seen = store.kv_get_json("daemon.entries_seen")
+    assert set(seen) == {e.label for e in SCHEDULE} and {parse_ts(v) for v in seen.values()} == {parse_ts("2026-10-25T00:00:00Z")}
+    # a restart reads the same record and leaves it alone
+    again = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)
+    again.due(ist(2026, 11, 3, 7, 5))
+    assert store.kv_get_json("daemon.entries_seen") == seen
+
+
+def test_an_entry_is_never_taken_to_exist_before_the_scheduler_did(store, settings, fake_clock):
+    seed_calendar(store, settings)
+    store.kv_set("daemon.first_start", "2026-11-02T00:00:00Z")
+    store.kv_set_json("daemon.entries_seen", {"collect_global": "2026-10-01T00:00:00Z"})  # a stamp older than the first start
+    eng = ScheduleEngine(store, ExchangeCalendar(store), fake_clock)
+    eng.due(ist(2026, 10, 30, 7, 0))  # a clock reading from before the scheduler existed
+    seen = store.kv_get_json("daemon.entries_seen")
+    assert all(parse_ts(v) >= parse_ts("2026-11-02T00:00:00Z") for label, v in seen.items() if label != "collect_global")
 
 
 def test_preempted_attempts_do_not_count(engine, store):

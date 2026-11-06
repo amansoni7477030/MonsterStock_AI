@@ -243,6 +243,36 @@ def cmd_ideas(args: argparse.Namespace) -> int:
     return EXIT_OK if result.status in {"success", "skipped"} else EXIT_FAIL
 
 
+def cmd_opening(args: argparse.Namespace) -> int:
+    """The 09:30 opening read (the first fifteen minutes against the 09:12 picks, new movers, reference levels) now: ``--dry-run`` prints
+    the report and freezes and sends nothing (outside 09:30-09:45 IST its figures cover whatever stretch of the session the quotes
+    show, and say so); without it the scheduler's own job runs (frozen once per day, Telegram report)."""
+    from automation import opening
+    from automation.context import JobContext
+    from automation.runner import execute_job
+    from notifications import opening as renderer
+    from notifications.telegram import to_plain_text
+    from ranking.types import OpeningReport
+
+    settings = _settings(args)
+    _logging(settings, "cli.log")
+    day = _parse_day(args.date).isoformat()
+    if not args.dry_run:
+        result = execute_job(settings, "opening_scan", day, force=args.force, install_signal=True)
+    else:
+        store = _open_store(settings)
+        try:
+            ctx = JobContext.create(settings, store, run_key=day, dry_run=True, force=args.force)
+            result = opening.run_opening_scan(ctx)
+        finally:
+            store.close()
+        report = result.metrics.get("report")
+        if report:
+            print("\n\n".join(to_plain_text(part) for part in renderer.render_opening_report(OpeningReport.from_dict(report))))
+    print(f"opening scan {day}: {result.status} - {result.message}")
+    return EXIT_OK if result.status in {"success", "skipped"} else EXIT_FAIL
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from automation.runner import execute_job
 
@@ -745,6 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="print the report; freeze and send nothing")
     p.add_argument("--force", action="store_true",
                    help="send the frozen report even after the 15:05 deadline (marked late); scan first only if none is frozen")
+    p = add("opening", cmd_opening, "run the 09:30 opening read now (first 15 minutes vs the 09:12 picks, new movers, reference levels)")
+    p.add_argument("--date")
+    p.add_argument("--dry-run", action="store_true", help="print the report; freeze and send nothing")
+    p.add_argument("--force", action="store_true",
+                   help="send the frozen report even after the 09:45 deadline (marked late); scan first only if none is frozen")
     p = add("evaluate", cmd_evaluate, "evaluate a day's predictions")
     p.add_argument("--date")
     p = add("train", cmd_train, "train the models now")

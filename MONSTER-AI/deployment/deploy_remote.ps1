@@ -11,8 +11,11 @@
     Needs only what ships with Windows 10/11: the OpenSSH client (ssh, scp) and bsdtar (tar).
     Run it from a normal console (Windows Terminal / PowerShell window), not from the ISE.
 
-    The env file (default: .env in the project root, when it exists) is copied over SSH ONLY. This script
-    never reads it, never prints it, and the server-side copy is shredded after the installation.
+    The env file (default: .env in the project root, when it exists) is copied over SSH ONLY, and only the
+    settings MONSTER AI defines (the keys of .env.example) leave this PC: other keys - for example the broker's
+    login values KOTAK_MPIN / KOTAK_TOTP_SECRET / KOTAK_UCC / KOTAK_MOBILE - stay here, and only their NAMES are
+    listed (lib\envseed.ps1, the one place that reads the file). Values are never printed, and the server-side
+    copy is shredded after the installation.
     No firewall or SSH settings on the server are changed.
 
 .PARAMETER Target
@@ -25,7 +28,8 @@
     SSH private key to use (ssh -i).
 
 .PARAMETER EnvFile
-    Configuration to seed /etc/monster-ai/monster.env from. Default: <project>\.env when present.
+    Configuration to seed /etc/monster-ai/monster.env from. Default: <project>\.env when present. Only the
+    settings that .env.example defines are uploaded.
 
 .PARAMETER NoBootstrap
     Do not run the first-time data bootstrap during the installation (the daemon does it later).
@@ -73,6 +77,9 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Select-UploadSeed: the filter that keeps everything MONSTER AI does not define (broker login values ...) on this PC.
+. (Join-Path $PSScriptRoot 'lib\envseed.ps1')
+
 # ----------------------------------------------------------------------------------------------- helpers
 function Write-Step([string]$Message) { Write-Host $Message -ForegroundColor Cyan }
 function Write-Note([string]$Message) { Write-Host $Message }
@@ -119,6 +126,7 @@ if [ "$keep" != 1 ]; then rm -rf "$d"; fi
 # --------------------------------------------------------------------------------------------- main flow
 $exitCode = 1
 $archivePath = $null
+$uploadSeedPath = $null
 $remoteDir = $null
 
 try {
@@ -151,6 +159,22 @@ try {
     }
     $envFileFull = $null
     if ($EnvFile) { $envFileFull = (Resolve-Path -LiteralPath $EnvFile).Path }
+
+    # The upload copy of the env file: only the settings MONSTER AI defines. Whatever else the file holds (the
+    # broker's login values, other projects' secrets, typos) never leaves this PC; only the NAMES are listed.
+    $uploadSeedName = $null
+    if ($envFileFull) {
+        $template = Join-Path $projectRoot '.env.example'
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            throw ".env.example was not found below $projectRoot - run this script from the project."
+        }
+        $uploadSeedName = 'monster-ai-seed-' + [guid]::NewGuid().ToString('N') + '.env'
+        $uploadSeedPath = Join-Path ([System.IO.Path]::GetTempPath()) $uploadSeedName
+        $keptHere = @(Select-UploadSeed $envFileFull $template $uploadSeedPath)
+        if ($keptHere.Count -gt 0) {
+            Write-Note ('      kept on this PC, not uploaded (MONSTER AI has no such setting): ' + ($keptHere -join ', '))
+        }
+    }
 
     $connectOptions = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ServerAliveInterval=30', '-o', 'ConnectTimeout=20')
     $sshOptions = @('-p', [string]$Port) + $connectOptions
@@ -207,10 +231,10 @@ try {
     finally { Pop-Location }
 
     if ($envFileFull) {
-        Write-Note "      env file: $envFileFull (copied over SSH, contents are never shown, deleted from the server afterwards)"
-        Push-Location -LiteralPath (Split-Path -Parent $envFileFull)
+        Write-Note "      env file: $envFileFull (only the settings MONSTER AI defines are copied over SSH, contents are never shown, deleted from the server afterwards)"
+        Push-Location -LiteralPath $archiveDir
         try {
-            & $scp @scpOptions (Split-Path -Leaf $envFileFull) "${scpTarget}:${remoteDir}/monster.env"
+            & $scp @scpOptions $uploadSeedName "${scpTarget}:${remoteDir}/monster.env"
             if ($LASTEXITCODE -ne 0) { throw "scp of the env file failed with exit code $LASTEXITCODE" }
         }
         finally { Pop-Location }
@@ -234,8 +258,12 @@ try {
 
     Write-Step '[4/4] Running the installer on the server (you may be asked for the sudo password) ...'
     Write-Note ('-' * 78)
+    # ssh ends a -tt session with "Connection to HOST closed." on stderr. When this script's output is redirected (2>&1) PowerShell turns
+    # that line into an error record, which must not make a successful installation look like a failure: the exit code decides.
+    $ErrorActionPreference = 'Continue'
     & $ssh '-tt' @sshOptions $Target $installCommand
     $installExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
     Write-Note ('-' * 78)
     $exitCode = $installExit
     if ($installExit -eq 0) {
@@ -253,6 +281,9 @@ catch {
 finally {
     if ($archivePath -and (Test-Path -LiteralPath $archivePath)) {
         Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
+    if ($uploadSeedPath -and (Test-Path -LiteralPath $uploadSeedPath)) {
+        Remove-Item -LiteralPath $uploadSeedPath -Force -ErrorAction SilentlyContinue
     }
     if ($remoteDir) {
         try {

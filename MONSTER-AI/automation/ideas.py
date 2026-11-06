@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from app import jsonutil
-from app.clock import at_ist, iso, ist_date, parse_ts
+from app.clock import at_ist, iso, parse_ts
 from app.logging_setup import redact
 from app.release import release_id
 from automation.context import JobContext, JobResult
@@ -39,8 +39,14 @@ from features.loader import load_panel
 from features.swing import last_row, swing_frames, volume_fraction
 from features.technical import ema
 from ingestion.freshness import ist_label
+from ingestion.livefeed import merge_live
 from ingestion.nse import LIVE_LISTS
-from ingestion.pipeline import collect_live_equities, collect_live_indices
+from ingestion.pipeline import (
+    collect_kotak_indices,
+    collect_kotak_quotes,
+    collect_live_equities,
+    collect_live_indices,
+)
 from ranking.ideas import IdeaConfig, eligibility, market_regime, overnight_block, rank_ideas
 from ranking.types import IdeasReport, TradeIdea
 
@@ -58,6 +64,7 @@ EVENT_LOOKAHEAD_DAYS = 9
 SWING_EVENT_SESSIONS = 5  # a results date this many sessions ahead or less is inside a swing's horizon
 DEADLINE_MARGIN_SEC = 20.0  # live requests must be over this long before the report deadline
 LATE_FETCH_SEC = 90.0  # a run that starts when the report deadline is (nearly) over may spend this long on NSE
+NSE_GRACE_SEC = 45.0  # once the broker has answered, NSE gets this much more to answer (the broker alone can carry the scan)
 EVALUATE_DAYS = 14  # calendar days back whose ideas are judged (again) each night
 RECORD_DAYS = 120  # the live record in a report covers the runs of this many calendar days
 INDEX_NAMES = {"nifty": "NIFTY 50", "vix": "INDIA VIX"}
@@ -73,6 +80,19 @@ class LiveDay:
     source_ts: str | None = None
     indices: dict[str, dict[str, Any]] = field(default_factory=dict)
     lists: tuple[str, ...] = ()
+    feeds: dict[str, int] = field(default_factory=dict)  # rows taken from each live feed: {"nse": n, "kotak": n}
+    cross_checked: int = 0  # names both feeds had and agreed on
+    broker: str = "off"  # the broker feed: off | failed | lagging | unstamped | used
+    notes: list[str] = field(default_factory=list)  # what a report must say about the feeds
+
+    def source_label(self, universe: int) -> str:
+        """Where the live prices of a report came from, and how many names they covered."""
+        count = f"{len(self.rows)} of {universe} names with a complete live row"
+        if self.broker == "used" and not self.feeds.get("nse"):
+            return f"Kotak broker feed (NSE did not answer): {count}"
+        if self.broker == "used":
+            return f"NSE ({' + '.join(self.lists)}) + Kotak broker feed: {count}; {self.cross_checked} confirmed by both"
+        return f"NSE ({' + '.join(self.lists)}): {count}"
 
 
 def run_key(day: date | str) -> str:
@@ -94,25 +114,48 @@ def fetch_bound(ctx: JobContext, deadline_at: datetime) -> float:
     return ctx.budget(LATE_FETCH_SEC)
 
 
+def live_feed_name(settings: Any) -> str:
+    """What the operator calls the live feed in a failure notice."""
+    return "NSE and Kotak live quotes" if settings.kotak_configured else "NSE live quotes"
+
+
+def _trading_now(ctx: JobContext, day: date) -> bool:
+    """Is the regular session of ``day`` under way right now? (A live feed is only judged for age while it is.)"""
+    session = ctx.calendar.session(day)
+    now = ctx.clock.now()
+    return session.open is not None and session.close is not None and session.open <= now <= session.close
+
+
 def fetch_live(ctx: JobContext, symbols: list[str], deadline: float | None, errors: list[str] | None = None) -> LiveDay | None:
-    """NSE's live rows of the universe, keeping only complete rows that are stamped on today's date (a row from an earlier session
-    is not today's trading and is counted, never used). ``None`` when NSE did not answer at all; ``errors`` then holds why."""
+    """The live rows of the universe from NSE and, when ``KOTAK_CONSUMER_KEY`` is set, from the broker too, merged by ``ingestion.livefeed``
+    (each feed's rows must be stamped on today's date and complete before the feeds are compared; a name both feeds have must agree; the
+    fresher row wins; a lagging broker feed is not used). Either feed alone carries the scan when the other fails; ``None`` when neither
+    answered, ``errors`` then holds why.
+
+    The broker is asked first: it answers in a second or two, where a blocked NSE can use up its whole retry budget, and a call that starts
+    after the deadline gets nothing. Once the broker has answered NSE gets ``NSE_GRACE_SEC`` more at most."""
     s, day = ctx.settings, ctx.run_date
     lists = LIVE_LISTS.get(s.universe_mode, LIVE_LISTS["fno_nifty100"])
     nse = ctx.nse_api()
-    snapshot = collect_live_equities(ctx.store, nse, lists, symbols, deadline=deadline, errors=errors)
-    if snapshot is None:
+    quotes = collect_kotak_quotes(ctx.store, ctx.kotak(), symbols, day, deadline=deadline, errors=errors) if s.kotak_configured else None
+    nse_deadline = deadline
+    if quotes is not None:
+        grace = ctx.budget(NSE_GRACE_SEC)
+        nse_deadline = grace if deadline is None else min(deadline, grace)
+    snapshot = collect_live_equities(ctx.store, nse, lists, symbols, deadline=nse_deadline, errors=errors)
+    if snapshot is None and quotes is None:
         return None
-    live = LiveDay({}, source_ts=snapshot.source_ts, lists=tuple(lists))
-    for row in snapshot.rows:
-        stamp = parse_ts(row.get("row_ts"))
-        if stamp is None or ist_date(stamp) != day:
-            live.stale += 1
-        elif any(row.get(key) is None for key in ("open", "high", "low", "last", "prev_close", "volume")):
-            live.incomplete += 1
-        else:
-            live.rows[row["symbol"]] = row
-    live.indices = collect_live_indices(ctx.store, nse, deadline=deadline)
+    merged = merge_live(snapshot, quotes, configured=s.kotak_configured, day=day, lag_limit_sec=s.kotak_max_lag_sec,
+                        judge_lag=_trading_now(ctx, day))
+    live = LiveDay({row["symbol"]: row for row in merged.rows}, stale=merged.stale, incomplete=merged.incomplete, source_ts=merged.source_ts,
+                   lists=tuple(lists), feeds=merged.feeds, cross_checked=merged.cross_checked, broker=merged.broker, notes=merged.notes)
+    if snapshot is not None:
+        live.indices = collect_live_indices(ctx.store, nse, deadline=nse_deadline)
+    if INDEX_NAMES["nifty"] not in live.indices and merged.broker == "used":  # NSE's index call gave nothing: the broker has them too
+        for name, row in collect_kotak_indices(ctx.store, ctx.kotak(), deadline=deadline).items():
+            live.indices.setdefault(name, row)
+    log.info("live feeds: %d NSE + %d Kotak rows (%d confirmed by both, %d in conflict), broker feed %s", merged.feeds["nse"],
+             merged.feeds["kotak"], merged.cross_checked, len(merged.conflicts), merged.broker)
     return live
 
 
@@ -125,12 +168,12 @@ def session_fraction(ctx: JobContext, day: date, moment: datetime) -> float:
 
 
 # ----------------------------------------------------------------------------------------------- table
-def build_table(ctx: JobContext, live: LiveDay, instruments: dict[str, dict[str, Any]], fraction: float) -> tuple[pd.DataFrame, pd.Series, dict[str, Any]]:
-    """The one-row-per-stock table of the closing hour, the Nifty close series with today's live value, and the names that were
-    left out. Raises ``ValueError`` when the stored history is not complete up to the previous REGULAR session (a special session
-    such as Muhurat trading is not in the panel by design): ideas computed over a gap would read a multi-day move as today's."""
-    store, day = ctx.store, ctx.run_date
-    panel = load_panel(store, start=(day - timedelta(days=HISTORY_DAYS)).isoformat(), end=(day - timedelta(days=1)).isoformat(),
+def stored_panel(ctx: JobContext, history_days: int = HISTORY_DAYS) -> tuple[Any, date]:
+    """The stored daily history up to the previous session, plus an empty row for today, and the date of that previous session.
+    Raises ``ValueError`` when the history is not complete up to the previous REGULAR session (a special session such as Muhurat
+    trading is not in the panel by design): figures computed over a gap would read a multi-day move as today's."""
+    day = ctx.run_date
+    panel = load_panel(ctx.store, start=(day - timedelta(days=history_days)).isoformat(), end=(day - timedelta(days=1)).isoformat(),
                        today=day, calendar=ctx.calendar)
     if len(panel.dates) < 2 or panel.dates[-1].date() != day:
         raise ValueError("the stored history has no previous session")
@@ -139,18 +182,18 @@ def build_table(ctx: JobContext, live: LiveDay, instruments: dict[str, dict[str,
                if ctx.calendar.session(d).kind == "regular"]
     if missing:
         raise ValueError(f"the stored history ends on {last_stored} but {missing[-1]} was a regular session: run collect_india")
-    stamp = panel.dates[-1]
-    stored_prev = panel.c.iloc[-2]
-    symbols = [s for s in panel.symbols if s in live.rows]
+    return panel, last_stored
+
+
+def basis_exclusions(symbols: list[str], rows: dict[str, dict[str, Any]], stored_prev: pd.Series, last_stored: date) -> dict[str, str]:
+    """The names whose exchange previous close cannot be matched with the stored one (none stored, or more than ``BASIS_TOLERANCE``
+    apart: an ex-date today). Raises ``ValueError`` when so many are affected that the stored history itself is off."""
     excluded: dict[str, str] = {}
     for symbol in symbols:
-        row = live.rows[symbol]
-        for frame, key in ((panel.o, "open"), (panel.h, "high"), (panel.low, "low"), (panel.c, "last"), (panel.v, "volume")):
-            frame.loc[stamp, symbol] = float(row[key])
         stored = stored_prev.get(symbol)
         if stored is None or not np.isfinite(stored) or stored <= 0:
             excluded[symbol] = NO_PREVIOUS_CLOSE
-        elif abs(float(row["prev_close"]) / float(stored) - 1.0) > BASIS_TOLERANCE:
+        elif abs(float(rows[symbol]["prev_close"]) / float(stored) - 1.0) > BASIS_TOLERANCE:
             excluded[symbol] = BASIS_MISMATCH
     unseen = sum(1 for why in excluded.values() if why == NO_PREVIOUS_CLOSE)
     if symbols and unseen / len(symbols) > MAX_UNSEEN_SHARE:
@@ -159,6 +202,21 @@ def build_table(ctx: JobContext, live: LiveDay, instruments: dict[str, dict[str,
     if symbols and shifted / len(symbols) > MAX_UNSEEN_SHARE:  # an ex-date moves a few names; this many means the stored closes are off
         raise ValueError(f"the stored close of {last_stored} differs from the exchange's previous close for {shifted} of "
                          f"{len(symbols)} names: run collect_india")
+    return excluded
+
+
+def build_table(ctx: JobContext, live: LiveDay, instruments: dict[str, dict[str, Any]], fraction: float) -> tuple[pd.DataFrame, pd.Series, dict[str, Any]]:
+    """The one-row-per-stock table of the closing hour, the Nifty close series with today's live value, and the names that were
+    left out. Raises ``ValueError`` when the stored history is not complete up to the previous REGULAR session (see ``stored_panel``)."""
+    panel, last_stored = stored_panel(ctx)
+    stamp = panel.dates[-1]
+    stored_prev = panel.c.iloc[-2]
+    symbols = [s for s in panel.symbols if s in live.rows]
+    for symbol in symbols:
+        row = live.rows[symbol]
+        for frame, key in ((panel.o, "open"), (panel.h, "high"), (panel.low, "low"), (panel.c, "last"), (panel.v, "volume")):
+            frame.loc[stamp, symbol] = float(row[key])
+    excluded = basis_exclusions(symbols, live.rows, stored_prev, last_stored)
     nifty_close = panel.nifty["close"].astype(float).copy()
     live_nifty = live.indices.get(INDEX_NAMES["nifty"])
     if live_nifty and len(nifty_close):
@@ -322,7 +380,7 @@ def _scan(ctx: JobContext) -> JobResult:
     live = fetch_live(ctx, symbols, fetch_bound(ctx, at_ist(day, s.ideas_report_deadline_time)), why)
     if live is None:
         reason = "; ".join(dict.fromkeys(why))[:200] or "blocked or offline"
-        return _fail(ctx, f"NSE live quotes unavailable ({reason}); nothing is guessed from older prices")
+        return _fail(ctx, f"{live_feed_name(s)} unavailable ({reason}); nothing is guessed from older prices")
     coverage = len(live.rows) / len(symbols)
     if coverage < MIN_LIVE_COVERAGE:
         detail = f"{len(live.rows)} of {len(symbols)} names have a complete live row of {day}"
@@ -335,7 +393,7 @@ def _scan(ctx: JobContext) -> JobResult:
     cutoff = stamp if stamp is not None and stamp <= now else now
     fraction = session_fraction(ctx, day, cutoff)
     # What the report must not leave unsaid comes first: only the first few notes fit into a message.
-    notes: list[str] = []
+    notes: list[str] = list(live.notes)
     if INDEX_NAMES["nifty"] not in live.indices:
         notes.append("NSE index quotes unavailable: Nifty and VIX not shown, relative strength to Nifty not used")
     table, nifty_close, info = build_table(ctx, live, instruments, fraction)
@@ -369,7 +427,7 @@ def _build_report(ctx: JobContext, ideas: list[TradeIdea], market: dict[str, Any
                   ) -> IdeasReport:
     s, day = ctx.settings, ctx.run_date
     excluded = info["excluded"]
-    source = f"NSE ({' + '.join(live.lists)}): {len(live.rows)} of {n_universe} names with a complete live row"
+    source = live.source_label(n_universe)
     block = overnight_block(market)[1]
     if block:
         notes.append(block)

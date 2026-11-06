@@ -83,6 +83,39 @@ def test_yahoo_quote_comes_from_the_chart_meta(cfg, fake_clock):
     assert quote["price"] and quote["prev_close"] and quote["source_ts"]
 
 
+def intraday_payload(timestamps, **columns):
+    return {"chart": {"result": [{"meta": {"exchangeTimezoneName": "Asia/Kolkata"}, "timestamp": timestamps,
+                                  "indicators": {"quote": [columns]}}], "error": None}}
+
+
+def test_yahoo_intraday_bars_carry_exchange_local_time_sorted_and_skip_null_bars(cfg, fake_clock):
+    t0 = int(datetime(2026, 11, 2, 3, 45, tzinfo=timezone.utc).timestamp())  # 09:15 IST
+    payload = intraday_payload(
+        [t0 + 600, t0, t0 + 300, t0 + 900, "garbage", t0 + 1200],  # out of order, a null bar and a bad timestamp
+        open=[101.0, 100.0, 100.5, None, 1.0, 102.0], high=[102.0, 101.0, 101.5, None, 1.0, 103.0],
+        low=[100.5, 99.5, 100.0, None, 1.0, 101.5], close=[101.5, 100.5, 101.0, None, 1.0, 102.5], volume=[1000, None, 500, None, 5, 700])
+    session = FakeSession([FakeResponse(200, payload)])
+    bars = YahooClient(cfg, http=http_with(session, fake_clock)).fetch_intraday("INFY.NS")
+    assert [(b["trade_date"], b["hhmm"]) for b in bars] == [("2026-11-02", "09:15"), ("2026-11-02", "09:20"), ("2026-11-02", "09:25"),
+                                                            ("2026-11-02", "09:35")]
+    assert [b["open"] for b in bars] == [100.0, 100.5, 101.0, 102.0] and bars[0]["ts"] == "2026-11-02T03:45:00Z"
+    assert [b["volume"] for b in bars] == [None, 500.0, 1000.0, 700.0]  # the opening bar's volume is missing in this feed
+    params = session.calls[0][2]["params"]
+    assert params["range"] == "5d" and params["interval"] == "5m"
+
+
+def test_yahoo_intraday_keeps_each_session_on_its_own_local_date_and_survives_empty_answers(cfg, fake_clock):
+    late = int(datetime(2026, 11, 2, 22, 40, tzinfo=timezone.utc).timestamp())  # 04:10 IST the next morning: another local date than in UTC
+    first = int(datetime(2026, 11, 2, 3, 45, tzinfo=timezone.utc).timestamp())
+    payload = intraday_payload([first, late], open=[1.0, 2.0], high=[1.5, 2.5], low=[0.5, 1.5], close=[1.2, 2.2], volume=[1, 2])
+    bars = YahooClient(cfg, http=http_with(FakeSession([FakeResponse(200, payload)]), fake_clock)).fetch_intraday("X.NS")
+    assert [(b["trade_date"], b["hhmm"]) for b in bars] == [("2026-11-02", "09:15"), ("2026-11-03", "04:10")]
+    for empty in (intraday_payload([], open=[], high=[], low=[], close=[], volume=[]), intraday_payload(None, open=None)):
+        assert YahooClient(cfg, http=http_with(FakeSession([FakeResponse(200, empty)]), fake_clock)).fetch_intraday("X.NS") == []
+    with pytest.raises(SymbolNotFound):
+        YahooClient(cfg, http=http_with(FakeSession([FakeResponse(404, fixture_bytes("yahoo_notfound.json"))]), fake_clock)).fetch_intraday("NO.NS")
+
+
 # -------------------------------------------------------------------------------------------------- NSE
 def test_bhavcopy_parsing_and_edge_cases(cfg, fake_clock):
     archive = nse.NseArchive(cfg, http=http_with(FakeSession([FakeResponse(200, fixture_bytes("bhavcopy_full_sample.csv"))]), fake_clock))

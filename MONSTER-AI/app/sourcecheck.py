@@ -3,9 +3,10 @@ answer with data.
 
 A provider renames or retires an endpoint now and then (NSE retired ``equity-stockIndices`` in 2026). This is the command that finds
 that out before a scan does, and it names the reason of every failure. It only reads: nothing is stored and no report is touched.
-Sections: ``nse`` (the JSON API behind www.nseindia.com), ``archive`` (the end-of-day files), ``yahoo``, ``rss`` (the news feeds) and
+Sections: ``nse`` (the JSON API behind www.nseindia.com), ``archive`` (the end-of-day files), ``yahoo``, ``kotak`` (the broker feed, when
+``KOTAK_CONSUMER_KEY`` is set), ``rss`` (the news feeds) and
 ``gdelt`` (global news discovery: GDELT and the Google News search that stands in for it). An endpoint the system cannot do without
-that does not answer is ``fail``; one that is optional (GDELT, its fallback), one of many (a single feed) or merely not published
+that does not answer is ``fail``; one that is optional (GDELT, its fallback, the broker), one of many (a single feed) or merely not published
 yet is ``warn``.
 """
 
@@ -21,7 +22,7 @@ from app.doctor import DoctorReport
 from app.doctor import render as render_report
 from app.logging_setup import redact
 
-SECTIONS = ("nse", "archive", "yahoo", "rss", "gdelt")
+SECTIONS = ("nse", "archive", "yahoo", "kotak", "rss", "gdelt")
 FILE_DAYS = 4  # weekdays an end-of-day file is looked for: today's is published in the evening
 MAX_FEED_ROWS = 10  # failing feeds named one by one
 Verdict = tuple[str, str]  # (status, detail)
@@ -109,6 +110,51 @@ def check_archive(report: DoctorReport, s: Settings, today: date) -> None:
         _probe(report, "NSE F&O lot sizes", arc.fo_lot_sizes, lambda r: _count(len(r), "underlyings"))
     finally:
         arc.http.close()
+
+
+# ------------------------------------------------------------------------------------------------ Kotak
+KOTAK_PROBE_SYMBOLS = ("RELIANCE", "HDFCBANK", "TCS", "INFY", "SBIN")  # liquid names: their last trade is never old while the market trades
+KOTAK_CANDLE_LOOKBACK = 5  # days a finished session is looked for (a weekend and a holiday or two fit)
+
+
+def check_kotak(report: DoctorReport, s: Settings, today: date) -> None:
+    """The broker feed end to end with the production client: the application token, the instrument master, live quotes, the index quotes
+    and the five-minute candles of the latest finished session (which must end with the 15:10 bar the broker serves)."""
+    from ingestion.kotak import KotakApi
+
+    if not s.kotak_configured:
+        report.add("Kotak broker feed", "ok", "off (KOTAK_CONSUMER_KEY is not set, or KOTAK_ENABLED=false)")
+        return
+    api = KotakApi(s)
+    try:
+        tokens = _probe(report, "Kotak instrument master", api.token_map,
+                        lambda r: _count(len(r), "stocks") if len(r) >= 500 else ("fail", f"only {len(r)} stocks"), optional=True)
+        _probe(report, "Kotak index quotes", api.indices,
+               lambda r: ("ok", ", ".join(f"{name} {row['last']:g}" for name, row in r.items())) if r else ("fail", "no index quote"), optional=True)
+        if not tokens:
+            return
+        wanted = {symbol: tokens[symbol] for symbol in KOTAK_PROBE_SYMBOLS if symbol in tokens}
+
+        def quotes(result: Any) -> Verdict:
+            if len(result.rows) < len(wanted):
+                return "warn", f"{len(result.rows)} of {len(wanted)} stocks answered"
+            return "ok", f"{len(result.rows)} stocks, newest trade {result.asof:%Y-%m-%d %H:%M:%S} UTC" if result.asof else f"{len(result.rows)} stocks"
+
+        _probe(report, "Kotak live quotes", lambda: api.quotes(wanted), quotes, optional=True)
+        symbol = next(iter(wanted), None)
+        if symbol is None:
+            return
+
+        def candles(bars: list[dict[str, Any]]) -> Verdict:
+            if not bars:
+                return "fail", "no five-minute bars"
+            last = bars[-1]
+            return "ok", f"{len(bars)} bars of {symbol}, the last on {last['trade_date']} starting {last['hhmm']} IST"
+
+        _probe(report, "Kotak 5-minute candles", lambda: api.candles(wanted[symbol], "5min", today - timedelta(days=KOTAK_CANDLE_LOOKBACK), today),
+               candles, optional=True)
+    finally:
+        api.close()
 
 
 # ---------------------------------------------------------------------------------------------- Yahoo
@@ -213,7 +259,8 @@ def run_checks(settings: Settings, sections: Sequence[str] | None = None, *, tod
     wanted = set(sections or SECTIONS)
     runners: dict[str, Callable[[], None]] = {
         "nse": lambda: check_nse(report, settings, day), "archive": lambda: check_archive(report, settings, day),
-        "yahoo": lambda: check_yahoo(report, settings), "rss": lambda: check_rss(report, settings),
+        "yahoo": lambda: check_yahoo(report, settings), "kotak": lambda: check_kotak(report, settings, day),
+        "rss": lambda: check_rss(report, settings),
         "gdelt": lambda: check_gdelt(report, settings),
     }
     for name in SECTIONS:

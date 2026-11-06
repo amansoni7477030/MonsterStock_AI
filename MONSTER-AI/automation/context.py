@@ -86,6 +86,12 @@ class JobContext:
 
         return self._lazy("nse_api", lambda: NseApi(self.settings, clock=self.clock))
 
+    def kotak(self) -> Any:
+        """The broker's market-data client. Only for ``settings.kotak_configured`` (it refuses to start without a key)."""
+        from ingestion.kotak import KotakApi
+
+        return self._lazy("kotak", lambda: KotakApi(self.settings, clock=self.clock))
+
     def news(self) -> Any:
         from ingestion.news_sources import NewsCollector
 

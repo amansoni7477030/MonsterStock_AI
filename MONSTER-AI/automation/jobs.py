@@ -17,7 +17,7 @@ from app.errors import DataUnavailable
 from app.logging_setup import redact
 from app.release import release_id
 from app.resources import check_resources, disk_info, emergency_cleanup, memory_info, release_memory
-from automation import ideas, scan
+from automation import ideas, opening, scan
 from automation.calendar import infer_holidays_from_bars, refresh_calendar, trading_days_before
 from automation.context import JobContext, JobResult
 from automation.health import CALENDAR_REFRESH_KEY
@@ -279,10 +279,22 @@ def closing_scan(ctx: JobContext) -> JobResult:
     return skipped or ideas.run_closing_scan(ctx)
 
 
+def opening_scan(ctx: JobContext) -> JobResult:
+    """09:30 IST: the first fifteen minutes of the session read against the 09:12 picks, from NSE's live quotes and the stored history."""
+    skipped = _non_trading(ctx)
+    return skipped or opening.run_opening_scan(ctx)
+
+
 def evaluate_ideas(ctx: JobContext) -> JobResult:
     """Evening: attach the outcomes of the earlier trade ideas (kept apart from the frozen reports) for the live record."""
     skipped = _non_trading(ctx)
     return skipped or ideas.evaluate_ideas(ctx)
+
+
+def evaluate_opening(ctx: JobContext) -> JobResult:
+    """Evening: attach the outcomes of the earlier 09:30 opening reads (kept apart from the frozen reports) for the live record."""
+    skipped = _non_trading(ctx)
+    return skipped or opening.evaluate_opening(ctx)
 
 
 def refresh_preopen(ctx: JobContext) -> JobResult:
@@ -605,10 +617,12 @@ FUNCTIONS: dict[str, Callable[[JobContext], JobResult]] = {
     "prelim_scan": prelim_scan,
     "refresh_preopen": refresh_preopen,
     "final_scan": final_scan,
+    "opening_scan": opening_scan,
     "closing_scan": closing_scan,
     "ingest_eod": ingest_eod,
     "evaluate": evaluate,
     "evaluate_ideas": evaluate_ideas,
+    "evaluate_opening": evaluate_opening,
     "backup": backup,
     "housekeeping": housekeeping,
     "train": train,

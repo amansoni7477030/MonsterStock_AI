@@ -32,7 +32,10 @@ GROQ_EXTRA_FALLBACK_MODELS = ("qwen/qwen3.8-27b",)
 # incompatible with structured outputs (console.groq.com/docs/tool-use/built-in-tools and /browser-search, read 2026-11-02).
 GROQ_WEB_MODEL_PREFIX = "openai/gpt-oss"
 CLOSING_SCAN_START = "14:30:00"  # IST: when the scheduler starts the closing-hour scan (automation.schedule)
+OPENING_SCAN_START = "09:30:15"  # IST: when the scheduler starts the 09:30 opening read, just after the third five-minute candle closes
+KOTAK_BASE_URL = "https://mis.kotaksecurities.com"  # the Kotak Neo API host the broker's own SDK uses for quotes and history
 _GROQ_URL = re.compile(r"https://api\.groq\.com(?::443)?(?:/[A-Za-z0-9._~/-]*)?", re.IGNORECASE)
+_KOTAK_URL = re.compile(r"https://(?:[a-z0-9-]+\.)*kotaksecurities\.com(?::443)?/?", re.IGNORECASE)
 _URL_UNSAFE = re.compile(r"[\\@\s]")  # credentials, backslashes and spaces: what different URL parsers read differently
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -42,6 +45,13 @@ def is_groq_url(url: str | None) -> bool:
     a look-alike host (``https://api.groq.com.evil.example``), credentials in the URL (``https://api.groq.com@evil.example``) and
     anything else a URL parser could read differently from the HTTP client never receive it."""
     return bool(url) and _GROQ_URL.fullmatch(str(url).strip()) is not None
+
+
+def is_kotak_url(url: str | None) -> bool:
+    """True only for a plain https origin on ``kotaksecurities.com`` or one of its sub-domains. ``KOTAK_CONSUMER_KEY`` is sent to a URL
+    only when this holds: a look-alike host (``https://mis.kotaksecurities.com.evil.example``, ``https://evilkotaksecurities.com``),
+    credentials in the URL and anything else a URL parser could read differently from the HTTP client never receive it."""
+    return bool(url) and _KOTAK_URL.fullmatch(str(url).strip()) is not None
 
 
 def is_loopback_http(url: str) -> bool:
@@ -207,7 +217,9 @@ VARS: tuple[Var, ...] = (
         "More chats that also receive the reports and their chart images (comma separated; the person sends the bot /start first, "
         "`telegram-setup --list` shows their id). They never get the operational alerts, failure notices or tests.", "Telegram"),
     Var("send_prelim_report", "SEND_PRELIM_REPORT", "false", _bool,
-        "Also send the 08:45 preliminary scan (off by default to avoid noise).", "Telegram"),
+        "Also send the 08:45 preliminary scan. Off by default: the day has four reports (09:12 pre-open, 09:30 opening read, 14:30 "
+        "closing hour, evening). The 08:45 scan still runs silently: it repairs the previous session and is the fallback snapshot.",
+        "Telegram"),
     Var("send_evening_report", "SEND_EVENING_REPORT", "true", _bool, "Send the post-session evaluation summary.", "Telegram"),
     Var("send_charts", "SEND_CHARTS", "true", _bool,
         "Attach chart images (donut, bars, trade-plan ladders) to the Telegram reports, sent after the text. Needs the Pillow "
@@ -267,6 +279,20 @@ VARS: tuple[Var, ...] = (
     Var("ideas_include_shorts", "IDEAS_INCLUDE_SHORTS", "true", _bool,
         "Include bearish ideas (F&O names only: short futures or buy puts; the cash market cannot be held short overnight) "
         "and the sell triggers of the watchlist.", "Ideas"),
+    # -- the 09:30 opening read (the first fifteen minutes of the session) -----------------------------------------------
+    Var("opening_enabled", "OPENING_ENABLED", "true", _bool,
+        "Run the 09:30 opening read: the first fifteen minutes of the session (three five-minute candles) read against the 09:12 "
+        "picks, the new opening movers and reference levels around the opening range, from NSE live quotes and the stored history. "
+        "Research output in shadow mode: it estimates how WIDE the day will be (validated out of sample), never which way.", "Opening"),
+    Var("send_opening_report", "SEND_OPENING_REPORT", "true", _bool,
+        "Send the 09:30 report to Telegram (false = compute, freeze and evaluate it silently).", "Opening"),
+    Var("opening_report_deadline_time", "OPENING_REPORT_DEADLINE_TIME", "09:45", _hhmm,
+        "Hard deadline of the 09:30 report (IST): it is never sent after this time (a manual run with --force may). Up to then the "
+        "live range covers at most 30 minutes and is normalised back to the first fifteen. Between 09:31 and 10:00.", "Opening"),
+    Var("opening_top_n", "OPENING_TOP_N", "8", _int, "New opening movers listed (the names of the 09:12 report are always read again).", "Opening"),
+    Var("opening_min_x", "OPENING_MIN_X", "0.60", _float,
+        "How wide a new mover's opening range must be, as a multiple of the stock's mean daily range, to be listed "
+        "(0.60 = a HOT opening, 0.85 = EXPLOSIVE only; between 0.3 and 3).", "Opening"),
     # -- providers -----------------------------------------------------------------------------------------
     Var("yahoo_min_interval_sec", "YAHOO_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between Yahoo requests.", "Providers"),
     Var("nse_min_interval_sec", "NSE_MIN_INTERVAL_SEC", "1.0", _float, "Minimum spacing between NSE requests.", "Providers"),
@@ -287,6 +313,23 @@ VARS: tuple[Var, ...] = (
     Var("news_feeds_file", "NEWS_FEEDS_FILE", "{home}/data/seeds/feeds.json", _path, "RSS/Atom feed registry.", "Providers"),
     Var("news_lookback_hours", "NEWS_LOOKBACK_HOURS", "36", _int, "How far back a collection run looks.", "Providers"),
     Var("news_retention_days", "NEWS_RETENTION_DAYS", "45", _int, "Raw article text retention (structured events are kept).", "Providers"),
+    # -- kotak ---------------------------------------------------------------------------------------------
+    Var("kotak_consumer_key", "KOTAK_CONSUMER_KEY", "", _opt_str,
+        "Kotak Neo application token (NEO app > More > Trade API > Generate application). Switches the broker feed on: live quotes "
+        "of every F&O stock (a second real-time source beside NSE, cross-checked) and exchange-grade 5-minute candles, read-only. "
+        "Only this one value is used: quotes and candles need no login, so the MPIN, TOTP secret, mobile number and UCC must NOT "
+        "be put here. Empty = NSE and Yahoo only.", "Kotak", True),
+    Var("kotak_enabled", "KOTAK_ENABLED", "true", _bool,
+        "Use the Kotak feed when KOTAK_CONSUMER_KEY is set (false = switch it off without removing the key).", "Kotak"),
+    Var("kotak_base_url", "KOTAK_BASE_URL", KOTAK_BASE_URL, _str,
+        "Kotak API host. The key is sent only to https on kotaksecurities.com; anything else is refused at start-up.", "Kotak"),
+    Var("kotak_max_lag_sec", "KOTAK_MAX_LAG_SEC", "90", _float,
+        "During the session the broker quotes are used only while their newest trade is at most this many seconds old (a lagging "
+        "feed is left out and NSE alone answers). Outside the session no age is judged. 0 = no check.", "Kotak"),
+    Var("kotak_quote_interval_sec", "KOTAK_QUOTE_INTERVAL_SEC", "0.2", _float,
+        "Minimum spacing between quote requests (the broker allows 25 a second; 40 stocks answer per request).", "Kotak"),
+    Var("kotak_history_interval_sec", "KOTAK_HISTORY_INTERVAL_SEC", "1.1", _float,
+        "Minimum spacing between candle requests (the broker limits them to about one a second; 429 slows the client down).", "Kotak"),
     # -- llm -----------------------------------------------------------------------------------------------
     Var("groq_api_key", "GROQ_API_KEY", "", _opt_str,
         "Groq API key (https://console.groq.com/keys). Enables LLM event extraction on Groq with the defaults below. Empty = "
@@ -445,6 +488,11 @@ class Settings:
     ideas_min_score: float = 60.0
     ideas_max_risk_pct: float = 4.0
     ideas_include_shorts: bool = True
+    opening_enabled: bool = True
+    send_opening_report: bool = True
+    opening_report_deadline_time: str = "09:45:00"
+    opening_top_n: int = 8
+    opening_min_x: float = 0.6
     yahoo_min_interval_sec: float = 1.0
     nse_min_interval_sec: float = 1.0
     nse_enabled: bool = True
@@ -458,6 +506,12 @@ class Settings:
     news_feeds_file: Path = HOME_DEFAULT / "data" / "seeds" / "feeds.json"
     news_lookback_hours: int = 36
     news_retention_days: int = 45
+    kotak_consumer_key: str | None = None
+    kotak_enabled: bool = True
+    kotak_base_url: str = KOTAK_BASE_URL
+    kotak_max_lag_sec: float = 90.0
+    kotak_quote_interval_sec: float = 0.2
+    kotak_history_interval_sec: float = 1.1
     groq_api_key: str | None = None
     llm_api_base: str | None = None
     llm_api_key: str | None = None
@@ -613,6 +667,11 @@ class Settings:
         return bool(self.typesafe_api_key)
 
     @property
+    def kotak_configured(self) -> bool:
+        """The broker feed is on: switched on, a key present and a host the key may be sent to."""
+        return bool(self.kotak_enabled and self.kotak_consumer_key and is_kotak_url(self.kotak_base_url))
+
+    @property
     def s3_configured(self) -> bool:
         return bool(self.s3_bucket and self.s3_access_key_id and self.s3_secret_access_key)
 
@@ -758,6 +817,12 @@ def validate(s: Settings) -> list[str]:
         problems.append("IDEAS_MIN_SCORE must be between 0 and 100")
     if not 0.0 < s.ideas_max_risk_pct <= 15.0:
         problems.append("IDEAS_MAX_RISK_PCT must be above 0 and at most 15")
+    if not (OPENING_SCAN_START < s.opening_report_deadline_time <= "10:00:00"):
+        problems.append("OPENING_REPORT_DEADLINE_TIME must lie after the 09:30 scan and not after 10:00 (IST)")
+    if not 1 <= s.opening_top_n <= 12:
+        problems.append("OPENING_TOP_N must be between 1 and 12")
+    if not 0.3 <= s.opening_min_x <= 3.0:
+        problems.append("OPENING_MIN_X must be between 0.3 and 3")
     if s.dashboard_enabled and s.dashboard_host not in {"127.0.0.1", "::1", "localhost"} and not s.dashboard_token:
         problems.append("DASHBOARD_TOKEN is required when the dashboard is not bound to loopback")
     if s.dashboard_token and len(s.dashboard_token) < 16:
@@ -785,6 +850,16 @@ def validate(s: Settings) -> list[str]:
         problems.append("JEV_MIN_CONFIDENCE must be between 0 and 1")
     if s.typesafe_api_key and not s.jev_model:
         problems.append("JEV_MODEL must not be empty when TYPESAFE_API_KEY is set")
+    if not is_kotak_url(s.kotak_base_url):
+        problems.append("KOTAK_BASE_URL must be a plain https URL on kotaksecurities.com (the key is never sent anywhere else)")
+    if s.kotak_consumer_key and re.search(r"\s", s.kotak_consumer_key):
+        problems.append("KOTAK_CONSUMER_KEY must not contain spaces (copy the application token again)")
+    if s.kotak_max_lag_sec < 0:
+        problems.append("KOTAK_MAX_LAG_SEC must not be negative (0 = no check)")
+    if not 0.0 <= s.kotak_quote_interval_sec <= 5.0:
+        problems.append("KOTAK_QUOTE_INTERVAL_SEC must be between 0 and 5")
+    if not 0.5 <= s.kotak_history_interval_sec <= 10.0:
+        problems.append("KOTAK_HISTORY_INTERVAL_SEC must be between 0.5 and 10 (the broker limits candles to about one a second)")
     if s.training_mode == "external" and not (s.model_artifact_url and s.model_signing_key):
         problems.append("TRAINING_MODE=external requires MODEL_ARTIFACT_URL and MODEL_SIGNING_KEY")
     if s.model_artifact_url and not s.model_artifact_url.lower().startswith("https://"):

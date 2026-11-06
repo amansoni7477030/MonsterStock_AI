@@ -7,6 +7,146 @@ by itself).
 
 ## [Unreleased]
 
+**A day now has four reports, and the 09:30 opening read is new.** The 08:45 report is no longer sent (that scan still runs silently).
+The opening read looks at the first fifteen minutes of the session (three five-minute candles) and estimates how wide the day will be;
+see the README, *The 09:30 opening read*, for what was measured and what was not found. No database migration; the new records live in
+the key-value store under `opening:` and are pruned with the other records.
+
+### Upgrade notes (the 09:30 opening read)
+
+- **New jobs and schedule entries** (picked up when the scheduler restarts): `opening_scan` at 09:30:15 (a try every 20 seconds until
+  09:44, **critical**) and `evaluate_opening` at 18:32 after `ingest_eod`. Run `sudo monster-ai jobs` to see them.
+- **New settings** (safe defaults, see `.env.example`): `OPENING_ENABLED` (true), `SEND_OPENING_REPORT` (true),
+  `OPENING_REPORT_DEADLINE_TIME` (09:45), `OPENING_TOP_N` (8) and `OPENING_MIN_X` (0.60). The report goes to the same Telegram chat as
+  the others (and to the extra chats); `SEND_OPENING_REPORT=false` keeps it computing, freezing and evaluating without sending,
+  `OPENING_ENABLED=false` switches it off.
+- **`SEND_PRELIM_REPORT` is `false` by default and should stay `false`**: the day has four reports (09:12, 09:30, 14:30 and the evening
+  one). An existing `monster.env` that still says `true` keeps sending the 08:45 report until it is changed; `deployment/install.sh`
+  does not rewrite existing values.
+- **New command** `monster-ai opening [--date D] [--dry-run] [--force]`; `telegram-preview` has a new kind `opening`.
+
+### Upgrade notes (the Kotak broker feed)
+
+- **One new optional setting is the only thing to add**: `KOTAK_CONSUMER_KEY`, the application token from the NEO app (*More > Trade API >
+  Generate application*). Nothing else of the broker is needed or read: no MPIN, TOTP secret, mobile number or UCC (they are not settings
+  and must not be put in `monster.env`; if they sit in your local `.env` the deploy scripts leave them on your PC, see *Added (the Kotak
+  broker feed)*). Empty = NSE and Yahoo alone, exactly as before. Its companions have safe defaults:
+  `KOTAK_ENABLED` (true), `KOTAK_MAX_LAG_SEC` (90), `KOTAK_BASE_URL`, `KOTAK_QUOTE_INTERVAL_SEC` (0.2), `KOTAK_HISTORY_INTERVAL_SEC` (1.1).
+  Verify with `sudo monster-ai sources-check --only kotak` and `sudo monster-ai doctor`.
+- New sources in the catalogue: `kotak_quotes` and `kotak_history` (optional; `source_health` and the health check cover them).
+  `sources-check` has a new section `kotak`. No database migration; the daily instrument map is one key-value record (`kotak:tokens`).
+
+### Added (the Kotak broker feed)
+
+- **A second real-time source for the 09:30 and 14:30 scans** (`ingestion/kotak.py`, `ingestion/livefeed.py`). Kotak Neo's quotes
+  endpoint serves 40 stocks a request (the documented 50 is refused with HTTP 400: found live, 49 works) and takes the application
+  token alone, so the whole F&O universe is one second and a half of requests. Every F&O stock matched NSE's own row exactly on open,
+  high, low, last, previous close and volume (218 of 218, measured after the close). The two feeds are merged per name: a name both
+  have must agree (previous close 0.3 %, open 0.5 %, last price 3 %) or it is left out and named in the report; of two agreeing rows
+  the one with the larger day volume (the fresher) is taken whole; a broker feed whose freshest trade is older than
+  `KOTAK_MAX_LAG_SEC` during the session is not used; either feed alone carries a scan when the other fails, which also ends the
+  closing scan's and the opening read's total dependence on NSE's cookie-guarded website API. The report's `source` line names the
+  feeds and its notes say when the broker was unavailable, lagging or in conflict. Nifty 50 and India VIX come from the broker when
+  NSE's index call gives nothing.
+- **Exchange-grade candles for the evening judging** (`automation.opening._intraday`). The listed names' five-minute candles come from the
+  broker first (a day is judged only when all 72 five-minute bars from 09:15 to 15:10 are there, otherwise Yahoo is asked for that name), and reach back the whole
+  evaluation window instead of Yahoo's five sessions.
+- **`monster-ai sources-check --only kotak`** (the token, instrument master, live quotes, index quotes and candles), `doctor` lines for the feed,
+  `KotakApi.token_map` / `quotes` / `indices` / `candles`, and a scripted `FakeKotakApi` that every scan test uses (a guard makes a test that
+  forgot its double fail instead of reaching the network).
+- **The deploy scripts upload only the settings `.env.example` defines** (`deployment/lib/envseed.ps1` for `deploy_remote.ps1`, `envseed.sh` for
+  `deploy_remote.sh`). Their default seed is the real `.env`, which can now also hold the broker's login values (`KOTAK_MOBILE`, `KOTAK_UCC`,
+  `KOTAK_MPIN`, `KOTAK_TOTP_SECRET`); MONSTER AI never reads them and they must not reach the server, so they are filtered out on the
+  workstation before the upload and only their names are listed (the installer would have ignored them, but the upload itself would have
+  carried them into the server's temporary directory). Keys are matched case-sensitively like the application; BOM, CRLF and UTF-16 files are
+  handled; a template without settings or an unreadable file uploads nothing. Tested for both scripts (the end-to-end test runs
+  `deploy_remote.sh` with `ssh`, `scp` and `tar` replaced and checks the file that would be uploaded), and `deploy_remote.ps1` itself still
+  never reads the file.
+
+### Found while building it
+
+- **Yahoo's five-minute bars are not the exchange's.** On 1,176 stock-days both could be compared on, Yahoo's first-15-minute range was
+  narrower than the exchange's on 87 % of them (median ratio 1.10; its first bar misses the opening spike, its prices carry float32 noise and
+  its 09:15 bar has no auction volume), while the broker's candles are the exact aggregate of its one-minute candles and reproduced NSE's
+  official day low for 60 of 60 stocks. The 09:30 opening model had been fitted on Yahoo's bars and is fed NSE's true range live: see *Changed*.
+- **curl_cffi's streamed responses close the connection** (the shared client reads every body as a stream), which costs the broker host's 2.3 s
+  handshake on every request here; the broker clients use the plain `requests` transport, which keeps the connection alive (about 0.1 s a request).
+- The broker's history **stops at the 15:10 five-minute bar** (the last 15 minutes of each session are missing, or appear only as a flat artefact after the day; the evening judging never needed them). On some days (found on 2026-10-14, 10-28, 10-29 and 11-05) the archive marks the 15:10 bar with a **negative volume**; the parser drops such a bar, the day is then unfinished and the judging asks Yahoo for that name, so a few listed names are judged on Yahoo's bars on those days
+  and answers about **one request a second** (a faster caller is refused with HTTP 429, which the client honours and slows down on).
+
+### Changed
+
+- **The 09:30 opening model was refitted on the exchange's own five-minute candles** (138 sessions, 2026-04-13 to 2026-10-30, 28,982
+  stock-days of the F&O stocks; `opening-m3-20261107`). The first fit (60 sessions of Yahoo's smoothed bars) is fed NSE's true, wider range
+  live. On the exchange data (118 sessions, out of sample) it ranked as well as the refit (AUC 0.765 against 0.763) but stated 29.0 %
+  where 25.9 % happened (calibration intercept -0.21), and its six highest-rated names made a range above 3 % in 76.8 % of cases against
+  the refit's 80.1 %. Every coefficient, residual quantile, range-growth ratio, strength history and day-type edge changed with it, as did
+  the evidence the reports quote (`MODEL_INFO`); the golden test cases were recomputed by the independent script. Stated chances are
+  about three points lower than the first fit's on average. Two findings moved: for the range still to come the opening now adds
+  nothing measurable (-2 to +2 points), and breakout plans lose about what they cost (-0.20 % per trade after costs, -0.02 % before)
+  where the first study could not tell them from zero. The direction finding was **not** repeated on the exchange data and is attributed
+  to the earlier study. A fit made on the first half of the sample stated 27.2 % for the second half, which really ran 25.9 %: the base
+  rate drifts by a point or two between regimes, so the live record remains the judge.
+- The failure notice of a scan with no live quotes says `NSE and Kotak live quotes unavailable (...)` when the broker is on (the old wording when it is not).
+- `SECTIONS` of `sources-check` gained `kotak`; the security documentation no longer says "no broker keys": the only broker value is the read-only token.
+
+### Added (the 09:30 opening read)
+
+- **The opening read** (`ranking/opening.py`, `automation/opening.py`, `notifications/opening.py`, `backtesting/opening.py`). NSE's live
+  quotes after the third five-minute candle hold the first fifteen minutes' open, high and low; the scan reads that range against each
+  stock's own normal (mean daily range of 20 sessions, 14-day ATR) and sends the 09:12 picks read again, new opening movers, reference
+  levels around the opening range and the market at the open. The estimate is a four-input logistic / log-linear model fitted on 138
+  sessions of the broker's own five-minute candles (an earlier fit on 60 sessions of Yahoo's smoothed bars was replaced, see *Found while
+  building it*). **Measured out of sample**, on the names whose range so far had not yet passed 3 % (a range that has already printed
+  counts towards the day): the opening range lifts the AUC for a day range above 3 % from 0.695 to 0.763, the six highest-rated names of
+  a day went on to one in 80 % of cases (63 % on the 09:12 information alone, 28 % for random names), the stated chances were calibrated
+  (slope 0.96; 26.1 % stated against 25.9 % real) and the 80 % band held 79 %; for the range still to come after 09:30 the opening adds
+  nothing measurable over the 09:12 information among hot openings (-2 to +2 points); **no direction edge was found (earlier study) and a
+  breakout plan on the opening range returned -0.20 % per trade after costs (-0.02 % before)**, so the report says it estimates the
+  width of the day and nothing else. The tests pin the coefficients to an independent calculation (`tests/test_opening_model.py`).
+- **A headline was corrected before release.** The first version advertised "93 % of the top six made a range above 3 %"; a replay on
+  real data showed that 59 % of those names had already printed a range above 3 % in their first fifteen minutes, so the figure was
+  largely trivial. The claim, the mover list and the live record were redone on the names that had not yet passed the line: a level the
+  range so far has passed has a chance of exactly 1 and the report says "already above 3 %" instead of a probability; the day's range
+  band never starts below the range so far ("at least X %"); new movers are the HOT or EXPLOSIVE openings (`OPENING_MIN_X`) ranked by
+  the range still expected after 09:30 instead of by a chance that favoured names that had already moved; the live record counts the
+  names that had already passed 3 % apart ("not a test") and judges the chance on the others.
+- **Guards.** The scan starts at 09:30:15 and fails (and retries) while the quotes are stamped before the third candle has closed; a
+  retry a few minutes late is normalised to the fifteen-minute basis with the measured growth of the range and says so; later than 30
+  minutes after the open it is no opening read and does not run; special sessions are skipped; the stored history must be complete up
+  to the previous regular session and a name whose previous close does not match the stored one is left out (the closing scan's checks,
+  now shared: `automation.ideas.stored_panel` and `basis_exclusions`, behaviour unchanged).
+- **Frozen once, judged on everything it scored.** The report is stored under `opening:run:<date>` and the scored table of every
+  eligible name under `opening:state:<date>`; `evaluate_opening` judges all of them on the official bars (calibration of the stated
+  chance and the model's top six against the base rate, on the names not already past 3 %; the 80 % band's coverage on every name)
+  and the listed names also on Yahoo's five-minute bars while they reach back (`YahooClient.fetch_intraday`): the range ahead and the
+  levels as a plan (a bar that touches both stop and target counts as stopped, a gap through a trigger fills at the open, costs
+  deducted). The live record in each report starts empty.
+- **Health and alerts.** `opening_scan_failed` and `opening_deadline_missed` alerts, a `health_opening_scan_missing` warning at 09:50, a
+  `CLOSING`-style failure notice for the stage `opening`, retention for the `opening:` records, and `opening` in `telegram-preview`.
+
+### Changed
+
+- The 08:45 report is off by default (see the upgrade notes); the scan itself still runs and its snapshot is the fallback of the
+  09:12 and 09:30 reports.
+- `SEND_PRELIM_REPORT`'s description and the README timetable now describe the four-report day.
+
+### Fixed
+
+- **`deploy_remote.ps1` reported a successful installation as failed when its output was redirected.** ssh ends a `-tt` session with
+  "Connection to HOST closed." on stderr; with `2>&1` in front of the script (a CI step, a wrapper, a log tee) PowerShell turns that line
+  into an error record and `$ErrorActionPreference = 'Stop'` aborted the script with `[FAIL] Connection ... closed.` and exit code 1
+  after the installer had finished. The interactive call now tolerates it and the installer's exit code alone decides (a static test pins
+  it, and a redirected deploy to the real server printed "Deployment finished successfully." with exit code 0).
+- **A job added by an upgrade was reported as missed for the days before the upgrade.** The scheduler judged every window that had
+  closed since the daemon's first start, so the first upgrade that added a timetable entry (`opening_scan`) raised "missed" alerts
+  (three error-level Telegram alerts for the three preceding trading days) for a job that did not exist yet. The scheduler now
+  records when it first saw each timetable entry (`daemon.entries_seen` in the key-value store) and ignores windows that closed
+  before that; a window that closes after it is held to the job as before. The first release that records this stamps every existing
+  entry with the daemon's first start, so nothing that already existed changes. No migration.
+
+## [Unreleased, earlier]
+
 Closing-hour trade ideas (BTST, swing, bearish F&O and a next-day intraday watchlist), a longer Groq model chain, and tables and chart
 images in the Telegram reports. No database migration; the new records live in the key-value store under `ideas:` and are pruned with
 the other records.

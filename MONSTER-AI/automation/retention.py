@@ -18,6 +18,7 @@ job runs, deliveries,       deleted after N days (delivered alerts: half)       
 alerts
 dated kv keys               evaluation summaries follow the records; fetch markers 30 d   (constant)
 trade-idea records          ``ideas:run:`` (frozen) and ``ideas:out:`` (outcomes)         RECORD_RETENTION_DAYS (1825)
+opening-read records        ``opening:run:`` / ``opening:state:`` / ``opening:out:``      RECORD_RETENTION_DAYS (1825)
 backups                     daily / weekly policy + a total size budget                   BACKUP_KEEP_*, BACKUP_MAX_MB
 models                      last versions per stage                                       (models.registry)
 cache / tmp                 age and size caps                                             (constants below)
@@ -141,6 +142,7 @@ POLICIES: tuple[TablePolicy, ...] = (
 KV_POLICIES: tuple[KvPolicy, ...] = (
     KvPolicy("kv_evaluation", "evaluation:", lambda s: s.record_retention_days),
     KvPolicy("kv_ideas", "ideas:", lambda s: s.record_retention_days),
+    KvPolicy("kv_opening", "opening:", lambda s: s.record_retention_days),
     KvPolicy("kv_fetch_markers", "yahoo:fetched:", lambda s: FETCH_MARKER_DAYS),
 )
 

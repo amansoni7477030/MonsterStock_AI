@@ -95,12 +95,32 @@ def test_all_errors_are_reported_together(tmp_path):
         ({"IDEAS_MIN_SCORE": "-1"}, "IDEAS_MIN_SCORE"),
         ({"IDEAS_MAX_RISK_PCT": "0"}, "IDEAS_MAX_RISK_PCT"),
         ({"IDEAS_MAX_RISK_PCT": "16"}, "IDEAS_MAX_RISK_PCT"),
+        ({"OPENING_ENABLED": "maybe"}, "OPENING_ENABLED"),
+        ({"OPENING_REPORT_DEADLINE_TIME": "09:30"}, "OPENING_REPORT_DEADLINE_TIME"),  # not after the 09:30:15 scan
+        ({"OPENING_REPORT_DEADLINE_TIME": "10:05"}, "OPENING_REPORT_DEADLINE_TIME"),  # the opening range is long over
+        ({"OPENING_TOP_N": "0"}, "OPENING_TOP_N"),
+        ({"OPENING_TOP_N": "13"}, "OPENING_TOP_N"),
+        ({"OPENING_MIN_X": "0"}, "OPENING_MIN_X"),
+        ({"OPENING_MIN_X": "0.29"}, "OPENING_MIN_X"),
+        ({"OPENING_MIN_X": "3.01"}, "OPENING_MIN_X"),
     ],
 )
 def test_cross_field_validation(tmp_path, env, needle):
     with pytest.raises(ConfigError) as err:
         _load(tmp_path, **env)
     assert needle in str(err.value)
+
+
+def test_the_opening_read_defaults_to_a_report_at_09_30_with_a_deadline_before_the_range_ages(tmp_path):
+    s = _load(tmp_path)
+    assert s.opening_enabled and s.send_opening_report and not s.send_prelim_report
+    assert s.opening_report_deadline_time == "09:45:00" and (s.opening_top_n, s.opening_min_x) == (8, 0.6)
+    custom = _load(tmp_path, OPENING_ENABLED="false", SEND_OPENING_REPORT="no", OPENING_REPORT_DEADLINE_TIME="09:40", OPENING_TOP_N="5",
+                   OPENING_MIN_X="0.85")
+    assert not custom.opening_enabled and not custom.send_opening_report and custom.opening_report_deadline_time == "09:40:00"
+    assert (custom.opening_top_n, custom.opening_min_x) == (5, 0.85)
+    assert _load(tmp_path, OPENING_REPORT_DEADLINE_TIME="10:00").opening_report_deadline_time == "10:00:00"  # the latest allowed
+    assert (_load(tmp_path, OPENING_MIN_X="0.3").opening_min_x, _load(tmp_path, OPENING_MIN_X="3").opening_min_x) == (0.3, 3.0)  # both bounds are valid
 
 
 def test_the_trade_idea_settings_default_to_a_closing_hour_report_with_shorts_for_f_and_o(tmp_path):
@@ -209,7 +229,7 @@ def test_the_ai_services_are_off_by_default_and_the_secrets_are_secret(tmp_path)
     assert s.llm_base_url is None and s.llm_key is None and s.llm_model_name is None and s.llm_fallback_name is None
     assert (s.jev_model, s.llm_reasoning_effort, s.jev_min_confidence) == ("jev-1.14.0", "low", 0.5)
     secret_vars = {v.env for v in VARS if v.secret}
-    assert {"GROQ_API_KEY", "TYPESAFE_API_KEY", "LLM_API_KEY"} <= secret_vars
+    assert {"GROQ_API_KEY", "TYPESAFE_API_KEY", "LLM_API_KEY", "KOTAK_CONSUMER_KEY"} <= secret_vars
 
 
 def test_a_groq_key_alone_is_enough_and_selects_the_best_model_with_a_fallback(tmp_path):
@@ -359,3 +379,64 @@ def test_the_new_keys_are_redacted_and_registered_for_log_scrubbing(tmp_path):
     assert shown["groq_api_key"] == "***set***" and shown["typesafe_api_key"] == "***set***"
     assert {GROQ, TYPESAFE} <= set(s.secrets())
     assert GROQ not in repr(s) and TYPESAFE not in repr(s) and GROQ not in str(shown) and TYPESAFE not in str(shown)
+
+
+KOTAK = "kotak-test-token-0123456789abcdef0123"
+
+
+def test_the_broker_feed_is_off_without_a_key_and_on_with_one_and_can_be_switched_off(tmp_path):
+    s = _load(tmp_path)
+    assert (s.kotak_configured, s.kotak_consumer_key, s.kotak_enabled) == (False, None, True)
+    assert (s.kotak_base_url, s.kotak_max_lag_sec, s.kotak_quote_interval_sec, s.kotak_history_interval_sec) == (
+        "https://mis.kotaksecurities.com", 90.0, 0.2, 1.1)
+    assert _load(tmp_path, KOTAK_CONSUMER_KEY=KOTAK).kotak_configured is True
+    assert _load(tmp_path, KOTAK_CONSUMER_KEY=KOTAK, KOTAK_ENABLED="false").kotak_configured is False
+    assert _load(tmp_path, KOTAK_ENABLED="true").kotak_configured is False  # switched on, but no key
+
+
+@pytest.mark.parametrize(("url", "ok"), [
+    ("https://mis.kotaksecurities.com", True), ("https://cis.kotaksecurities.com/", True), ("https://MIS.KotakSecurities.com:443", True),
+    ("https://kotaksecurities.com", True), ("https://a.b.kotaksecurities.com", True),
+    ("http://mis.kotaksecurities.com", False), ("https://mis.kotaksecurities.com.evil.example", False),
+    ("https://evilkotaksecurities.com", False), ("https://evil.example/mis.kotaksecurities.com", False),
+    ("https://mis.kotaksecurities.com@evil.example", False), ("https://mis.kotaksecurities.com\\@evil.example", False),
+    ("https://mis.kotaksecurities.com/path", False), ("https://mis.kotaksecurities.com ", True), (" https://x.evil.example", False),
+    ("", False), (None, False), ("kotaksecurities.com", False),
+])
+def test_the_key_may_only_be_sent_to_https_on_kotaksecurities_com(url, ok):
+    from app.config import is_kotak_url
+
+    assert is_kotak_url(url) is ok
+
+
+def test_the_broker_settings_are_validated_and_a_bad_host_is_refused_at_start_up(tmp_path):
+    with pytest.raises(ConfigError, match="KOTAK_BASE_URL"):
+        _load(tmp_path, KOTAK_CONSUMER_KEY=KOTAK, KOTAK_BASE_URL="https://mis.kotaksecurities.com.evil.example")
+    with pytest.raises(ConfigError, match="KOTAK_CONSUMER_KEY must not contain spaces"):
+        _load(tmp_path, KOTAK_CONSUMER_KEY="abc def")
+    with pytest.raises(ConfigError, match="KOTAK_MAX_LAG_SEC"):
+        _load(tmp_path, KOTAK_MAX_LAG_SEC="-1")
+    with pytest.raises(ConfigError, match="KOTAK_QUOTE_INTERVAL_SEC"):
+        _load(tmp_path, KOTAK_QUOTE_INTERVAL_SEC="9")
+    with pytest.raises(ConfigError, match="KOTAK_HISTORY_INTERVAL_SEC"):
+        _load(tmp_path, KOTAK_HISTORY_INTERVAL_SEC="0.1")
+    assert _load(tmp_path, KOTAK_MAX_LAG_SEC="0").kotak_max_lag_sec == 0.0  # 0 = no age check
+
+
+def test_the_broker_token_is_redacted_scrubbed_from_logs_and_never_in_the_repr(tmp_path):
+    s = _load(tmp_path, KOTAK_CONSUMER_KEY=KOTAK)
+    assert s.redacted()["kotak_consumer_key"] == "***set***" and KOTAK in s.secrets()
+    assert KOTAK not in repr(s) and KOTAK not in str(s.redacted())
+    from app.logging_setup import clear_secrets, redact, register_secrets
+
+    register_secrets(s.secrets())
+    try:
+        assert KOTAK not in redact(f"GET /quotes failed, Authorization: {KOTAK}, token {KOTAK}")
+    finally:
+        clear_secrets()
+
+
+def test_only_the_application_token_is_a_setting_never_the_trading_credentials():
+    names = {v.env for v in VARS}
+    assert "KOTAK_CONSUMER_KEY" in names
+    assert not {n for n in names if n.startswith("KOTAK_")} & {"KOTAK_MPIN", "KOTAK_TOTP", "KOTAK_TOTP_SECRET", "KOTAK_UCC", "KOTAK_MOBILE"}

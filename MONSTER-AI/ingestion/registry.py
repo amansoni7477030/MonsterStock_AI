@@ -41,10 +41,10 @@ SOURCES: tuple[dict[str, Any], ...] = (
     dict(
         source_id="yahoo_quote", provider="Yahoo Finance (unofficial chart API)",
         endpoint="https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m",
-        coverage="Last price and previous close (Asia open moves, US futures); the 5-minute bars the endpoint also returns are not used",
-        timestamp_meaning="Last trade time reported by the exchange (UTC epoch)", update_frequency="Real-time to ~15 min delayed",
-        history_depth="Latest quote only (the endpoint serves ~60 days of 5m bars; none are stored)", rate_limits="Same as yahoo_daily", license_notes=UNLICENSED,
-        failure_behavior="Descriptive context only; absence never blocks a report", backup_source=None, criticality="optional",
+        coverage="Last price and previous close (Asia open moves, US futures); in the evening also the 5-minute bars of the few names listed in the 09:30 opening read, to judge its reference levels when the broker (`kotak_history`) has no complete day for them (never a model input)",
+        timestamp_meaning="Last trade time reported by the exchange (UTC epoch); each 5-minute bar is dated and timed in exchange-local time", update_frequency="Real-time to ~15 min delayed",
+        history_depth="Latest quote only (the endpoint serves ~60 days of 5m bars; the evening judging reads the last 5 sessions of the listed names and stores only the outcome; the feed omits the opening auction's volume and some closing bars)", rate_limits="Same as yahoo_daily", license_notes=UNLICENSED,
+        failure_behavior="Descriptive context only; absence never blocks a report (a night without 5-minute bars judges the opening reads on the daily bars only)", backup_source=None, criticality="optional",
     ),
     dict(
         source_id="nse_bhavcopy", provider="NSE archives (sec_bhavdata_full)",
@@ -99,11 +99,35 @@ SOURCES: tuple[dict[str, Any], ...] = (
         coverage="Every F&O stock (or a broader index list) in ONE call: today's open, high, low, last price, previous close, volume so far, plus the 52-week range; Nifty 50, India VIX and the sector indices live",
         timestamp_meaning="the answer's own `timestamp`, exchange time in IST (parsed with an explicit IST assumption) and the stamp of every row; the per-stock `lastUpdateTime` is a placeholder (31-DEC-2999) or the date of an old update and is NOT read",
         update_frequency="Live during the session (seconds to a minute behind); the final values after the close",
-        history_depth="Live only (not point-in-time reconstructable): every trade idea freezes the figures it was based on",
-        rate_limits="Same session as nse_api_market: cookie handshake, ~1 request/second; the closing-hour scan makes two calls; frequent 401/403 from datacentre IPs",
+        history_depth="Live only (not point-in-time reconstructable): every trade idea and every opening read freezes the figures it was based on",
+        rate_limits="Same session as nse_api_market: cookie handshake, ~1 request/second; the 09:30 opening read and the closing-hour scan each make two calls; frequent 401/403 from datacentre IPs",
         license_notes=EXCHANGE_PUBLIC + " Endpoints are undocumented and may change without notice (NSE retired `equity-stockIndices` in 2026).",
-        failure_behavior="The closing-hour scan fails visibly and retries inside its window (nothing is guessed from older data, and a snapshot that is not from today is refused); the morning scans do not use it",
-        backup_source=None, criticality="optional",
+        failure_behavior="The 09:30 opening read and the closing-hour scan fail visibly and retry inside their windows (nothing is guessed from older data, and a snapshot that is not from today is refused) unless the Kotak broker feed (`kotak_quotes`) is on: it then carries the scan alone; the pre-open morning scans do not use it",
+        backup_source="kotak_quotes", criticality="optional",
+    ),
+    dict(
+        source_id="kotak_quotes", provider="Kotak Neo market-data API (broker): live quotes and the instrument master",
+        endpoint="https://mis.kotaksecurities.com/script-details/1.0/quotes/neosymbol/nse_cm|{token},nse_cm|{token}/all ; /script-details/1.0/masterscrip/file-paths ; the nse_cm instrument master CSV it lists (header Authorization: the application token)",
+        coverage="Every F&O stock live in a handful of requests: open, high, low, last price, previous close, the day's volume, VWAP and the 52-week range with each stock's own last-update time; Nifty 50 and India VIX by name. After the close all 218 F&O stocks matched NSE's own rows exactly on open, high, low, last, previous close and volume",
+        timestamp_meaning="`lstup_time`: UTC epoch seconds of each stock's last update (NSE's answer has one stamp for every row); `ohlc.close` is the PREVIOUS close; the age of the freshest trade of an answer is the age of the feed",
+        update_frequency="Live during the session (exchange-fed; its age is measured on every answer and held against it, `KOTAK_MAX_LAG_SEC`); the final figures after the close",
+        history_depth="Live only (not point-in-time reconstructable): every trade idea and every opening read freezes the figures it was based on",
+        rate_limits="Documented 25 requests a second and 50 stocks a request; measured live: a request for exactly 50 is refused with HTTP 400 (49 works), so 40 are asked, 0.2 s apart; HTTP 429 slows the client down",
+        license_notes="Broker market data for the account holder's own use under the broker's API terms (confirm them before any wider use). Only the application token is used and sent: no login, no orders, no personal data.",
+        failure_behavior="NSE alone carries the scan, exactly as before the broker existed; a name the two feeds disagree on is left out and counted; a broker feed whose freshest trade is older than `KOTAK_MAX_LAG_SEC` during the session is not used; with NSE down the broker alone carries the 09:30 and 14:30 scans",
+        backup_source="nse_live_quotes", criticality="optional",
+    ),
+    dict(
+        source_id="kotak_history", provider="Kotak Neo market-data API (broker): historical candles",
+        endpoint="https://mis.kotaksecurities.com/market-data/1.0/historical/details?neosymbol=nse_cm|{token}&interval=5min&fromdate=YYYY-MM-DD&todate=YYYY-MM-DD (header Authorization: the application token)",
+        coverage="1, 3, 5, 10, 15, 30 and 60-minute, daily and weekly candles of every NSE stock: open, high, low, close and volume (the first bar carries the opening auction's volume, which Yahoo's lacks). Built from the exchange's own trades: the five-minute candles are exactly the aggregate of the one-minute ones and the day's low matched NSE's official low for 60 of 60 stocks, where Yahoo's first-15-minute range is about a tenth narrower",
+        timestamp_meaning="the bar's START, ISO 8601 with +0530; a session normally ends with the 15:10 five-minute bar (the last 15 minutes are missing, or appear only as a flat artefact after the day, and on some days the 15:10 bar carries a negative volume)",
+        update_frequency="Complete for the day in the evening; used after the close only",
+        history_depth="Years (a 2023 window answered); at most 30 days per request for 1, 3 and 5-minute candles",
+        rate_limits="About one request a second (a second request within the second is refused with HTTP 429), so one request a name; the client spaces them `KOTAK_HISTORY_INTERVAL_SEC` apart and slows down on 429",
+        license_notes="Broker market data for the account holder's own use under the broker's API terms (confirm them before any wider use). Only the application token is used and sent.",
+        failure_behavior="A name whose broker day is missing or unfinished is judged on Yahoo's bars; a night with neither judges the opening reads on the daily bars only",
+        backup_source="yahoo_quote", criticality="optional",
     ),
     dict(
         source_id="rss_news", provider="Publisher RSS/Atom feeds (data/seeds/feeds.json)",
@@ -177,6 +201,7 @@ def _fetch_strategy() -> dict[str, str]:
     """How each source is requested (transport, spacing, batching), phrased from the code's own constants (lazy imports keep this
     module light for the callers that only need ``tracked``)."""
     from app.config import GROQ_EXTRA_FALLBACK_MODELS, GROQ_FALLBACK_MODEL, GROQ_MODEL
+    from ingestion.kotak import QUOTE_BATCH
     from ingestion.news_sources import (
         FEED_DISABLE_AFTER,
         FEED_DISABLE_HOURS,
@@ -200,7 +225,10 @@ def _fetch_strategy() -> dict[str, str]:
             "file, Yahoo only repairs the names the file lacks and serves the resumable history backfill (one full download per symbol)."),
         "yahoo_quote": (
             "client `yahoo` (shared spacing): one 5-minute chart request per context symbol (Asia indices, US futures, USD/INR, "
-            "crude) per collection; a failure never blocks a report."),
+            "crude) per collection; a failure never blocks a report. In the evening `evaluate_opening` asks for the last 5 sessions "
+            "of 5-minute bars (`range=5d&interval=5m`) of each name the 09:30 opening read listed that the broker (`kotak_history`) "
+            "could not give a complete day for, within a 120-second budget, "
+            "and only for runs whose intraday figures are not yet stored; bars Yahoo leaves null are skipped."),
         "nse_bhavcopy": (
             f"client `nse_archive`: {nse_client}. ONE file per trading day covers every stock; a page served with status 200 but "
             "holding HTML is rejected."),
@@ -217,8 +245,28 @@ def _fetch_strategy() -> dict[str, str]:
             "client `nse_api` (same session and cookie handshake as the pre-open book): ONE `equity-stockIndex` call returns the "
             "running figures of the whole F&O segment (a larger universe adds one `equity-stock-indices` call per index list; the "
             "retired `equity-stockIndices` is tried last, and only a 404 moves on to the next name) and ONE `allIndices` call the "
-            "indices; both are bounded by the report deadline of the closing-hour scan. The answer's own timestamp is the stamp of "
-            "every row, and one that is not today's date is not today's session and is refused."),
+            "indices; both are bounded by the report deadline of the scan that asks (09:45 for the opening read, 15:05 for the "
+            "closing-hour scan). The answer's own timestamp is the stamp of "
+            "every row, and one that is not today's date is not today's session and is refused. With `KOTAK_CONSUMER_KEY` set the "
+            "same scans also read the broker (`kotak_quotes`) and merge the two (`ingestion.livefeed`)."),
+        "kotak_quotes": (
+            "client `kotak_quotes`: plain `requests` transport (the API needs no browser fingerprint, and curl_cffi's streamed responses "
+            "drop the connection so that every call pays the host's 2 s handshake again), spacing `KOTAK_QUOTE_INTERVAL_SEC`. The "
+            "application token travels in the `Authorization` header to https hosts on kotaksecurities.com only (`KOTAK_BASE_URL` is "
+            "refused at start-up otherwise); the instrument master (`file-paths`, then the `nse_cm` CSV of about 3 MB, fetched WITHOUT the "
+            f"token and only from a listed host on kotaksecurities.com) is read once a day into the database, {QUOTE_BATCH} stocks go into "
+            "each quote request, a refused request is halved until the one stock the API cannot quote is found, and a stock the API "
+            "merely omits is a name this feed does not have. `ingestion.livefeed` merges the rows with NSE's: a name both have must "
+            "agree on previous close (0.3 %), open (0.5 %) and last price (3 %) or it is left out; of two agreeing rows the one with the "
+            "larger day volume (the fresher one) is taken whole; the feed is not used when, during the session, even its freshest trade "
+            "is older than `KOTAK_MAX_LAG_SEC`. Nifty 50 and India VIX are asked only when NSE's index call gave nothing."),
+        "kotak_history": (
+            "client `kotak_history` (same transport and token rules), spacing `KOTAK_HISTORY_INTERVAL_SEC`: in the evening "
+            "`evaluate_opening` asks for one `5min` window of the trading day per listed name, inside the same 120-second budget as "
+            "Yahoo; a day counts only when all 72 five-minute bars from 09:15 to 15:10 are there (the day is cut to those bars, and a bar "
+            "the parser drops, such as the archive's end-of-day artefact with a negative volume, makes the day unfinished) and otherwise "
+            "Yahoo is asked for that name instead. The candles are normalised to the shape Yahoo's bars have, a row that is not a bar of the regular session "
+            "or whose high and low do not contain its open and close is dropped, and a timestamp that appears twice keeps its last row."),
         "nse_announcements": (
             "client `nse_api` (same session): one call per date window for all symbols (filtered locally); the board-meeting "
             "calendar likewise."),

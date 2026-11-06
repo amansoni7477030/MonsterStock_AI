@@ -20,7 +20,8 @@ def cli_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MONSTER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MONSTER_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("MONSTER_ENV_FILE", str(tmp_path / "none.env"))
-    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY", "TYPESAFE_API_KEY", "LLM_API_BASE", "LLM_MODEL", "LLM_API_KEY"):
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY", "TYPESAFE_API_KEY", "KOTAK_CONSUMER_KEY", "LLM_API_BASE", "LLM_MODEL",
+                 "LLM_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(runner, "_install_sigterm", lambda: None)
     return tmp_path
@@ -71,6 +72,66 @@ def test_doctor_reports_the_ai_services_as_optional_and_names_the_ones_that_are_
     detail = report.checks[0].detail
     assert "LLM via groq (openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)" in detail and "Jev (jev-1.14.0)" in detail
     assert "gsk_test" not in detail and "ts_test" not in detail
+
+
+def test_doctor_says_whether_the_broker_feed_is_on_and_never_prints_the_token(cli_env, monkeypatch):
+    import app.doctor as doctor
+    from app.config import load_settings
+
+    def line():
+        report = doctor.DoctorReport()
+        doctor._kotak_config(report, load_settings())
+        (row,) = report.checks
+        return row
+
+    row = line()
+    assert row.name == "broker feed" and row.status == "ok" and row.detail.startswith("off (optional)")
+    monkeypatch.setenv("KOTAK_CONSUMER_KEY", "kotak-test-token-0123456789abcdef0123")
+    row = line()
+    assert row.status == "ok" and "cross-checked against NSE" in row.detail and "37 chars" in row.detail and "kotak-test" not in row.detail
+    monkeypatch.setenv("KOTAK_ENABLED", "false")
+    assert line().detail.startswith("off: KOTAK_ENABLED=false")
+
+
+def test_doctor_proves_the_broker_token_with_one_index_quote_and_a_failure_is_only_a_warning(cli_env, monkeypatch):
+    import app.doctor as doctor
+    import ingestion.kotak as kotak
+    from app.config import load_settings
+    from app.errors import DataUnavailable
+
+    monkeypatch.setenv("KOTAK_CONSUMER_KEY", "kotak-test-token-0123456789abcdef0123")
+    closed = []
+
+    class Broker:
+        outcome: object = {"NIFTY 50": {"last": 25030.35}, "INDIA VIX": {"last": 17.47}}
+
+        def __init__(self, settings):
+            pass
+
+        def indices(self):
+            if isinstance(Broker.outcome, Exception):
+                raise Broker.outcome
+            return Broker.outcome
+
+        def close(self):
+            closed.append(1)
+
+    monkeypatch.setattr(kotak, "KotakApi", Broker)
+    report = doctor.DoctorReport()
+    doctor._kotak_network(report, load_settings())
+    assert [(c.name, c.status, c.detail) for c in report.checks] == [("network: Kotak quotes", "ok", "NIFTY 50 25030.3, INDIA VIX 17.47")]
+    Broker.outcome = DataUnavailable("kotak_quotes", "Kotak refused the application token (HTTP 403): copy KOTAK_CONSUMER_KEY again")
+    report = doctor.DoctorReport()
+    doctor._kotak_network(report, load_settings())
+    assert report.checks[0].status == "warn" and "refused the application token" in report.checks[0].detail and not report.failed
+    Broker.outcome = {}
+    report = doctor.DoctorReport()
+    doctor._kotak_network(report, load_settings())
+    assert report.checks[0].status == "warn" and closed == [1, 1, 1]
+    monkeypatch.delenv("KOTAK_CONSUMER_KEY")
+    report = doctor.DoctorReport()
+    doctor._kotak_network(report, load_settings())
+    assert report.checks == [] and closed == [1, 1, 1]  # no key: nothing is asked, nothing is opened
 
 
 def test_doctor_says_whether_chart_images_will_be_sent_and_why_not(cli_env, monkeypatch):
@@ -289,7 +350,8 @@ def test_main_reports_configuration_errors_with_exit_2(cli_env, monkeypatch, cap
 def test_jobs_lists_the_timetable(cli_env, capsys):
     assert run(["jobs"]) == 0
     out = capsys.readouterr().out
-    for name in ("collect_global", "prelim_scan", "final_scan", "closing_scan", "ingest_eod", "evaluate_ideas", "backup", "train"):
+    for name in ("collect_global", "prelim_scan", "final_scan", "opening_scan", "closing_scan", "ingest_eod", "evaluate_ideas", "evaluate_opening",
+                 "backup", "train"):
         assert name in out
 
 
@@ -371,6 +433,37 @@ def test_ideas_runs_the_scheduler_job_and_reports_its_outcome(cli_env, monkeypat
     assert run(["ideas", "--date", "2026-11-02"]) == 0 and seen["force"] is False
     monkeypatch.setitem(jobs.FUNCTIONS, "closing_scan", lambda ctx: JobResult("failed", "NSE live quotes unavailable"))
     assert run(["ideas", "--date", "2026-11-02"]) == 1 and "failed - NSE live quotes unavailable" in capsys.readouterr().out
+
+
+def test_opening_dry_run_prints_the_report_and_freezes_nothing(cli_env, monkeypatch, capsys):
+    from automation import opening
+    from automation.context import JobResult
+    from ranking.types import OpeningIdea, OpeningReport
+
+    idea = OpeningIdea(symbol="ABC", rank=1, kind="MOVER", ltp=100.0, open=99.0, prev_close=98.0, or_high=101.0, or_low=98.5, gap_pct=1.0,
+                       or_pct=2.5, move_pct=1.0, x=0.9, strength="EXPLOSIVE", p3=0.8, p5=0.3, day_range=[2.0, 3.5, 6.0], ahead=[1.0, 2.0, 3.5])
+    report = OpeningReport(trade_date="2026-11-02", snapshot_ist="2026-11-02 09:30:42 IST", picks=[], movers=[idea]).to_dict()
+    seen = {}
+    monkeypatch.setattr(opening, "run_opening_scan", lambda ctx: seen.update(dry=ctx.dry_run, key=ctx.run_key)
+                        or JobResult("success", "dry run", {"report": report}))
+    assert run(["opening", "--date", "2026-11-02", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "ABC" in out and "09:30 Opening read" in out and "opening scan 2026-11-02: success" in out
+    assert seen == {"dry": True, "key": "2026-11-02"}
+
+
+def test_opening_runs_the_scheduler_job_and_reports_its_outcome(cli_env, monkeypatch, capsys):
+    from automation import jobs
+    from automation.context import JobResult
+
+    seen = {}
+    monkeypatch.setitem(jobs.FUNCTIONS, "opening_scan", lambda ctx: seen.update(force=ctx.force, key=ctx.run_key)
+                        or JobResult("success", "report sent"))
+    assert run(["opening", "--date", "2026-11-02", "--force"]) == 0
+    assert seen == {"force": True, "key": "2026-11-02"} and "opening scan 2026-11-02: success - report sent" in capsys.readouterr().out
+    assert run(["opening", "--date", "2026-11-02"]) == 0 and seen["force"] is False
+    monkeypatch.setitem(jobs.FUNCTIONS, "opening_scan", lambda ctx: JobResult("failed", "the opening range is not formed yet"))
+    assert run(["opening", "--date", "2026-11-02"]) == 1 and "failed - the opening range is not formed yet" in capsys.readouterr().out
 
 
 def test_telegram_setup_discovers_and_writes_the_chat_id(cli_env, monkeypatch, capsys):

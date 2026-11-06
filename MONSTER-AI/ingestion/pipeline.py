@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -22,6 +23,7 @@ from app.errors import CircuitOpen, DataUnavailable
 from app.logging_setup import redact
 from database.store import Store
 from ingestion.fno import aggregate_stock_fno
+from ingestion.kotak import KotakApi, KotakQuotes
 from ingestion.nse import LiveEquities, NseApi, NseArchive, PreopenSnapshot
 from ingestion.series import NSE_EQUITY_SPEC, SERIES, SERIES_BY_KEY, SeriesSpec
 from ingestion.validation import overlap_consistent, validate_bars
@@ -556,6 +558,87 @@ def collect_live_indices(store: Store, nse: NseApi, *, deadline: float | None = 
         log.warning("live indices failed: %s", redact(str(exc)))
         return {}
     return indices
+
+
+TOKENS_KEY = "kotak:tokens"  # {"day", "tokens": {symbol: token}, "absent": [symbols the broker does not list]}
+
+
+def _recorded_tokens(stored: Any) -> tuple[dict[str, str], set[str], str | None]:
+    """The map recorded in the database as ``(tokens, absent, day)``. Anything that is not exactly the shape ``kotak_tokens`` writes (an older
+    release, a hand edit, a damaged row) counts as no map at all, so it can neither crash a scan nor stand in for a master that is down."""
+    if not isinstance(stored, dict):
+        return {}, set(), None
+    tokens, absent, day = stored.get("tokens"), stored.get("absent"), stored.get("day")
+    if not (isinstance(tokens, dict) and isinstance(absent, list) and isinstance(day, str)):
+        return {}, set(), None
+    if not all(isinstance(k, str) and isinstance(v, str) and v for k, v in tokens.items()) or not all(isinstance(s, str) for s in absent):
+        return {}, set(), None
+    return dict(tokens), set(absent), day
+
+
+def kotak_tokens(store: Store, api: KotakApi, symbols: Iterable[str], today: date, *, deadline: float | None = None) -> dict[str, str]:
+    """``{symbol: instrument token}`` of the ``symbols`` the broker lists. The map is kept in the database and re-read from the broker's
+    instrument master (a file of about 3 MB) once a day, or at once when a wanted name is neither known nor recorded as not listed. A
+    token does not change from one day to the next, so when the master cannot be read an older map still serves, but only when it holds a
+    token of at least one wanted name: otherwise the master's own failure is raised (it is the real reason there is no answer)."""
+    wanted = set(symbols)
+    known, absent, day = _recorded_tokens(store.kv_get_json(TOKENS_KEY))
+    if day != today.isoformat() or wanted - known.keys() - absent:
+        try:
+            master = api.token_map(deadline=deadline)
+        except DataUnavailable as exc:
+            if not wanted & known.keys():
+                raise
+            log.warning("kotak instrument master unavailable (%s): the map of %s serves", redact(str(exc)), day)
+        else:
+            known = {symbol: master.get(symbol, token) for symbol, token in known.items()}
+            known.update({symbol: master[symbol] for symbol in wanted if symbol in master})
+            store.kv_set_json(TOKENS_KEY, {"day": today.isoformat(), "tokens": known, "absent": sorted(wanted - master.keys())})
+    return {symbol: known[symbol] for symbol in wanted if symbol in known}
+
+
+def collect_kotak_quotes(store: Store, api: KotakApi, symbols: Iterable[str], today: date, *, deadline: float | None = None,
+                         errors: list[str] | None = None) -> KotakQuotes | None:
+    """Live rows of ``symbols`` from the broker (about 40 stocks per request). ``None`` when nothing could be read; the reason is logged,
+    recorded in ``source_health`` as ``kotak_quotes`` and appended (redacted) to ``errors``. A partial answer is returned as it is: the
+    names it lacks are simply names this feed does not have. The broker is an extra: an unexpected error in its handling is a failure of
+    this feed only, never of the scan that has NSE's rows."""
+    started = time.monotonic()
+    try:
+        tokens = kotak_tokens(store, api, symbols, today, deadline=deadline)
+        if not tokens:
+            raise DataUnavailable("kotak_quotes", "the broker lists none of the requested symbols", retryable=False)
+        quotes = api.quotes(tokens, deadline=deadline)
+    except DataUnavailable as exc:
+        reason = redact(str(exc))
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.exception("broker live quotes failed unexpectedly")
+        reason = f"unexpected {type(exc).__name__}: {redact(str(exc))[:120]}"
+    else:
+        store.record_source_result("kotak_quotes", bool(quotes.rows), latency_ms=(time.monotonic() - started) * 1000.0,
+                                   data_ts=iso(quotes.asof), error=None if quotes.rows else "no stock answered")
+        if quotes.failed:
+            log.warning("broker live quotes: %d of %d stocks could not be read", len(quotes.failed), quotes.asked)
+        return quotes
+    store.record_source_result("kotak_quotes", False, error=reason)
+    log.warning("broker live quotes failed: %s", reason)
+    if errors is not None:
+        errors.append(reason)
+    return None
+
+
+def collect_kotak_indices(store: Store, api: KotakApi, *, deadline: float | None = None) -> dict[str, dict[str, Any]]:
+    """Nifty 50 and India VIX from the broker; ``{}`` when it does not answer. Used only when NSE's own index call gave nothing."""
+    try:
+        return api.indices(deadline=deadline)
+    except DataUnavailable as exc:
+        reason = redact(str(exc))
+    except Exception as exc:  # noqa: BLE001 - the broker is an extra, as in collect_kotak_quotes
+        log.exception("broker index quotes failed unexpectedly")
+        reason = f"unexpected {type(exc).__name__}: {redact(str(exc))[:120]}"
+    store.record_source_result("kotak_quotes", False, error=reason)
+    log.warning("broker index quotes failed: %s", reason)
+    return {}
 
 
 def collect_live_context(store: Store, yahoo: YahooClient, keys: Sequence[str] = LIVE_CONTEXT,

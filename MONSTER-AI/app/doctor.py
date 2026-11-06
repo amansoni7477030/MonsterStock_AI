@@ -205,6 +205,38 @@ def _ai_network(report: DoctorReport, s: Settings) -> None:
             report.add(f"ai: {check.label}", "ok" if check.status == "ok" else "warn", check.detail)
 
 
+def _kotak_config(report: DoctorReport, s: Settings) -> None:
+    """The broker feed is an optional second live source: off is fine, but a key that is set and a feed that is switched off (or a base
+    URL the key may not be sent to) is worth saying."""
+    if not s.kotak_consumer_key:
+        report.add("broker feed", "ok", "off (optional): KOTAK_CONSUMER_KEY not set, NSE and Yahoo alone")
+    elif not s.kotak_enabled:
+        report.add("broker feed", "ok", "off: KOTAK_ENABLED=false (the key is set)")
+    elif not s.kotak_configured:
+        report.add("broker feed", "warn", "KOTAK_BASE_URL is not an https host on kotaksecurities.com: the key is not sent")
+    else:
+        report.add("broker feed", "ok", f"Kotak Neo: live quotes cross-checked against NSE and 5-minute candles (key set, {len(s.kotak_consumer_key)} chars)")
+
+
+def _kotak_network(report: DoctorReport, s: Settings) -> None:
+    """One free index quote proves the application token and the quote endpoint without downloading the instrument master. An optional
+    feed that fails is a warning, never a reason to call the machine not ready."""
+    if not s.kotak_configured:
+        return
+    from app.errors import DataUnavailable
+    from ingestion.kotak import KotakApi
+
+    api = KotakApi(s)
+    try:
+        found = api.indices()
+        report.add("network: Kotak quotes", "ok" if found else "warn",
+                   ", ".join(f"{name} {row['last']:g}" for name, row in found.items()) if found else "answered with no index quote")
+    except DataUnavailable as exc:
+        report.add("network: Kotak quotes", "warn", " ".join(redact(str(exc)).split())[:150])
+    finally:
+        api.close()
+
+
 def _network(report: DoctorReport, s: Settings) -> None:
     from app.errors import DataUnavailable
     from ingestion.http import HttpClient
@@ -289,9 +321,11 @@ def run_doctor(*, offline: bool = False, env_file: str | None = None) -> DoctorR
         _telegram_config(report, settings)
         _charts(report, settings)
         _ai_config(report, settings)
+        _kotak_config(report, settings)
         if not offline:
             _network(report, settings)
             _nse_api(report, settings)
+            _kotak_network(report, settings)
             _ai_network(report, settings)
     return report
 

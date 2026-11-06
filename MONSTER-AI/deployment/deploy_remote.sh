@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # =====================================================================================================
 # MONSTER AI - one-command remote deploy from Linux / macOS
 #
@@ -7,7 +8,10 @@
 #   --port N             SSH port (default 22)
 #   --identity FILE      SSH private key
 #   --env-file FILE      configuration to seed /etc/monster-ai/monster.env from (default: ./.env of the
-#                        project when it exists). Secrets are copied over SSH only, never printed, and the
+#                        project when it exists). Only the settings MONSTER AI defines (the keys of
+#                        .env.example) are uploaded - other keys, e.g. the broker's login values KOTAK_MPIN /
+#                        KOTAK_TOTP_SECRET / KOTAK_UCC / KOTAK_MOBILE, stay on this machine and only their
+#                        NAMES are listed (lib/envseed.sh). Copied over SSH only, never printed, and the
 #                        remote copy is shredded afterwards.
 #   --no-bootstrap | --enable-dashboard | --skip-swap    passed on to install.sh
 #   --keep-remote-temp   keep the uploaded release on the server (the env copy is deleted regardless)
@@ -22,11 +26,14 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/envseed.sh
+source "$SCRIPT_DIR/lib/envseed.sh"
 
 TARGET=""
 PORT=22
 IDENTITY=""
 ENV_FILE=""
+UPLOAD_SEED=""
 INSTALL_FLAGS=()
 KEEP_REMOTE_TEMP=0
 
@@ -147,6 +154,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   if [[ -n $ARCHIVE && -f $ARCHIVE ]]; then rm -f -- "$ARCHIVE"; fi
+  if [[ -n $UPLOAD_SEED ]]; then rm -f -- "$UPLOAD_SEED" "$UPLOAD_SEED.names" "$UPLOAD_SEED.utf8"; fi
   if [[ -n $REMOTE_DIR ]]; then
     if ! ssh "${SSH_OPTS[@]}" "$TARGET" bash -s -- "$REMOTE_DIR" "$KEEP_REMOTE_TEMP" <<'EOF'
 set -u
@@ -180,15 +188,28 @@ build_archive() {
   say "  archive size: $(du -h "$ARCHIVE" | cut -f 1)"
 }
 
+# The upload copy of the env file: only the settings MONSTER AI defines. Whatever else the file holds (the
+# broker's login values, other projects' secrets, typos) never leaves this machine; only the NAMES are listed.
+prepare_seed() {
+  local names
+  [[ -n $ENV_FILE ]] || return 0
+  [[ -f $PROJECT_ROOT/.env.example ]] || die ".env.example not found below $PROJECT_ROOT"
+  UPLOAD_SEED=$(mktemp "${TMPDIR:-/tmp}/monster-ai-seed.XXXXXXXXXX") || die "cannot create a temporary file"
+  names=$(envseed_filter "$ENV_FILE" "$PROJECT_ROOT/.env.example" "$UPLOAD_SEED") || die "the env file could not be filtered, so nothing was uploaded"
+  if [[ -n $names ]]; then
+    say "  kept on this machine, not uploaded (MONSTER AI has no such setting): $(printf '%s' "$names" | tr '\n' ' ')"
+  fi
+}
+
 upload() {
   local archive_name dest
   archive_name=$(basename -- "$ARCHIVE")
   dest="$(scp_target):$REMOTE_DIR"
   say "Uploading to $TARGET:$REMOTE_DIR ..."
   scp "${SCP_OPTS[@]}" -- "$ARCHIVE" "$dest/$archive_name"
-  if [[ -n $ENV_FILE ]]; then
-    say "  env file: $ENV_FILE (copied over SSH, contents are never shown, deleted from the server afterwards)"
-    scp "${SCP_OPTS[@]}" -- "$ENV_FILE" "$dest/monster.env"
+  if [[ -n $UPLOAD_SEED ]]; then
+    say "  env file: $ENV_FILE (only the settings MONSTER AI defines are copied over SSH, contents are never shown, deleted from the server afterwards)"
+    scp "${SCP_OPTS[@]}" -- "$UPLOAD_SEED" "$dest/monster.env"
   else
     say "  no env file given and no ./.env found: the server starts from .env.example (add your Telegram token later)"
   fi
@@ -211,6 +232,7 @@ main() {
   parse_args "$@"
   validate
   build_ssh_options
+  prepare_seed
   build_archive
   say "Connecting to $TARGET (port $PORT) ..."
   REMOTE_DIR=$(ssh "${SSH_OPTS[@]}" "$TARGET" 'mktemp -d -t monster-ai-deploy.XXXXXXXXXX')

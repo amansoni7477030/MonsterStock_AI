@@ -41,9 +41,10 @@ VALIDATED_LABEL = "VALIDATED: official exchange data"
 
 _MODEL_BADGES = {"validated": ("✅", "VALIDATED"), "baseline": ("📏", "BASELINE (no trained model)")}
 _SHADOW_BADGE = ("🧪", "SHADOW - unvalidated")
-_STAGE_LABELS = {"pre": "PRELIMINARY", "final": "FINAL", "closing": "CLOSING-HOUR IDEAS"}
+_STAGE_LABELS = {"pre": "PRELIMINARY", "final": "FINAL", "closing": "CLOSING-HOUR IDEAS", "opening": "09:30 OPENING READ"}
 # what a failure notice says was not published, and what its absence must not be read as, per stage
-_NOT_PUBLISHED = {"closing": ("No trade ideas were published for this date.", "there is nothing to trade")}
+_NOT_PUBLISHED = {"closing": ("No trade ideas were published for this date.", "there is nothing to trade"),
+                  "opening": ("No opening read was published for this date.", "nothing stands out at the open")}
 _NOT_PUBLISHED_DEFAULT = ("No candidate list was published for this date.", "there are no large-move setups")
 _CAPPED_TIERS = frozenset({"STRONG", "MODERATE"})
 

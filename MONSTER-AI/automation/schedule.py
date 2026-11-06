@@ -20,6 +20,7 @@ from database.store import Store
 log = logging.getLogger(__name__)
 
 FIRST_START_KEY = "daemon.first_start"
+ENTRIES_SEEN_KEY = "daemon.entries_seen"  # {entry label: when the scheduler first knew that entry}
 CATCH_UP_DAYS = 2
 PREEMPTED = "preempted"
 
@@ -70,6 +71,8 @@ SCHEDULE: tuple[ScheduleEntry, ...] = (
     E("prelim_scan", "08:45", "09:02", retry_sec=180, max_attempts=5),
     E("refresh_preopen", "09:00:30", "09:07:30", retry_sec=60, max_attempts=2),
     E("final_scan", "09:08:45", "09:13:30", retry_sec=45, max_attempts=3),
+    # ---- the opening read (trading days): the third five-minute candle has closed, so NSE's day high / low IS the opening range ----
+    E("opening_scan", "09:30:15", "09:44", retry_sec=20, max_attempts=40),
     # ---- the closing hour (trading days): fresh news, then BTST / swing / watchlist ideas while the entry window is open -------
     E("collect_news", "13:40", "14:20", slot="midday", retry_sec=600, max_attempts=2),
     E("closing_scan", "14:30", "15:00", retry_sec=60, max_attempts=30),  # a try a minute fills the whole window, not its first five minutes
@@ -77,6 +80,7 @@ SCHEDULE: tuple[ScheduleEntry, ...] = (
     E("ingest_eod", "17:45", "23:30", retry_sec=1200, max_attempts=12, catch_up=True),
     E("evaluate", "18:15", "23:45", retry_sec=1200, max_attempts=10, after=("ingest_eod",), catch_up=True),
     E("evaluate_ideas", "18:30", "23:50", retry_sec=1200, max_attempts=8, after=("ingest_eod",), catch_up=True),
+    E("evaluate_opening", "18:32", "23:50", retry_sec=1200, max_attempts=8, after=("ingest_eod",), catch_up=True),
     E("health_check", "20:00", "23:00", days="any", slot="evening", retry_sec=600, max_attempts=2),
     E("backup", "23:30", "23:59", days="any", retry_sec=900, max_attempts=3, catch_up=True),
     E("housekeeping", "23:50", "23:59", days="any", retry_sec=900, max_attempts=2, after=("backup",), catch_up=True),
@@ -102,6 +106,7 @@ class ScheduleEngine:
                  entries: tuple[ScheduleEntry, ...] = SCHEDULE) -> None:
         self.store, self.calendar, self._clock = store, calendar, clock
         self.entries = entries
+        self._seen: dict[str, datetime] | None = None
 
     @property
     def clock(self) -> Clock:
@@ -122,6 +127,29 @@ class ScheduleEngine:
             stamp = iso(self.clock.now()) or ""
             self.store.kv_set(FIRST_START_KEY, stamp)
         return parse_ts(stamp) or self.clock.now()
+
+    def _entries_seen(self, first: datetime, now: datetime) -> dict[str, datetime]:
+        """When the scheduler first knew each entry (persisted), never earlier than the daemon's first start.
+
+        A window that closed before an entry existed is not that entry's miss, so a job added by an upgrade is not reported as missed
+        for the days before the upgrade. On a database that has no such record yet every entry is taken to have existed since the
+        daemon's first start; an entry that appears afterwards is stamped with the moment it is first evaluated."""
+        if self._seen is not None and all(e.label in self._seen for e in self.entries):
+            return self._seen
+        raw = self.store.kv_get_json(ENTRIES_SEEN_KEY)
+        known = isinstance(raw, dict)
+        seen = {k: t for k, v in (raw if known else {}).items() if (t := parse_ts(v)) is not None}
+        stamp = max(now if known else first, first)
+        added = [e.label for e in self.entries if e.label not in seen]
+        for label in added:
+            seen[label] = stamp
+        if added or not known:
+            current = {e.label for e in self.entries}
+            self.store.kv_set_json(ENTRIES_SEEN_KEY, {label: iso(t) for label, t in seen.items() if label in current})
+            if known and added:
+                log.info("schedule entries first seen now: %s", ", ".join(added))
+        self._seen = seen
+        return seen
 
     # --------------------------------------------------------------------------------------- applicability
     def _eligible_day(self, entry: ScheduleEntry, day: date) -> bool:
@@ -160,11 +188,12 @@ class ScheduleEngine:
         now = now or self.clock.now()
         today = ist_date(now)
         first = self.first_start()
+        seen = self._entries_seen(first, now)
         found: list[Due] = []
         for back in range(CATCH_UP_DAYS, -1, -1):
             day = today - timedelta(days=back)
             for entry in self.entries:
-                item = self._evaluate(entry, day, today, now, first)
+                item = self._evaluate(entry, day, today, now, max(first, seen[entry.label]))
                 if item is not None:
                     found.append(item)
         found.sort(key=lambda d: (not d.critical, at_ist(d.day, d.entry.at), d.entry.label))
@@ -183,16 +212,16 @@ class ScheduleEngine:
         state = self._state(entry.job, key)
         if state["settled"] or state["running"]:
             return None
-        if day < today and end <= first:  # that window closed before the scheduler existed: nothing to catch up
+        if day < today and end <= first:  # that window closed before the entry existed (a fresh install, or a job added by an upgrade): nothing to catch up
             return None
         past_window = now > end if day == today else True
         if state["attempts"] >= entry.max_attempts:
             self._miss(entry, key, f"gave up after {state['attempts']} failed attempts")
             return None
         if past_window and not entry.catch_up:
-            if end <= first:  # the scheduler did not exist yet when this window was open
+            if end <= first:  # the entry did not exist yet when this window was open
                 if day == today:
-                    self.store.job_record(entry.job, key, "skipped", message="scheduler was not installed yet")
+                    self.store.job_record(entry.job, key, "skipped", message="the job was not installed yet when its window closed")
             else:
                 self._miss(entry, key, f"window closed at {entry.until} IST without a successful run")
             return None
